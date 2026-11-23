@@ -709,12 +709,11 @@ async def delete_thread_upload(
     """Remove one file from a persistent thread workspace's ``uploads/`` dir.
 
     Exists so the cockpit's *eager* upload can be cancelled honestly. The
-    composer starts transferring the moment a file is attached, before the
-    user commits to sending, so removing an attachment chip can arrive after
-    the bytes have already landed. Without this, cancelling is a lie and
-    attach → remove → re-attach cycles accumulate ``_1``/``_2`` copies in a
-    directory the agent can list and read
-    (``knowledge-base/knowledge/features/session_attachment_send_flow.md`` §9.1).
+    composer starts transferring the moment a file is attached, before the user
+    commits to sending, so removing an attachment chip can arrive after the
+    bytes have already landed. Without this, cancelling is a lie and attach →
+    remove → re-attach cycles accumulate ``_1``/``_2`` copies in a directory
+    the agent can list and read.
 
     ``path`` is relative to ``uploads/`` — i.e. the ``name`` field the upload
     response returned (``report.pdf``, or ``bundle/sub/a.txt`` for a
@@ -736,6 +735,7 @@ async def delete_thread_upload(
         upload, and the usual destination taxonomy (409 no/unready workspace,
         502 unreachable, 503 misconfigured or at capacity) otherwise.
     """
+    # Design: knowledge-base/knowledge/features/session_attachment_send_flow.md §9.1.
     from orchestrator.services.thread_uploads import (
         ThreadUploadError,
         delete_file_from_attested_k8s_workspace,

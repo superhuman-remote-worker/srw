@@ -484,6 +484,7 @@ def test_all_release_dockerfiles_carry_standard_declared_oci_metadata():
         "docker/Dockerfile.mcp",
         "docker/Dockerfile.workspace",
         "docker/Dockerfile.vm-controller",
+        "docker/Dockerfile.cli",
         "docker/agent-vm-base/Dockerfile.containerDisk",
         "docker/agent-vm-base/Dockerfile.containerDisk-stage1",
     )
@@ -541,8 +542,11 @@ def test_image_workflows_pass_full_source_revision_separately_from_short_sha():
     # workspace job labels two images (the full one and the minimal one it is
     # built on), and so does the in-pod plane's (the FUSE opener and the cloud
     # mount supervisor).
-    assert _count_full_revision(main, "org.opencontainers.image.revision") == 17
+    # main builds one image more than develop: srw-cli, the command-line
+    # client's image, which is released from main only.
+    assert _count_full_revision(main, "org.opencontainers.image.revision") == 18
     assert _count_full_revision(develop, "org.opencontainers.image.revision") == 17
+    assert "io.srw.component=cli" in main
     for component in (
         "agent",
         "orchestrator",

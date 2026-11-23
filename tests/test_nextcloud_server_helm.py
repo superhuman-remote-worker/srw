@@ -299,6 +299,39 @@ def test_a_server_config_change_restarts_nextcloud() -> None:
     assert checksum() != checksum("--set", "nextcloud.apache.maxRequestWorkers=48")
 
 
+def test_sso_logins_leave_project_groups_to_srw() -> None:
+    """With unique uids, user_oidc's group provisioning puts a login into a
+    hashed copy of each project group and takes it out of the real one, which
+    owns the folder. SRW writes project-group membership itself."""
+    hook = _hook(_documents(*BUNDLED))
+
+    assert "--group-provisioning=1" not in hook
+    provider_calls = re.findall(r"occ user_oidc:provider .*?2>&1", hook, re.DOTALL)
+    assert len(provider_calls) == 2
+    assert all("--group-provisioning=0" in call for call in provider_calls)
+
+
+def test_a_setup_hook_change_restarts_nextcloud() -> None:
+    """The hook runs only when Nextcloud starts and is mounted by subPath, so
+    a release that changes it must roll the Pod, or the old settings stay."""
+
+    def rendered(*extra: str) -> tuple[str, str]:
+        documents = _documents(*BUNDLED, *extra)
+        annotations = _named(documents, "Deployment", "-nextcloud")["spec"]["template"][
+            "metadata"
+        ]["annotations"]
+        return _hook(documents), annotations["checksum/setup-hook"]
+
+    hook, checksum = rendered()
+    changed_hook, changed_checksum = rendered(
+        "--set", "nextcloud.rateLimits.shareCreate.limit=300"
+    )
+
+    assert hook != changed_hook
+    assert checksum != changed_checksum
+    assert checksum == rendered()[1]
+
+
 def test_s3_bucket_check_is_skipped_only_once_installed_on_s3() -> None:
     line = (
         "occ config:system:set objectstore arguments verify_bucket_exists "

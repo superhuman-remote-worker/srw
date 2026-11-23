@@ -163,15 +163,16 @@ async def get_stuck_jobs(
 ) -> dict[str, Any]:
     """Get jobs suspected stuck, scoped to the caller's visibility (G5).
 
-    E3 (officer_supervision_surface §5): stuckness comes from the one shared
-    liveness computation — audit movement first, then agent heartbeat —
-    never from ``jobs.updated_at`` (display metadata poisoned by trigger
-    cascades). Rows carry the liveness state and reasons. Jobs whose
-    activity evidence is unreachable are returned with
-    ``state='unavailable'`` — surfaced uncertainty, not a fabricated
-    stuck fact. Admins see the full fleet; non-admins see only jobs they
-    own or are project members of.
+    Stuckness comes from the one shared liveness computation — audit movement
+    first, then agent heartbeat — never from ``jobs.updated_at`` (display
+    metadata poisoned by trigger cascades). Rows carry the liveness state and
+    reasons. Jobs whose activity evidence is unreachable are returned with
+    ``state='unavailable'`` — surfaced uncertainty, not a fabricated stuck
+    fact. Admins see the full fleet; non-admins see only jobs they own or are
+    project members of.
     """
+    # Design: knowledge-base/knowledge/features/officer_supervision_surface.md
+    # §5 (slice E3).
     user = await dependencies.require_approved_user(request, dependencies.store)
     return await usage_reporting.stuck_jobs(
         user=user,

@@ -26,6 +26,7 @@ for _metadata_group in (
     _definitions.WORKSPACE_UPGRADE_TOOLS_METADATA,
     _definitions.OFFICER_TOOLS_METADATA,
     _definitions.RESEARCH_TOOLS_METADATA,
+    _definitions.IMAGE_GENERATION_TOOLS_METADATA,
     _definitions.PAPER_TOOLS_METADATA,
     _definitions.RESEARCH_WORKFLOW_TOOLS_METADATA,
     _definitions.BROWSER_DIRECT_TOOLS_METADATA,

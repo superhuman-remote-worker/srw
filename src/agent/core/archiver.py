@@ -38,6 +38,7 @@ Usage:
 """
 
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
@@ -50,6 +51,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from shared.runtime.llm.reasoning_chat import WIRE_ATTEMPTS_KEY, take_wire_attempts
 from shared.runtime_actor import audit_metadata_payload, redact_audit_payload_metadata
 
 logger = logging.getLogger(__name__)
@@ -170,9 +172,65 @@ def _message_to_dict(msg: BaseMessage) -> Dict[str, Any]:
 
     # Include response_metadata if present (token_usage, model_name, finish_reason, etc.)
     if hasattr(msg, "response_metadata") and msg.response_metadata:
-        result["response_metadata"] = msg.response_metadata
+        metadata = msg.response_metadata
+        if WIRE_ATTEMPTS_KEY in metadata:
+            # Wire attempts belong to their call's row (``request.wire``), not
+            # to every later request that replays the message.
+            metadata = {k: v for k, v in metadata.items() if k != WIRE_ATTEMPTS_KEY}
+        if metadata:
+            result["response_metadata"] = metadata
 
     return result
+
+
+def _wire_records(attempts: Optional[Sequence[Any]]) -> List[Dict[str, Any]]:
+    """Wire attempts as stored: plain dicts without the recorder's own keys."""
+    records = []
+    for attempt in attempts or []:
+        if isinstance(attempt, dict):
+            records.append({k: v for k, v in attempt.items() if not k.startswith("_")})
+    return records
+
+
+def _call_timing(
+    started_at: Optional[datetime],
+    wire: List[Dict[str, Any]],
+    attempt: Optional[int],
+) -> Dict[str, Any]:
+    """``metrics`` fields that say when a call started and which try it was.
+
+    ``started_at`` is when the caller began the call (UTC); without one, the
+    send time of the first request on the wire. The row's own ``timestamp``
+    is when it was written, after the reply.
+    """
+    timing: Dict[str, Any] = {}
+    if started_at is not None:
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        timing["started_at"] = started_at.astimezone(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
+    elif wire and wire[0].get("sent_at"):
+        timing["started_at"] = wire[0]["sent_at"]
+    if attempt is not None:
+        timing["attempt"] = attempt
+    return timing
+
+
+def full_tool_io_enabled() -> bool:
+    """Whether tool steps keep their full arguments and result in ``agent_audit``.
+
+    Off by default: a tool result is also in the next model request, so the
+    step row only needs a preview. On (``AUDIT_FULL_TOOL_IO=1``) for a record
+    that must hold every tool call as it ran, including a job's last batch,
+    which no later request carries, and results a compaction later shortens.
+    """
+    return os.environ.get("AUDIT_FULL_TOOL_IO", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def inflight_tool_calls(messages: Sequence[BaseMessage]) -> List[Dict[str, Any]]:
@@ -300,6 +358,9 @@ class LLMArchiver:
         call_type: str = "main",
         auxiliary_metadata: Optional[Dict[str, Any]] = None,
         history_messages: Optional[Sequence[BaseMessage]] = None,
+        started_at: Optional[datetime] = None,
+        attempt: Optional[int] = None,
+        rejected: Optional[str] = None,
     ) -> Optional[str]:
         """Archive an LLM request/response.
 
@@ -328,10 +389,22 @@ class LLMArchiver:
                 list, so an entry is archived as context, never as part of
                 the tool result or user message it was folded into. None:
                 the delta reads ``messages``.
+            started_at: When the caller began this call (UTC), stored as
+                ``metrics.started_at``. None: the send time of the first
+                request on the wire, when the client recorded one.
+            attempt: Which try of the caller's retry loop this row is
+                (1-based), stored as ``metrics.attempt``.
+            rejected: Why the caller did not use this reply (a guard's name).
+                The row is stored with ``metadata.status = "rejected"`` and no
+                chat_history entry: the reply was produced and billed, but is
+                not part of the conversation.
 
         Returns:
             Inserted document ID, or None if archiving failed.
         """
+        # Taken off the reply whether or not the store is reachable, so the
+        # records never ride along in the conversation state.
+        wire = _wire_records(take_wire_attempts(response))
         if not self._ensure_connected():
             return None
 
@@ -346,6 +419,11 @@ class LLMArchiver:
                 request_data["tool_count"] = len(tool_schemas)
             if model_kwargs:
                 request_data["model_kwargs"] = model_kwargs
+            if wire:
+                # One record per request the SDK sent for this call: the send
+                # time, the parameters as sent, the request's shape and the
+                # hash of its body (reasoning_chat._begin_wire_attempt).
+                request_data["wire"] = wire
 
             response_dict = _message_to_dict(response)
 
@@ -370,6 +448,7 @@ class LLMArchiver:
                 # under input_token_details.cache_read here for BOTH APIs, so this is
                 # the provider-agnostic source the metering SQL reads.
                 "usage_metadata": getattr(response, "usage_metadata", None) or {},
+                **_call_timing(started_at, wire, attempt),
             }
 
             tool_count = metrics["tool_calls"]
@@ -398,14 +477,21 @@ class LLMArchiver:
                 else None,
                 "metrics": metrics,
             }
+            if rejected:
+                row["metadata"] = {
+                    **(row["metadata"] or {}),
+                    "status": "rejected",
+                    "rejected": {"reason": rejected},
+                }
             request_id = self._writer.insert_llm_request(row)
             if request_id is None:
                 return None
             logger.info(
                 f"[LLM] {request_id} | job={job_id[:8]}... | {iter_str} | "
                 f"{latency_str} | {tool_str}{type_str}"
+                + (f" | rejected={rejected}" if rejected else "")
             )
-            if call_type == "main":
+            if call_type == "main" and not rejected:
                 self._archive_chat_entry(
                     job_id=job_id,
                     agent_type=agent_type,
@@ -436,15 +522,27 @@ class LLMArchiver:
         latency_ms: Optional[int] = None,
         call_type: str = "main",
         auxiliary_metadata: Optional[Dict[str, Any]] = None,
+        iteration: Optional[int] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        model_kwargs: Optional[Dict[str, Any]] = None,
+        started_at: Optional[datetime] = None,
+        attempt: Optional[int] = None,
+        wire_attempts: Optional[Sequence[Any]] = None,
     ) -> Optional[str]:
         """Archive a FAILED LLM call (no response) to the llm_requests collection.
 
         Mirrors :meth:`archive` for the exception path so a failed call leaves a
-        queryable row (``status="error"``) instead of vanishing. The main loop
-        surfaces its failures via the job's ``error_message``/status, but
-        auxiliary calls are deliberately non-fatal and otherwise leave no trace
-        — this is how a degraded auxiliary model becomes visible in the debug
-        view. Fire-and-forget: never raises.
+        queryable row (``status="error"``) instead of vanishing. Auxiliary
+        calls are deliberately non-fatal and otherwise leave no trace — this is
+        how a degraded auxiliary model becomes visible in the debug view. The
+        main loop archives each try that raised (``attempt``), so a retried
+        call shows every request that went out, not only the one that was
+        answered. Fire-and-forget: never raises.
+
+        ``wire_attempts`` are the requests the client sent for this call
+        (``record_wire_attempts`` / ``wire_attempts_of``); ``started_at``,
+        ``attempt``, ``iteration``, ``tool_schemas`` and ``model_kwargs`` as in
+        :meth:`archive`.
 
         See knowledge-base/knowledge/issues/surface_silent_aux_failures.md.
         """
@@ -452,10 +550,18 @@ class LLMArchiver:
             return None
 
         try:
-            request_data = {
+            wire = _wire_records(wire_attempts)
+            request_data: Dict[str, Any] = {
                 "messages": [_message_to_dict(m) for m in messages],
                 "message_count": len(messages),
             }
+            if tool_schemas:
+                request_data["tools"] = tool_schemas
+                request_data["tool_count"] = len(tool_schemas)
+            if model_kwargs:
+                request_data["model_kwargs"] = model_kwargs
+            if wire:
+                request_data["wire"] = wire
             metrics = {
                 "input_chars": sum(
                     len(_normalize_content(m.content)) for m in messages
@@ -463,6 +569,7 @@ class LLMArchiver:
                 "output_chars": 0,
                 "tool_calls": 0,
                 "token_usage": {},
+                **_call_timing(started_at, wire, attempt),
             }
             type_str = f" | type={call_type}" if call_type != "main" else ""
 
@@ -474,7 +581,7 @@ class LLMArchiver:
                 "agent_type": agent_type,
                 "call_type": call_type,
                 "model": model,
-                "iteration": None,
+                "iteration": iteration,
                 "timestamp": datetime.now(timezone.utc),
                 "latency_ms": latency_ms,
                 "request": request_data,
@@ -887,6 +994,12 @@ class LLMArchiver:
                     "name": tool_name,
                     "call_id": call_id,
                     "arguments": args_preview,
+                    # The arguments as called, uncut (AUDIT_FULL_TOOL_IO).
+                    **(
+                        {"arguments_full": _serialize_payload(arguments)}
+                        if full_tool_io_enabled()
+                        else {}
+                    ),
                     # Result fields - null until update_tool_result() is called
                     "result_preview": None,
                     "result_size_bytes": None,
@@ -935,6 +1048,11 @@ class LLMArchiver:
             }
             if error:
                 payload["tool"]["error"] = self._truncate_string(error, 500)
+            if full_tool_io_enabled():
+                # The result as the tool returned it (AUDIT_FULL_TOOL_IO).
+                payload["tool"]["result"] = result
+                if error:
+                    payload["tool"]["error_full"] = error
             return self._writer.insert_audit_post(audit_doc_id, payload, latency_ms)
 
         except Exception as e:
@@ -1042,6 +1160,74 @@ class LLMArchiver:
         except Exception as e:
             logger.warning(f"Failed to update LLM response: {e}")
             return False
+
+    def close_job_record(
+        self,
+        job_id: str,
+        agent_type: str,
+        flush_timeout_s: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """End a job's run in this process: flush, then leave a receipt.
+
+        Rows the audit store did not take yet (it was down) are written now,
+        waiting up to ``flush_timeout_s`` (``AUDIT_FLUSH_TIMEOUT_S``, 30 s) for
+        it to come back. Then one ``agent_audit`` row with
+        ``step_type = "audit_receipt"`` says what this process did with the
+        job's rows: written, replayed after an outage, dropped. Whoever
+        collects the job's record reads it like this:
+
+        - a receipt with ``complete: true`` — every row is in the store;
+        - a receipt with ``dropped > 0`` — the record has a hole;
+        - no receipt — unknown: the store never came back, or the process
+          died first.
+
+        A job that runs in several pieces (worker batches) leaves one receipt
+        per piece; their counts add up. Blocks: call it off the event loop.
+        Returns the counts at the close, or None when the job wrote nothing.
+        Never raises.
+        """
+        writer = self._writer
+        if writer is None or not hasattr(writer, "insert_job_receipt"):
+            return None
+        try:
+            if flush_timeout_s is None:
+                try:
+                    flush_timeout_s = float(
+                        os.environ.get("AUDIT_FLUSH_TIMEOUT_S", "") or 30.0
+                    )
+                except ValueError:
+                    flush_timeout_s = 30.0
+            flushed = writer.flush(flush_timeout_s)
+            stats = writer.job_stats(job_id)
+            if not stats["rows"] and not stats["spooled"]:
+                return None
+            writer.insert_job_receipt(
+                {
+                    "job_id": job_id,
+                    "agent_type": agent_type,
+                    "iteration": None,
+                    "step_type": "audit_receipt",
+                    "node_name": "job_end",
+                    "timestamp": datetime.now(timezone.utc),
+                    "payload": {"closed_at": _iso_utc_now()},
+                    "metadata": None,
+                }
+            )
+            if not flushed or not stats["complete"]:
+                logger.error(
+                    f"[AUDIT] job={job_id[:8]}... record incomplete at job end: "
+                    f"dropped={stats['dropped']} still_spooled={stats['spooled']} "
+                    f"last_error={stats.get('last_error')}"
+                )
+            elif stats["replayed"]:
+                logger.info(
+                    f"[AUDIT] job={job_id[:8]}... record complete; "
+                    f"{stats['replayed']} row(s) written after an outage"
+                )
+            return stats
+        except Exception as e:
+            logger.warning(f"Failed to close the audit record of job {job_id}: {e}")
+            return None
 
     def close(self):
         """Close the audit backend's connection."""

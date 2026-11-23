@@ -1,10 +1,11 @@
-import {ChangeDetectionStrategy, Component, computed, inject, OnInit} from '@angular/core';
+import {ChangeDetectionStrategy, Component, computed, inject, OnInit, signal} from '@angular/core';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AdminProvidersService, DEFAULT_MODEL_KINDS, DefaultModelKind, HelmManagedDefault} from '../../../core/services/admin-providers.service';
 import {HelmManagedBadgeComponent} from '../../../ui/helm-managed-badge/helm-managed-badge.component';
 import {chatModelLabel, ModelService} from '../../../core/services/model.service';
 import {AppSelectComponent} from '../../../ui/select';
 import {AppFormFieldComponent} from '../../../ui/form-field';
+import {AppInputComponent} from '../../../ui/input';
 
 @Component({
   selector: 'app-admin-defaults',
@@ -15,6 +16,7 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
     HelmManagedBadgeComponent,
     AppSelectComponent,
     AppFormFieldComponent,
+    AppInputComponent,
   ],
   template: `
     <div class="admin-defaults">
@@ -38,7 +40,7 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                   (changed)="setDefault(kind, $event ?? '')"
                 >
                   <option value="">
-                    {{ ((kind === 'search_fallback' || kind === 'live_voice')
+                    {{ ((kind === 'search_fallback' || kind === 'live_voice' || kind === 'image_generation')
                       ? 'admin.providers.defaults.none'
                       : 'admin.providers.defaults.unset') | transloco }}
                   </option>
@@ -48,6 +50,11 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                     }
                   } @else if (kind === 'live_voice') {
                     @for (m of modelService.liveVoiceModels(); track m.id) {
+                      <option [value]="m.id">{{ m.label }}</option>
+                    }
+                  } @else if (kind === 'image_generation') {
+                    <!-- Pin-only: without a pin the agent has no image tool. -->
+                    @for (m of modelService.imageGenerationModels(); track m.id) {
                       <option [value]="m.id">{{ m.label }}</option>
                     }
                   } @else if (kind === 'rerank') {
@@ -104,6 +111,43 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
                   </p>
                 }
               </app-form-field>
+              @if (kind === 'image_generation' && admin.imageGenerationSettings(); as image) {
+                <div class="image-settings" data-testid="image-generation-settings">
+                  <app-form-field
+                    [label]="'admin.providers.defaults.imageGeneration.maxPaidImages' | transloco"
+                    forId="image-max-paid"
+                    [hint]="'admin.providers.defaults.imageGeneration.maxPaidImagesHint' | transloco"
+                  >
+                    <app-input
+                      inputId="image-max-paid"
+                      type="number"
+                      [min]="0"
+                      [max]="10000"
+                      [step]="1"
+                      [value]="'' + image.max_paid_images"
+                      (changed)="saveImageSetting('max_paid_images', $event, 0, 10000)"
+                    />
+                  </app-form-field>
+                  <app-form-field
+                    [label]="'admin.providers.defaults.imageGeneration.threshold' | transloco"
+                    forId="image-threshold"
+                    [hint]="'admin.providers.defaults.imageGeneration.thresholdHint' | transloco"
+                  >
+                    <app-input
+                      inputId="image-threshold"
+                      type="number"
+                      [min]="1"
+                      [max]="100"
+                      [step]="1"
+                      [value]="'' + image.proxy_quota_threshold_percent"
+                      (changed)="saveImageSetting('proxy_quota_threshold_percent', $event, 1, 100)"
+                    />
+                  </app-form-field>
+                  @if (imageSettingsError(); as error) {
+                    <p class="default-warning" role="alert">{{ error | transloco }}</p>
+                  }
+                </div>
+              }
             }
           </div>
         }
@@ -155,6 +199,16 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
       font-size: 12px;
       margin: 6px 0 0;
     }
+    .image-settings {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      padding-left: 12px;
+      border-left: 2px solid var(--border-color);
+    }
+    .image-settings .default-warning {
+      grid-column: 1 / -1;
+    }
   `],
 })
 export class AdminDefaultsComponent implements OnInit {
@@ -175,8 +229,11 @@ export class AdminDefaultsComponent implements OnInit {
     this.modelService.searchModels().length === 0 &&
     this.modelService.fetchModels().length === 0 &&
     this.modelService.rerankModels().length === 0 &&
-    this.modelService.liveVoiceModels().length === 0,
+    this.modelService.liveVoiceModels().length === 0 &&
+    this.modelService.imageGenerationModels().length === 0,
   );
+  /** i18n key of the last image-settings problem, or null. */
+  readonly imageSettingsError = signal<string | null>(null);
   readonly searchFallbackMatchesPrimary = computed(() => {
     const primary = this.admin.defaults().search;
     return !!primary && primary === this.admin.defaults().search_fallback;
@@ -185,12 +242,32 @@ export class AdminDefaultsComponent implements OnInit {
   ngOnInit(): void {
     this.admin.loadDefaults();
     this.admin.loadHelmManaged();
+    this.admin.loadImageGenerationSettings();
     this.modelService.load();
   }
 
   /** Provenance of one pin from `GET /api/admin/helm-managed`, once loaded. */
   helmFor(kind: DefaultModelKind): HelmManagedDefault | null {
     return this.admin.helmManaged()?.defaults?.[kind] ?? null;
+  }
+
+  /** Save one image setting; a value out of range is refused before the call. */
+  saveImageSetting(
+    key: 'max_paid_images' | 'proxy_quota_threshold_percent',
+    raw: string,
+    low: number,
+    high: number,
+  ): void {
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < low || value > high) {
+      this.imageSettingsError.set('admin.providers.defaults.imageGeneration.invalid');
+      return;
+    }
+    this.imageSettingsError.set(null);
+    this.admin.saveImageGenerationSettings({[key]: value}).subscribe({
+      error: () =>
+        this.imageSettingsError.set('admin.providers.defaults.imageGeneration.saveFailed'),
+    });
   }
 
   setDefault(kind: DefaultModelKind, model: string): void {

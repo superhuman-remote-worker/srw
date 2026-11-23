@@ -66,7 +66,7 @@ src/shared/orch_surface/
 | `GET /api/agents` | List registered agents |
 | `PUT /api/agents/{id}/assign` | Assign job to agent |
 
-See `knowledge-base/knowledge/angular_migration_plan.md` for the full orchestration architecture.
+See [Architecture](../../docs/architecture.md) for the full orchestration architecture.
 
 ## Environment Variables
 

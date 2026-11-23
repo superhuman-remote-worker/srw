@@ -32,6 +32,7 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator import main as orch_main
+from tests._kb_context import connector_has_always_existed  # noqa: E402
 from orchestrator.application import controls as controls_composition
 from orchestrator.services import connector_credential_leases as leases
 from orchestrator.services import container_provisioner as container_provisioner_module
@@ -791,3 +792,16 @@ async def test_the_pod_delete_backstop_revokes_only_terminal_executions(
     backstop.assert_awaited_once_with(
         provisioner._db, owner=leases.LeaseOwner(lease_kind, THREAD_ID)
     )
+
+
+@pytest.fixture(autouse=True)
+def _project_knowledge_connector_has_always_existed():
+    """These tests deliver what they select. The unconnected application
+    store cannot answer the one extra lookup the delivery makes."""
+    store = orch_main.app.state.resources.postgres_db
+    with patch.object(
+        store,
+        "get_datasource_by_managed_key",
+        connector_has_always_existed(store),
+    ):
+        yield

@@ -154,7 +154,8 @@ function ordered(items: WorkspaceTemplateItem[]): WorkspaceTemplateItem[] {
     .filters { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem; }
     .group { margin-bottom: 1.5rem; }
     .group h2 { font-size: 0.95rem; margin: 0 0 0.5rem; }
-    .grid th, .grid td { vertical-align: top; }
+    /* Body cells only: a top-aligned header cell pins its label to the top edge of the shared header row. */
+    .grid td { vertical-align: top; }
     .link { background: none; border: 0; padding: 0; color: var(--text-primary); font: inherit; font-weight: 500; cursor: pointer; text-align: left; }
     .link:hover { text-decoration: underline; }
     .desc { display: block; color: var(--text-muted); }

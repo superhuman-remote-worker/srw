@@ -105,6 +105,18 @@ def wire(monkeypatch):
         fetchrow=AsyncMock(return_value=None),
         # An inherited selection is read for what a job cannot attach.
         get_datasource_policy_rows=AsyncMock(return_value=[]),
+        # Admission reads a stored expert by id for the job's effective
+        # `phases` (job_admission.stamp_job_phases). This one states nothing,
+        # so its jobs do not plan in phases.
+        get_expert_by_id=AsyncMock(
+            side_effect=lambda expert_id: {
+                "id": str(expert_id),
+                "name": "stored",
+                "expert_type": "worker",
+                "config": {},
+                "prompts": {},
+            }
+        ),
     )
     defaults = AsyncMock(return_value=([CONNECTOR], {}))
     authorize = AsyncMock(side_effect=lambda _actor, ids, **kw: (list(ids), {}))
@@ -589,8 +601,10 @@ async def test_external_vm_lane_override_keeps_permission_and_merged_grant_order
     permission.assert_awaited_once_with(
         wire.db.get_user.return_value, job_needs_vm=True, dependencies=ANY
     )
+    # Admission states the effective ``phases`` setting (no expert: the
+    # default) before the grants read the override.
     grant_enforcement_module.enforce_job_create_grants.assert_awaited_once_with(
-        {"workspace": {"backend": "vm"}, "autonomy": "partial"},
+        {"workspace": {"backend": "vm"}, "autonomy": "partial", "phases": False},
         user_id=USER,
         project_ids=[PROJECT],
         dependencies=ANY,
@@ -611,8 +625,13 @@ async def test_real_merged_capability_denial_is_refused_before_datasources_or_in
         grant_enforcement_module, "enforce_job_create_grants", wire.enforce_grants
     )
     wire.db.get_project.return_value["default_config_override"] = {"autonomy": "full"}
+    # An administrator's review ceiling (the default is full since 2026-11-11).
     wire.db.list_grants_for_scopes = AsyncMock(
-        return_value={"user": [], "project": [], "global": []}
+        return_value={
+            "user": [],
+            "project": [],
+            "global": [{"key": "autonomy_ceiling", "value_json": "review"}],
+        }
     )
     response = await submit(
         wire,
@@ -1023,8 +1042,9 @@ async def test_actual_create_json_keeps_row_nulls_extensions_and_serialization(
         "user_id": USER,
         "project_id": PROJECT,
         "context": {"expert_selection": {"source": "application", "expert_id": EXPERT}},
-        # Slice A2b: every root Job binds the workspace defaults chain.
-        "config_override": {"workspace": {"backend": "sandbox"}},
+        # Slice A2b: every root Job binds the workspace defaults chain; the
+        # expert states no ``phases``, so admission writes the default.
+        "config_override": {"workspace": {"backend": "sandbox"}, "phases": False},
         "workspace_contract": {"state": "unassigned"},
         "existing_extension": {"nullable": None},
         "workspace_recovery": None,
@@ -1173,10 +1193,12 @@ async def test_public_identity_and_authority_injection_are_stripped_without_new_
         "nested": [{"keep": 1}],
         "expert_selection": {"source": "application", "expert_id": EXPERT},
     }
-    # Slice A2b: every root Job binds the workspace defaults chain.
+    # Slice A2b: every root Job binds the workspace defaults chain; the
+    # expert states no ``phases``, so admission writes the default.
     assert kwargs["config_override"] == {
         "extra": {},
         "workspace": {"backend": "sandbox"},
+        "phases": False,
     }
 
 
@@ -1340,6 +1362,8 @@ async def test_project_and_expert_overrides_merge_before_request_at_real_insert(
         "extra": {"keep": True},
         # Slice A2b: every root Job binds the workspace defaults chain.
         "workspace": {"backend": "sandbox"},
+        # Admission states the effective setting: no layer names one.
+        "phases": False,
     }
     assert args["context"]["expert_selection"] == {
         "source": "project",
@@ -1808,6 +1832,14 @@ async def test_bench_readiness_refusal_precedes_fresh_creator_lookup(wire, monke
         ),
         ({"llm": {"model": "m", "api_key": "sk-caller"}}, "llm.api_key"),
         ({"env_keys": {"EMBEDDING_BASE_URL": "https://evil.example/v1"}}, "env_keys"),
+        # A pinned certificate is transport too: only dispatch writes one,
+        # from the endpoint row an admin trusted.
+        (
+            {"llm": {"model": "m", "tls_pinned_cert": "MIIBcaller"}},
+            "llm.tls_pinned_cert",
+        ),
+        ({"image": {"tls_pinned_cert": "MIIBcaller"}}, "image.tls_pinned_cert"),
+        ({"env_keys": {"EMBEDDING_TLS_PINNED_CERT": "MIIBcaller"}}, "env_keys"),
     ],
 )
 @pytest.mark.asyncio

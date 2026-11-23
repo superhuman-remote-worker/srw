@@ -1,8 +1,10 @@
 import {describe, expect, it} from 'vitest';
 import {
     attachmentDedupeKey,
+    attachmentTypeFromName,
     classifyUploadFailure,
     composeAgentContent,
+    parseAttachmentHint,
     progressWriteDue,
     PROGRESS_WRITE_INTERVAL_MS,
     sendProgressPercent,
@@ -38,6 +40,19 @@ describe('composeAgentContent', () => {
 
     it('returns the text unchanged when there are no files', () => {
         expect(composeAgentContent('hello', [])).toBe('hello');
+    });
+
+    // dictation_composer_redesign.md D1: the recording is no attachment, but
+    // the agent learns where the original audio is.
+    it('names a dictation recording before the attachments hint', () => {
+        expect(composeAgentContent('plan my week', ['a.pdf'], ['voice-message-1.webm'])).toBe(
+            'plan my week\n\n' +
+                '[Transcribed from a voice recording; the original audio is in uploads/: voice-message-1.webm]\n\n' +
+                '[Attached files in uploads/: a.pdf]',
+        );
+        expect(composeAgentContent('hi', [], ['v1.webm', 'v2.webm'])).toBe(
+            'hi\n\n[Transcribed from a voice recording; the original audio is in uploads/: v1.webm, v2.webm]',
+        );
     });
 });
 
@@ -235,5 +250,50 @@ describe('topLevelUploadTargets', () => {
     it('ignores an empty name rather than targeting the uploads root', () => {
         // A DELETE of '' would address uploads/ itself.
         expect(topLevelUploadTargets(['', '/leading.txt'])).toEqual([]);
+    });
+});
+
+
+describe('parseAttachmentHint (image_generation WP5: chips survive a reload)', () => {
+    it('undoes composeAgentContent', () => {
+        const sent = composeAgentContent('Look at these', ['cat.png', 'notes.pdf']);
+        expect(parseAttachmentHint(sent)).toEqual({
+            text: 'Look at these',
+            names: ['cat.png', 'notes.pdf'],
+            recordings: [],
+        });
+    });
+
+    it('reads a message that is only the hint', () => {
+        expect(parseAttachmentHint(composeAgentContent('', ['a.jpg']))).toEqual({
+            text: '',
+            names: ['a.jpg'],
+            recordings: [],
+        });
+    });
+
+    it('leaves a message without a trailing hint alone', () => {
+        const text = 'I wrote [Attached files in uploads/: x] in the middle\nand more';
+        expect(parseAttachmentHint(text)).toEqual({text, names: [], recordings: []});
+        expect(parseAttachmentHint('plain')).toEqual({text: 'plain', names: [], recordings: []});
+    });
+
+    it('strips the dictation hint and reports its recordings apart from the chips', () => {
+        expect(parseAttachmentHint(composeAgentContent('Plan my week', ['a.pdf'], ['v.webm']))).toEqual({
+            text: 'Plan my week',
+            names: ['a.pdf'],
+            recordings: ['v.webm'],
+        });
+        expect(parseAttachmentHint(composeAgentContent('Just talk', [], ['v.webm']))).toEqual({
+            text: 'Just talk',
+            names: [],
+            recordings: ['v.webm'],
+        });
+    });
+
+    it('guesses the type from the name for the chip icon', () => {
+        expect(attachmentTypeFromName('IMG_0001.JPG')).toBe('image/jpeg');
+        expect(attachmentTypeFromName('talk.m4a')).toBe('audio/mp4');
+        expect(attachmentTypeFromName('data.bin')).toBe('application/octet-stream');
     });
 });

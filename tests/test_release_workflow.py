@@ -147,7 +147,10 @@ def test_notes_are_rendered_before_any_build_and_published_after_the_tag():
     assert create["env"]["TITLE"] == "${{ needs.resolve-version.outputs.title }}"
     run = " ".join(create["run"].split())
     assert re.search(r'gh release create "\$TAG" --verify-tag --latest', run)
-    assert "--prerelease" not in run and "--draft" not in run
+    # A release is never created as a draft or a pre-release. The one use of
+    # the flag is publishing a draft that an interrupted upload left behind.
+    assert "--prerelease" not in run
+    assert "--draft" not in run.replace('gh release edit "$TAG" --draft=false', "")
 
 
 def test_the_preview_is_read_only_and_pr_only():

@@ -1,7 +1,8 @@
-import { Component, inject, effect, OnInit } from '@angular/core';
+import { Component, computed, inject, effect, OnInit } from '@angular/core';
 import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { TodoService } from '../../core/services/todo.service';
 import { DataService } from '../../core/services/data.service';
+import { worksWithoutPhases } from '../../core/util/phases';
 import { TodoItem } from '../../core/models/todo.model';
 import { AppButtonComponent } from '../../ui/button';
 import { AppIconButtonComponent } from '../../ui/icon-button';
@@ -135,8 +136,8 @@ import { AppSpinnerComponent } from '../../ui/spinner';
         <div class="empty-state">
           <span class="empty-icon">&#x2705;</span>
           <span>{{ 'todoList.empty.noTodos' | transloco }}</span>
-          <span class="empty-hint">
-            {{ (todo.isShowingCurrent() ? 'todoList.empty.planningHint' : 'todoList.empty.archiveHint') | transloco }}
+          <span class="empty-hint" data-testid="todo-empty-hint">
+            {{ emptyHintKey() | transloco }}
           </span>
         </div>
       }
@@ -442,6 +443,24 @@ export class TodoListComponent implements OnInit {
   readonly todo = inject(TodoService);
   readonly data = inject(DataService);
   private readonly transloco = inject(TranslocoService);
+
+  /** The selected job does its task directly (`phases === false`): it has no
+   *  plan and no phases, so its current todo list may stay empty for the whole
+   *  run. Read from the job rows the workbench already holds; a job whose
+   *  value is unknown (null) keeps the planning hint. */
+  readonly currentJobWorksWithoutPhases = computed(() => {
+    const id = this.data.currentJobId();
+    return !!id && worksWithoutPhases(this.data.jobs().find((job) => job.id === id));
+  });
+
+  /** Why the list is empty: a job without phases (whose current list may not
+   *  exist at all), a job that is still planning, or an archive with no todos. */
+  readonly emptyHintKey = computed(() => {
+    if (this.todo.selectedArchive() === null && this.currentJobWorksWithoutPhases()) {
+      return 'todoList.empty.directTaskHint';
+    }
+    return this.todo.isShowingCurrent() ? 'todoList.empty.planningHint' : 'todoList.empty.archiveHint';
+  });
 
   constructor() {
     // Load todos when selected job changes

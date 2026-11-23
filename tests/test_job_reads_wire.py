@@ -208,8 +208,10 @@ async def test_project_array_keeps_children_change_record_fields_and_distinct_sq
     expected = (
         "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
         "jcr.delivery_sha, jcr.record_type AS change_record_type, "
-        "j.diff_status, j.cloud_diff_baseline_commit, "
-        "j.context->'cloud_checkout' AS cloud_checkout "
+        "j.diff_status, j.cloud_diff_baseline_commit, j.title, "
+        "j.context->'cloud_checkout' AS cloud_checkout, "
+        "CASE j.config_override->>'phases' WHEN 'true' THEN true "
+        "WHEN 'false' THEN false END AS phases "
         "FROM job_summary js JOIN jobs j ON j.id = js.id "
         "LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "
         "WHERE js.project_id = $1"

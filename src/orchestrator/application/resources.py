@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from orchestrator.services.cloud_pricing import CloudCostEstimator
     from orchestrator.services.cloud_task_registry import CloudTaskRegistry
     from orchestrator.services.cloud_user_root import CloudRootConnectFlows
+    from orchestrator.services.job_naming import JobNamingTasks
     from orchestrator.services.completion_runtime import (
         CompletionAlerts,
         CompletionControlBoundary,
@@ -69,6 +70,12 @@ def _cloud_root_connect_flows() -> CloudRootConnectFlows:
     from orchestrator.services.cloud_user_root import CloudRootConnectFlows
 
     return CloudRootConnectFlows()
+
+
+def _job_naming_tasks() -> JobNamingTasks:
+    from orchestrator.services.job_naming import JobNamingTasks
+
+    return JobNamingTasks()
 
 
 @dataclass(eq=False)
@@ -130,6 +137,9 @@ class ApplicationResources:
 
     #: Live sessions' admission tasks (one per session; live_session_jobs).
     live_tasks: LiveTaskRegistry = field(default_factory=LiveTaskRegistry)
+    #: Auxiliary-model calls that name new jobs (services.job_naming),
+    #: request-spawned and drained at shutdown.
+    job_naming_tasks: JobNamingTasks = field(default_factory=_job_naming_tasks)
 
     # -- completion: one runtime and one control boundary per application,
     # wired right after construction because their callbacks close over this

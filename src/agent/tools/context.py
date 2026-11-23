@@ -651,10 +651,18 @@ class ToolContext:
 
     @property
     def kb_ids(self) -> List[str]:
-        """Authorized KB ids, falling back to legacy project scoping."""
-        if self.knowledge_bindings:
-            return [str(binding.kb_id) for binding in self.knowledge_bindings]
-        return list(self.project_ids)
+        """The bound knowledge bases' ids. A project whose knowledge-base
+        connector is not attached is not among them."""
+        return [str(binding.kb_id) for binding in self.knowledge_bindings]
+
+    @property
+    def writable_kb_id(self) -> Optional[str]:
+        """The one knowledge base this runtime may write (its own project's,
+        when attached), or ``None``."""
+        for binding in self.knowledge_bindings:
+            if binding.is_native and binding.writable:
+                return str(binding.kb_id)
+        return None
 
     def knowledge_binding(self, selector: str) -> Optional["KnowledgeBinding"]:
         """Resolve a KB alias or UUID inside the authorized binding set."""

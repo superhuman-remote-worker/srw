@@ -593,7 +593,9 @@
             "token": "mcp-secret"
           }
         },
-        "project_read_only": false
+        "project_read_only": false,
+        "datasource_id": "d500000f-0000-0000-0000-00000000000f",
+        "server_questions": "decline"
       }
     ]
   },
@@ -611,7 +613,9 @@
             "token": "mcp-secret"
           }
         },
-        "project_read_only": true
+        "project_read_only": true,
+        "datasource_id": "d500000f-0000-0000-0000-00000000000f",
+        "server_questions": "decline"
       }
     ]
   },
@@ -1021,7 +1025,9 @@
             "token": "mcp-secret"
           }
         },
-        "project_read_only": true
+        "project_read_only": true,
+        "datasource_id": "d500000f-0000-0000-0000-00000000000f",
+        "server_questions": "decline"
       }
     ]
   },
@@ -1273,7 +1279,9 @@
             "token": "mcp-secret"
           }
         },
-        "project_read_only": true
+        "project_read_only": true,
+        "datasource_id": "d500000f-0000-0000-0000-00000000000f",
+        "server_questions": "decline"
       }
     ]
   },
@@ -1873,7 +1881,9 @@
             "token": "mcp-secret"
           }
         },
-        "project_read_only": false
+        "project_read_only": false,
+        "datasource_id": "d500000f-0000-0000-0000-00000000000f",
+        "server_questions": "decline"
       }
     ]
   },
@@ -2125,7 +2135,9 @@
             "token": "mcp-secret"
           }
         },
-        "project_read_only": true
+        "project_read_only": true,
+        "datasource_id": "d500000f-0000-0000-0000-00000000000f",
+        "server_questions": "decline"
       }
     ]
   },

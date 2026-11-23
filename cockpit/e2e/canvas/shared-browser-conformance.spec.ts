@@ -17,6 +17,12 @@ const GENERATION_ONE = '70000000-0000-4000-8000-000000000001';
 const GENERATION_TWO = '70000000-0000-4000-8000-000000000002';
 const GENERATION_THREE = '70000000-0000-4000-8000-000000000003';
 const MESSAGE = Object.freeze({FRAME: 2, STATE: 3, INPUT: 4, CONTROL: 5, ERROR: 6});
+const STATE_VIEWPORT = Object.freeze({width: 800, height: 400});
+// The CSS size every FRAME header reports. It deliberately disagrees with the
+// decoded 8x8 JPEG, which stays authoritative for the backing store, and with
+// STATE_VIEWPORT: viewer input maps onto the size of the page in the frame on
+// screen, so a pointer position must come out in this space, not STATE's.
+const FRAME_HEADER_SIZE = Object.freeze({width: 999, height: 777});
 const KNOWN_RED_JPEG = Buffer.from(
   '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/2wBDAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAARCAAIAAgDAREAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD856/znP8ArYP/2Q==',
   'base64',
@@ -84,7 +90,7 @@ class BrowserSocketHarness {
     socket.route.send(serverJson(MESSAGE.STATE, {
       generation,
       baton: 'agent',
-      viewport: {width: 800, height: 400},
+      viewport: STATE_VIEWPORT,
       url: 'https://workspace.example.test/start',
       title: 'Workspace start',
       loading: false,
@@ -93,12 +99,13 @@ class BrowserSocketHarness {
   }
 
   sendFrame(socket: RoutedBrowserSocket, generation: string): void {
-    // Diagnostic header dimensions deliberately disagree with the JPEG. The
-    // decoded 8x8 image must remain authoritative for the backing store.
+    // Header dimensions deliberately disagree with the JPEG and with STATE
+    // (see FRAME_HEADER_SIZE): the decoded 8x8 image must remain authoritative
+    // for the backing store, and input must map onto the header's size.
     const header = Buffer.from(JSON.stringify({
       generation,
-      w: 999,
-      h: 777,
+      w: FRAME_HEADER_SIZE.width,
+      h: FRAME_HEADER_SIZE.height,
       ts: 1_753_200_000.25,
     }));
     const prefix = Buffer.alloc(3);
@@ -249,7 +256,10 @@ test.describe('Shared browser Cockpit handoff', () => {
     await expect(release).toBeEnabled();
     await expect(release).toHaveAttribute('aria-pressed', 'true');
 
-    const mapped = await surface.evaluate(canvas => {
+    // A click a quarter across and three quarters down the surface lands at
+    // that fraction of the frame header's CSS size, not of STATE's viewport.
+    const mapped = {x: FRAME_HEADER_SIZE.width / 4, y: FRAME_HEADER_SIZE.height * 3 / 4};
+    await surface.evaluate(canvas => {
       const bounds = canvas.getBoundingClientRect();
       const clientX = bounds.left + bounds.width / 4;
       const clientY = bounds.top + bounds.height * 3 / 4;
@@ -273,7 +283,6 @@ test.describe('Shared browser Cockpit handoff', () => {
         buttons: 0,
         detail: 1,
       }));
-      return {x: 200, y: 300};
     });
     await surface.focus();
     await page.keyboard.down('a');

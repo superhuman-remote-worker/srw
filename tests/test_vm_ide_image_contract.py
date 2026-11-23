@@ -23,3 +23,12 @@ def test_vm_image_installs_disabled_user_code_server_unit():
     config = (ROOT / "docker/agent-vm-base/files/code-server-config.yaml").read_text()
     assert "bind-addr: 127.0.0.1:8080" in config
     assert "auth: none" in config
+    # Port proxy off: /api/ide/<id>/proxy/ must never serve a guest port.
+    assert "disable-proxy: true" in config
+
+
+def test_container_workspace_starts_code_server_without_port_proxy():
+    entrypoint = (ROOT / "docker/workspace-entrypoint.sh").read_text()
+    start = entrypoint.index("$CODE_SERVER_PROCESS_PREFIX code-server")
+    command = entrypoint[start : entrypoint.index('" &', start)]
+    assert "--disable-proxy" in command

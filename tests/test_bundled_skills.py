@@ -280,3 +280,85 @@ def test_phase_skills_are_catalog_hidden_and_bound():
     # prose, and the per-expert stance lives in the expert's own phase skills.
     strategic = (_SKILLS / "strategic-phase" / "SKILL.md").read_text()
     assert "delegate_work" not in strategic and "has_tool(" not in strategic
+
+
+# ---------------------------------------------------------------------------
+# Office deliverable skills: catalog entries whose bundled files must exist,
+# be text (binary skill files are silently dropped on the way to the
+# workspace) and parse.
+# ---------------------------------------------------------------------------
+
+OFFICE_SKILLS = (
+    "pdf-report",
+    "charts",
+    "data-analysis",
+    "spreadsheet",
+    "document",
+    "slides",
+    # Not an office format, but the same contract: a catalog skill whose
+    # bundled scripts and references must ship as text and compile.
+    "image",
+)
+
+
+def test_office_skills_are_catalog_entries_with_text_only_files():
+    for skill in OFFICE_SKILLS:
+        root = _SKILLS / skill
+        fm, body = parse_skill_md((root / "SKILL.md").read_text(encoding="utf-8"))
+        assert not fm.get("catalog"), f"{skill} must stay in the model-invoked catalog"
+        assert fm.get("display_name") and fm.get("icon") and fm.get("tags"), skill
+        for path in root.rglob("*"):
+            if path.is_file():
+                assert "__pycache__" not in path.parts, path
+                path.read_text(encoding="utf-8")  # raises on a binary file
+
+
+def test_office_skill_paths_named_in_any_skill_exist():
+    """Every skills/<name>/<path> a SKILL.md names must ship, so the agent
+    never runs a script that is not there."""
+    pattern = re.compile(
+        r"skills/([a-z0-9-]+)/((?:scripts|assets|references)/[\w./-]+\.\w+)"
+    )
+    for skill in OFFICE_SKILLS:
+        text = (_SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
+        for owner, rel in pattern.findall(text):
+            assert (_SKILLS / owner / rel).is_file(), (
+                f"{skill} names missing skills/{owner}/{rel}"
+            )
+
+
+def test_office_skill_scripts_compile():
+    for skill in OFFICE_SKILLS:
+        for script in (_SKILLS / skill).rglob("*.py"):
+            compile(script.read_text(encoding="utf-8"), str(script), "exec")
+
+
+def test_office_skill_descriptions_point_at_their_siblings():
+    for skill in OFFICE_SKILLS:
+        fm, _ = parse_skill_md(
+            (_SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
+        )
+        _, desc = skill_identity(fm)
+        siblings = [s for s in OFFICE_SKILLS if s != skill and f"`{s}`" in desc]
+        assert siblings, f"{skill}: description names no sibling skill"
+
+
+def test_image_skill_offers_only_the_ways_in_that_are_bound():
+    """The image skill names generate_image only when a model is pinned, and
+    the shell scripts only when there is a shell (image_generation WP2)."""
+    md = (_SKILLS / "image" / "SKILL.md").read_text(encoding="utf-8")
+    full = render_instruction_content(
+        md, ["generate_image", "run_command", "read_file", "compose_images"]
+    )
+    virtual = render_instruction_content(md, ["read_file", "compose_images"])
+
+    assert "`generate_image`. It saves into the" in full
+    assert "skills/image/scripts/batch.py --max-spend" in full
+    assert "No image model is pinned here" not in full
+
+    assert "No image model is pinned here" in virtual
+    assert "Admin → Models → Defaults → Image generation" in virtual
+    assert "batch.py" not in virtual
+    assert "these need a shell" in virtual
+    for rendered in (full, virtual):
+        assert "{%" not in rendered and "region=[left, top, right, bottom]" in rendered

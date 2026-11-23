@@ -502,6 +502,178 @@ async def test_due_pinned_pause_installs_one_exact_retirement_and_operation(
 
 
 @pytest.mark.asyncio
+async def test_thread_release_accepts_deleted_vm_only_with_its_idle_permit(
+    db,
+    monkeypatch,
+):
+    """The controller's delete publishes ``deleted`` before the stop proof.
+
+    A VM Session's idle stop runs under the idle-release cleanup permit, and
+    the HTTP delete records the VM as deleted once it is gone. Completion
+    bridges that projection only with the completed permit for exactly this
+    VM, as a pinned Job's does; a generic deletion is no authority.
+    """
+
+    from orchestrator.services.vm_workspace_recovery_store import (
+        cleanup_intent_digest,
+    )
+
+    thread_id, body, identity = await ready_pinned_thread(db, monkeypatch)
+    await update_thread_status(
+        str(thread_id),
+        body,
+        dependencies=SimpleNamespace(
+            db=db,
+            thread_accepts_runtime=lambda _row: True,
+        ),
+    )
+    source = await db.fetchrow(
+        "SELECT workspace_idle_revision,workspace_idle_episode "
+        "FROM threads WHERE id=$1",
+        thread_id,
+    )
+    episode = json.loads(source["workspace_idle_episode"])
+    episode["episode_id"] = str(uuid4())
+    episode["entered_at"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=16)
+    ).isoformat()
+    await db.execute(
+        "UPDATE threads SET workspace_idle_revision=$2,"
+        "workspace_idle_episode=$3::jsonb WHERE id=$1",
+        thread_id,
+        source["workspace_idle_revision"] + 1,
+        json.dumps(episode),
+    )
+    idle = VMIdleLifecycleStore(db)
+    operation = await idle.admit_thread_release(
+        str(thread_id),
+        episode_id=episode["episode_id"],
+        revision=2,
+        identity=identity,
+        turn_quiescent=True,
+    )
+    assert operation is not None
+    context = json.loads(
+        await db.fetchval(
+            "SELECT runtime_retirement_context FROM threads WHERE id=$1",
+            thread_id,
+        )
+    )
+    assert (
+        await db.acknowledge_pinned_thread_local_quiescence(
+            str(thread_id),
+            expected_runtime_generation=str(operation["thread_runtime_generation"]),
+            expected_retirement_token=str(operation["thread_retirement_token"]),
+            expected_agent_id=context["agent_id"],
+            expected_attach_token=context["runtime_attach_token"],
+            expected_settle_status="suspended",
+            expected_quiescence_protocol="workspace_actuator_zero_v1",
+            expected_workspace_generation=identity["generation"],
+            expected_workspace_runtime_incarnation=identity["vm_uid"],
+        )
+        is not None
+    )
+    assert await db.settle_pinned_thread_retirement(
+        str(thread_id),
+        token=str(operation["thread_retirement_token"]),
+        generation=str(operation["thread_runtime_generation"]),
+        final_status="suspended",
+    )
+    # The VM record may say deleted only after its process-zero receipt.
+    await db.execute(
+        "INSERT INTO managed_repository_process_zero_receipts "
+        "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+        "VALUES('thread',$1,'vm','vm',$2)",
+        thread_id,
+        identity["generation"],
+    )
+    await db.execute(
+        "UPDATE threads SET metadata=jsonb_set(metadata,'{vm}',"
+        "metadata->'vm' || $2::jsonb) WHERE id=$1",
+        thread_id,
+        json.dumps(
+            {
+                "status": "deleted",
+                "_suspend_remote_io_closed": str(operation["id"]),
+            }
+        ),
+    )
+    pod = json.loads(operation["thread_agent_pod_identity"])
+    assert await idle.record_thread_agent_stop(
+        str(operation["id"]),
+        evidence={
+            "version": 1,
+            "pod": pod,
+            "disposition": "exact_absent",
+            "retirement_token": str(operation["thread_retirement_token"]),
+            "controller_authenticated": True,
+        },
+    )
+    evidence = {
+        "version": 1,
+        "kind": "vm_idle_physical_stop",
+        "operation_id": str(operation["id"]),
+        "generation": identity["generation"],
+        "vm_uid": identity["vm_uid"],
+        "vmi_uid": identity["vmi_uid"],
+        "launcher_uid": identity["launcher_uid"],
+        "pvc_uid": identity["pvc_uid"],
+        "vm_absent": True,
+        "vmi_absent": True,
+        "launcher_absent": True,
+        "retained_pvc": True,
+        "controller_authenticated": True,
+        "same_generation_replacement": False,
+    }
+    # Deleted without the idle permit: no authority.
+    assert not await idle.complete_release(str(operation["id"]), evidence=evidence)
+
+    def admission_digest(source_name: str) -> str:
+        return cleanup_intent_digest(
+            {
+                "owner_kind": "thread",
+                "owner_id": str(thread_id),
+                "provision_generation": identity["generation"],
+                "vm_uid": identity["vm_uid"],
+                "pvc_uid": identity["pvc_uid"],
+                "purge_disk": False,
+                "resource": "vm_workspace",
+                "source": source_name,
+            }
+        )
+
+    async def completed_admission(source_name: str) -> None:
+        await db.execute(
+            "INSERT INTO vm_workspace_cleanup_admissions "
+            "(id,owner_kind,owner_id,pvc_uid,source,request_id,completed_at,"
+            "outcome,intent_digest) VALUES ($1,'thread',$2,$3,$4,$5,"
+            "clock_timestamp(),'completed',$6)",
+            uuid4(),
+            thread_id,
+            identity["pvc_uid"],
+            source_name,
+            uuid4(),
+            admission_digest(source_name),
+        )
+
+    # An End's cleanup of the same VM is not the idle stop.
+    await completed_admission("pinned_thread_retirement")
+    assert not await idle.complete_release(str(operation["id"]), evidence=evidence)
+    await completed_admission("vm_idle_release")
+    assert await idle.complete_release(str(operation["id"]), evidence=evidence)
+    assert (
+        await db.fetchval(
+            "SELECT phase FROM vm_idle_operations WHERE id=$1", operation["id"]
+        )
+        == "suspended"
+    )
+    vm = json.loads(
+        await db.fetchval("SELECT metadata->'vm' FROM threads WHERE id=$1", thread_id)
+    )
+    assert vm["status"] == "suspended" and vm["rootdisk"] == "kept"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("permission_status", ["approved", "denied", "pending"])
 async def test_resolved_permission_history_does_not_pin_later_pause(
     db,

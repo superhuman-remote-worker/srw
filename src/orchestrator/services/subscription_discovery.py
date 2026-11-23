@@ -28,6 +28,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from orchestrator.services.llm_endpoint_probe import is_image_generation_id
 from orchestrator.services.subscription_providers import (
     client_protocol_for_channels,
 )
@@ -51,9 +52,15 @@ logger = logging.getLogger(__name__)
 
 #: A candidate SRW can register as a chat model.
 SUPPORT_SUPPORTED = "supported"
-#: Advertised, but the modality is one SRW has no workflow for (image/video
-#: generation). Shown so the inventory is honest; never bulk-imported.
+#: Advertised, but the modality is one SRW has no workflow for (video
+#: generation, speech, embeddings on this route). Shown so the inventory is
+#: honest; never imported. Image generation has a workflow since 2026-11-17
+#: (the ``image_generation`` capability): those candidates are importable.
 SUPPORT_UNSUPPORTED_MODALITY = "unsupported_modality"
+
+#: The adapter an imported proxy image row names (``params_json.provider``):
+#: the proxy serves OpenAI's Images API shape on ``/v1/images/*``.
+PROXY_IMAGE_ADAPTER = "openai-images"
 #: Advertised and probably usable, but protocol/source could not be resolved
 #: with confidence. Registrable one at a time, flagged for review.
 SUPPORT_NEEDS_REVIEW = "needs_review"
@@ -215,7 +222,10 @@ async def discover_subscription_models(
     """
     from orchestrator.services.llm_endpoint_probe import probe_endpoint_models
 
-    probe = await probe_endpoint_models(base_url=base_url, api_key=api_key)
+    # The proxy is an in-cluster http:// Service and is never pinned.
+    probe = await probe_endpoint_models(
+        base_url=base_url, api_key=api_key, tls_pin=None
+    )
     if not probe.ok:
         return DiscoveryResult(
             ok=False, probe_url=probe.probe_url, error=probe.error, candidates=[]
@@ -275,9 +285,14 @@ async def discover_subscription_models(
         )
 
         if not is_chat_candidate(model_id, definition):
-            candidate.support = SUPPORT_UNSUPPORTED_MODALITY
-            candidate.support_reason = "media_generation"
-            candidate.capabilities = ()
+            if is_image_generation_id(model_id):
+                # Importable as an image row, never as chat: the agent's
+                # generate_image tool calls it through /v1/images/*.
+                candidate.capabilities = ("image_generation",)
+            else:
+                candidate.support = SUPPORT_UNSUPPORTED_MODALITY
+                candidate.support_reason = "media_generation"
+                candidate.capabilities = ()
         else:
             protocol = client_protocol_for_channels(sources)
             candidate.client_protocol = protocol
@@ -379,8 +394,10 @@ async def import_candidates(
     * A model already registered on this endpoint is skipped, never re-inserted
       and never rewritten — that is what preserves manual labels, capability
       choices, limits and enabled state across a rediscovery.
-    * A media-generation model is rejected, even if explicitly selected: SRW
+    * A video/other media model is rejected, even if explicitly selected: SRW
       would register it as a chat model and every dispatch to it would fail.
+    * An image-generation model is registered as an ``image_generation`` row
+      with ``provider: openai-images`` and no chat protocol.
     * A ``needs_review`` model is rejected unless the caller opted in, and is
       then stored with ``needs_review`` on its routing block plus the safe
       Chat Completions protocol, so nothing silently inherits Codex behaviour.
@@ -413,18 +430,34 @@ async def import_candidates(
             continue
 
         needs_review = candidate.support == SUPPORT_NEEDS_REVIEW
-        protocol = candidate.client_protocol or PROTOCOL_OPENAI_CHAT
+        is_image = "image_generation" in (candidate.capabilities or ())
         params: dict[str, Any] = {}
-        if candidate.max_output_tokens:
-            params["max_output_tokens"] = candidate.max_output_tokens
-        params = merge_routing_into_params(
-            params,
-            routing_params_block(
+        if is_image:
+            # An image row names its wire shape the way research rows do
+            # (provider + ops); it has no chat protocol, and its routing block
+            # keeps only the provenance. ``billing`` marks it as subscription
+            # traffic for the usage ledger (decision D7, 2026-11-17).
+            params.update(
+                {
+                    "provider": PROXY_IMAGE_ADAPTER,
+                    "ops": ["generate", "edit"],
+                    "billing": "subscription",
+                }
+            )
+            routing = routing_params_block(
+                subscription_sources=candidate.sources,
+                needs_review=needs_review,
+            )
+        else:
+            protocol = candidate.client_protocol or PROTOCOL_OPENAI_CHAT
+            if candidate.max_output_tokens:
+                params["max_output_tokens"] = candidate.max_output_tokens
+            routing = routing_params_block(
                 client_protocol=protocol,
                 subscription_sources=candidate.sources,
                 needs_review=needs_review,
-            ),
-        )
+            )
+        params = merge_routing_into_params(params, routing)
         try:
             row = await db.create_model(
                 provider_kind="endpoint",
@@ -433,7 +466,11 @@ async def import_candidates(
                 display_label=candidate.display_label,
                 capabilities=list(candidate.capabilities or ("chat", "auxiliary")),
                 family=candidate.family or family_of(candidate.model_id),
-                context_window=_capped_context_window(candidate, context_window_cap),
+                context_window=(
+                    None
+                    if is_image
+                    else _capped_context_window(candidate, context_window_cap)
+                ),
                 params_json=params or None,
                 enabled=True,
                 seeded_from="subscription-proxy:discover",

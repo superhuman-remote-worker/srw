@@ -117,6 +117,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from agent.core.thread_messages import _persist_one_message
 from agent.database.postgres_db import PostgresDB
 from agent.services.image_content import IMAGE_DATA_TAG_TEMPLATE
+from agent.unrun_tool_calls import NOT_RUN_STOPPED_BEFORE_START
 from shared.row_identity import _coerce_row_id
 from shared.runtime.core.context_entries import make_context_entry
 from shared.runtime.core.message_markers import stamp_turn_membership
@@ -358,8 +359,9 @@ SCENARIOS: Dict[str, Scenario] = {
         ),
         compact_at_turn=3,
     ),
-    # A tool batch interrupted before it ran: the assistant call stays
-    # without results and the loop appends a "[tool-call interruption]" event.
+    # A tool batch interrupted before it ran: the call gets a not_run result
+    # (a Session turn leaves no call without one) instead of the
+    # "[tool-call interruption]" event a subagent records.
     "interrupted-tool-call": Scenario(
         turns=(
             ("What is in notes.md?", (call(_NOTES),)),
@@ -895,6 +897,9 @@ async def _run_session(session: Session, inputs: Callable[[], Any], monkeypatch:
         check_interrupt=check_interrupt,
         persist_message=persist,
         on_context_compacted=on_context_compacted,
+        # As the Session transport: a call the turn leaves un-run gets a
+        # not_run result.
+        close_unrun_calls=True,
     )
     knowledge_store = MagicMock()
     knowledge_store.get_charter_note = AsyncMock(return_value=harness.CHARTER)
@@ -1372,7 +1377,9 @@ def _check_scenario_ran(scenario_id: str, client: str, probe: Probe) -> None:
         # Path A: the restore starts with the checkpoint's summary.
         assert is_compaction_summary(probe.restored_messages[0])
     if scenario_id == "interrupted-tool-call":
-        assert "[tool-call interruption]" in raw
+        # The harness has no interrupt cause, so the Stop is a person's.
+        assert NOT_RUN_STOPPED_BEFORE_START in raw
+        assert "[tool-call interruption]" not in raw
     if scenario_id == "reasoning":
         # Each provider's reasoning shape is replayed live (Chat Completions
         # never sends reasoning_content back).

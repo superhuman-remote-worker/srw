@@ -2,11 +2,14 @@
 
 Extracted verbatim from ``orchestrator.main`` (R1.B04 lane W).
 
-Three shapes in here are deliberate and must not be tidied:
+Four shapes in here are deliberate and must not be tidied:
 
 * **The service-worker stub answers before authentication.** Its body is
   non-sensitive and browsers refetch it in the background after a cookie
   expires; a 401 there breaks every subsequent visit.
+* **code-server's port proxy is never reached.** ``proxy/`` and ``absproxy/``
+  paths are refused on both routes before authentication: a page served on a
+  workspace port would otherwise run on the origin that serves ``/api``.
 * **A 401 on a top-level browser navigation redirects; a 403 does not.** Only
   the no-session case can be fixed by logging in — sending an
   authenticated-but-unauthorized user through login would loop them.
@@ -26,9 +29,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import posixpath
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote
 from uuid import UUID
 
 import httpx
@@ -146,6 +151,32 @@ def _vm_proxy_path(path: str) -> tuple[str | None, str]:
     if str(lease) != parts[1]:
         return None, path
     return str(lease), parts[2] if len(parts) == 3 else ""
+
+
+# code-server serves whatever listens on a workspace port at /proxy/<port>/ and
+# /absproxy/<port>/. Forwarded through this router, that page would run on the
+# origin that serves /api and could call it as the viewing user. The workspace
+# images start code-server with --disable-proxy; refusing the prefixes here
+# keeps an older image, or any other upstream, from serving them.
+_CODE_SERVER_PORT_PROXY_SEGMENTS = frozenset({"proxy", "absproxy"})
+
+
+def _is_code_server_port_proxy(path: str) -> bool:
+    """True when ``path`` would reach code-server's port proxy upstream.
+
+    Matches the way code-server would route the forwarded path: after the VM
+    lease prefix, percent-decoded until stable, dot segments resolved, first
+    segment compared without case (Express routes ignore case).
+    """
+    _, upstream = _vm_proxy_path(path)
+    for _ in range(4):
+        decoded = unquote(upstream)
+        if decoded == upstream:
+            break
+        upstream = decoded
+    normalized = posixpath.normpath("/" + upstream).lstrip("/")
+    first = normalized.split("/", 1)[0].strip().lower()
+    return first in _CODE_SERVER_PORT_PROXY_SEGMENTS
 
 
 @router.post("/api/jobs/{job_id}/ide")
@@ -435,6 +466,11 @@ async def ide_proxy_http(
             headers={"cache-control": "no-store"},
         )
 
+    # Never forward to code-server's port proxy (see _is_code_server_port_proxy).
+    # Refused before authentication: the answer is the same for everyone.
+    if _is_code_server_port_proxy(path):
+        raise HTTPException(status_code=404, detail="Not Found")
+
     # H1: close the zero-auth hole — pre-fix, any caller knowing (or guessing)
     # the job/thread UUID got full code-server access (file r/w, terminal).
     try:
@@ -671,6 +707,10 @@ async def ide_proxy_ws(
     one this server derived for this owner.
     """
     import websockets
+
+    if _is_code_server_port_proxy(path):
+        await ws.close(code=4404, reason="Not found")
+        return
 
     user = await dependencies.resolve_ws_user(ws, dependencies.store)
     if not user:

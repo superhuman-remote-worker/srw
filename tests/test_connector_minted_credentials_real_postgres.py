@@ -526,7 +526,12 @@ async def test_a_job_is_claimed_only_once_its_credential_is_live(db, kube, monke
     claimed = [args[0] for args, _ in store.called("claim_job_for_agent")]
     assert claimed == [other]
     assert deliveries == {other: "delivered"}
-    # The hung mint is the only one, with one record.
+    # The hung mint is the only one, with one record. Its background task
+    # writes that record on its own schedule, so wait for it as for the other.
+    for _ in range(100):
+        if await _rows(db, dead):
+            break
+        await asyncio.sleep(0.02)
     assert len(await _rows(db, dead)) == 1
     release.set()
     await minted.settle_background_mints()

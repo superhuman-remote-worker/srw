@@ -408,6 +408,36 @@ async def test_progress_preserves_extensions_and_honest_terminal_liveness(
     assert payload["progress_percent"] is None
     assert payload["eta_seconds"] is None
     assert inspection_wire.events[:2] == ["job_auth", "progress"]
+    # Not held: nothing waits for a person.
+    assert payload["held_by"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("context", "held_by"),
+    [
+        ({"_operator_pause_hold": {"source": "operator", "hold_id": "h"}}, "operator"),
+        (
+            {"_operator_pause_hold": {"source": "workspace_recovery_exhausted"}},
+            "workspace_recovery_exhausted",
+        ),
+        # Presence alone holds, whatever the value's shape.
+        ({"_operator_pause_hold": True}, "unknown"),
+        ({"_worker_execution_hold": {}}, "worker_execution_outcome_unknown"),
+        ('{"_operator_pause_hold": {"source": "operator"}}', "operator"),
+        ({"queued_feedback": "x"}, None),
+        (None, None),
+    ],
+)
+async def test_progress_says_when_a_job_waits_for_an_explicit_resume(
+    inspection_wire, context, held_by
+):
+    """A paused job without a hold is picked up again by the dispatcher, so
+    only this field tells "waiting for a person" from "waiting for capacity"."""
+    inspection_wire.job["context"] = context
+    response = await get(inspection_wire, f"{JOB_PATH}/progress")
+    assert response.status_code == 200, response.text
+    assert response.json()["held_by"] == held_by
 
 
 @pytest.mark.asyncio

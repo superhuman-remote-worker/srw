@@ -538,6 +538,7 @@ def install_completion_runtime(resources: ApplicationResources) -> None:
             store=resources.postgres_db,
             notify_all_officers=session_wake.notify_all_officers,
             kick_officer_event_drain=session_wake.kick_event_drain,
+            notifier=notification_service_module.notification_service,
         )
     )
     resources.completion_runtime = CompletionRuntime(
@@ -551,6 +552,8 @@ def install_completion_runtime(resources: ApplicationResources) -> None:
             sweep_alert=resources.completion_alerts.sweep,
             resolution_alert=resources.completion_alerts.resolution,
             monitor_alert=resources.completion_alerts.monitor,
+            park_alert=resources.completion_alerts.parked,
+            parked_settled=resources.completion_alerts.parked_settled,
             max_queued_session_age_seconds=(
                 lambda: float(
                     os.getenv("STATELESS_SESSION_QUEUED_AGE_ALARM_S", "60") or "60"

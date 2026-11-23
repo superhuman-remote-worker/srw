@@ -4,19 +4,19 @@ import {ChangeDetectionStrategy, Component} from '@angular/core';
  * Static SVG explainer: which prompt each agent uses, and where in its loop.
  *
  * Two columns, mirroring the two execution models in the codebase:
- *   - WORKER (jobs)       -> src/graph.py — a LangGraph state machine that
- *                            alternates STRATEGIC (plan/audit) and TACTICAL
- *                            (execute todos) phases. `is_strategic_phase` flips
- *                            both the LLM and the phase prompt
- *                            (strategic.txt | tactical.txt).
+ *   - WORKER (jobs)       -> src/agent/graph.py — a LangGraph state machine
+ *                            that alternates STRATEGIC (plan/audit) and
+ *                            TACTICAL (execute todos) phases. The system prompt
+ *                            is the same in both; each phase opens with its
+ *                            phase skill (strategic-phase | tactical-phase).
  *   - PERSISTENT (sessions) -> src/persistent_graph.py — a turn-based loop with
  *                            no phases; every turn uses one conversational
  *                            prompt (systemprompt_interactive.txt).
  *
  * Both share persona.txt, run summarization_prompt.txt on compaction, and use
  * memory/curation prompts in the background. The bundled files resolve to a
- * model-family variant (e.g. strategic_minimax_m3.txt) via the config matrix —
- * see get_phase_system_prompt() in src/core/loader.py.
+ * model-family variant (e.g. systemprompt_minimax_m3.txt) via the config
+ * matrix — see get_system_prompt() in src/shared/runtime/core/loader.py.
  *
  * Purely presentational (no inputs/state). Colours come from theme tokens so it
  * tracks the active theme. Labels are hardcoded English to match this page
@@ -82,14 +82,13 @@ import {ChangeDetectionStrategy, Component} from '@angular/core';
         <rect x="24" y="316" width="332" height="96" rx="8" class="diag-prompt" />
         <text x="190" y="336" text-anchor="middle" class="diag-prompt-title">PROMPT · EVERY LLM CALL</text>
         <text x="190" y="355" text-anchor="middle" class="diag-prompt-body">
-          system · persona · <tspan class="ink-strategic">strategic</tspan>
-          <tspan class="diag-prompt-body"> | </tspan><tspan class="ink-tactical">tactical</tspan>
+          system · persona
         </text>
         <line x1="48" y1="368" x2="332" y2="368" class="diag-box-divider" />
-        <text x="190" y="386" text-anchor="middle" class="diag-instr-title">INSTRUCTION FILES · ON TRIGGER</text>
+        <text x="190" y="386" text-anchor="middle" class="diag-instr-title">PHASE SKILLS · AT PHASE START</text>
         <text x="190" y="404" text-anchor="middle" class="diag-instr-body">
-          <tspan class="ink-strategic">STRATEGIC</tspan> todo_guide.md
-          <tspan class="diag-box-sep"> │ </tspan><tspan class="ink-tactical">TACTICAL</tspan> research_guide.md
+          <tspan class="ink-strategic">STRATEGIC</tspan> strategic-phase
+          <tspan class="diag-box-sep"> │ </tspan><tspan class="ink-tactical">TACTICAL</tspan> tactical-phase
         </text>
 
         <!-- ============ RIGHT · PERSISTENT (sessions) ============ -->
@@ -127,11 +126,11 @@ import {ChangeDetectionStrategy, Component} from '@angular/core';
       </svg>
 
       <figcaption class="diag-caption">
-        Instruction files inject at their trigger — a phase start, before a
-        specific tool (gated until read), or session setup — per expert config,
-        separate from the every-call prompt. Prompts and instruction files
+        Skills and instruction files inject at their trigger — a phase start,
+        before a specific tool (gated until read), or session setup — per
+        expert config, separate from the every-call prompt. System prompts
         resolve to a model-family variant (e.g.
-        <code>strategic_minimax_m3.txt</code>). Both modes also run
+        <code>systemprompt_minimax_m3.txt</code>). Both modes also run
         <code>summarization_prompt.txt</code> during context compaction and
         <code>memory</code> / <code>curation</code> prompts in the background.
       </figcaption>

@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from shared.runtime.core.llm_retry import RetryPolicy, invoke_with_retry
 from shared.runtime.llm.exceptions import ContextOverflowError
+from shared.runtime.llm.reasoning_chat import wire_attempts_of
 from shared.runtime.llm.structured_recovery import recover_structured
 
 logger = logging.getLogger(__name__)
@@ -1738,6 +1739,7 @@ class AuxiliaryLLM:
                     latency_ms=latency_ms,
                     call_type=call_type,
                     auxiliary_metadata=meta,
+                    wire_attempts=wire_attempts_of(error),
                 )
             elif response is not None:
                 self._archiver.archive(
@@ -1781,6 +1783,7 @@ class AuxiliaryLLM:
                 latency_ms=latency_ms,
                 call_type=call_type,
                 auxiliary_metadata={"task_class": task_class},
+                wire_attempts=wire_attempts_of(exc),
             )
         except Exception as e:
             logger.warning(

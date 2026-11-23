@@ -297,7 +297,8 @@ def test_deprecation_logged_once_per_layer(caplog):
     assert "db-expert:x" in first
     assert "llm.strategic -> llm (model='s')" in first
     assert "llm.subagent -> subagents.llm" in first
-    assert "deprecated since U1" in first
+    assert "deprecated" in first
+    assert ".md" not in first  # no pointer into the private design vault
 
 
 def test_no_warning_for_empty_legacy_blocks(caplog):

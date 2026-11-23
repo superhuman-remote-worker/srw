@@ -3,8 +3,6 @@
  */
 
 export interface RecordingConfig {
-  isHoldToRecord: boolean;
-  maxDuration: number;
   mimeType?: string;
   audioConstraints?: MediaTrackConstraints;
 }
@@ -17,14 +15,8 @@ export interface RecordingResult {
 
 export interface RecordingState {
   isRecording: boolean;
+  /** Whole seconds since the recorder started. */
   duration: number;
-  audioLevel: number;
-}
-
-export interface VisualizationBar {
-  height: number;
-  timestamp: number;
-  x: number;
 }
 
 export interface DeviceCapabilities {

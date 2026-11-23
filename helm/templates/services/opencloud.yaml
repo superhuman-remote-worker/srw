@@ -13,7 +13,7 @@ data:
     log "Running OpenCloud pre-start hook"
     if [ "${PROXY_USER_OIDC_CLAIM:-}" != "sub" ]; then
         log "WARNING: PROXY_USER_OIDC_CLAIM is '${PROXY_USER_OIDC_CLAIM:-<unset>}'," \
-            "expected 'sub'. See knowledge-base/knowledge/operations/opencloud-bootstrap.md §4."
+            "expected 'sub'."
     fi
     if [ -z "${OC_OIDC_ISSUER:-}" ]; then
         log "WARNING: OC_OIDC_ISSUER is not set; OpenCloud will fail login flows."

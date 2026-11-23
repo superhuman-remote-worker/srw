@@ -22,6 +22,7 @@ from shared.datasource_policy import (
     datasource_tool_categories as datasource_tool_categories,
     resolve_repo_clone_names as resolve_repo_clone_names,
 )
+from shared.workspace_disk import WORKSPACE_HOME
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,27 @@ def _has_dir(workspace_manager: Any, relative_path: str) -> bool:
         return False
 
 
+PERSISTENT_HOME_FACT = (
+    f"`{WORKSPACE_HOME}` (this workspace included) is on a persistent volume of "
+    "limited size and survives a workspace restart. Running processes and other "
+    "paths such as `/tmp` do not. This workspace is the job's repository: keep "
+    "large files you can re-create (downloads, virtualenvs, model weights) under "
+    f"`{WORKSPACE_HOME}` outside it."
+)
+
+# The overlay's own refusal text (agent/core/backends/overlay.py, _DENY_TEMPLATE)
+# says the same: generated from live state, copy a file out to a normal path.
+# A brief that asks a script to parse instructions.md stalled a worker for six
+# hours because nothing told it the shell cannot see these files
+# (knowledge-base/knowledge/issues/blocked_worker_cycles_phases_instead_of_stopping.md).
+TOOL_ONLY_FILES_FACT = (
+    "`instructions.md`, `task_brief.md` and the files under `tools/` are "
+    "generated from live state and served by the file tools. They are not on "
+    "disk, so a shell command cannot read them. If a command needs one, copy it "
+    "to a normal workspace path with `copy_file` first."
+)
+
+
 def render_workspace_facts(
     ds_configs: List[Dict[str, Any]],
     workspace_manager: Any,
@@ -116,6 +138,8 @@ def render_workspace_facts(
     project_name: Optional[str] = None,
     expert: Optional[str] = None,
     ssh_identity_status: Optional[Dict[str, str]] = None,
+    persistent_home: bool = False,
+    tool_only_files: bool = False,
 ) -> str:
     """Render the marker-delimited workspace-facts block for README.md.
 
@@ -124,6 +148,16 @@ def render_workspace_facts(
     Never the job id, description, kickoff, or todos — those stay in the
     virtual ``task_brief.md``. Subjobs share their parent's workspace and
     connector set, so the block is safe on shared workspaces.
+
+    ``persistent_home``: the home directory is on a persistent volume and the
+    agent has a shell, so it is told which paths survive a workspace restart.
+    The caller decides; other backends keep different paths and get no line.
+
+    ``tool_only_files``: a job worker with a shell and ``copy_file`` bound, so
+    it is told that its virtual ``instructions.md``, ``task_brief.md`` and
+    ``tools/`` are out of the shell's reach and how to copy one out. The text
+    names no phase tool and reads the same for a job with or without phases.
+    A session has neither file and gets no line.
     """
     lines: List[str] = [WORKSPACE_FACTS_START]
 
@@ -149,6 +183,19 @@ def render_workspace_facts(
     else:
         lines.append("_No input documents._")
     lines.append("")
+
+    storage = [
+        fact
+        for fact, applies in (
+            (PERSISTENT_HOME_FACT, persistent_home),
+            (TOOL_ONLY_FILES_FACT, tool_only_files),
+        )
+        if applies
+    ]
+    if storage:
+        lines += ["## Storage", ""]
+        for fact in storage:
+            lines += [fact, ""]
 
     lines += ["## Layout", "", "- `output/` — deliverables"]
     if _has_dir(workspace_manager, "notes"):
@@ -199,6 +246,8 @@ def inject_workspace_facts(
     project_name: Optional[str] = None,
     expert: Optional[str] = None,
     ssh_identity_status: Optional[Dict[str, str]] = None,
+    persistent_home: bool = False,
+    tool_only_files: bool = False,
 ) -> Optional[str]:
     """Write the workspace-facts block into the workspace's README.md.
 
@@ -228,6 +277,8 @@ def inject_workspace_facts(
             project_name=project_name,
             expert=expert,
             ssh_identity_status=ssh_identity_status,
+            persistent_home=persistent_home,
+            tool_only_files=tool_only_files,
         )
         content = merge_workspace_facts(existing, block)
         workspace_manager.write_file("README.md", content)

@@ -44,7 +44,7 @@ import {AppInputComponent} from '../input';
           {{ cancelLabel() }}
         </app-button>
         <app-button
-          variant="primary"
+          [variant]="confirmVariant()"
           size="sm"
           [disabled]="!canConfirm()"
           (clicked)="confirm()"
@@ -75,6 +75,8 @@ export class AppConfirmNameDialogComponent {
   readonly namePrompt = input<string>('');
   readonly confirmLabel = input<string>('');
   readonly cancelLabel = input<string>('');
+  /** `danger` for a confirmation that removes something for good. */
+  readonly confirmVariant = input<'primary' | 'danger'>('primary');
   readonly confirmed = output<void>();
   readonly dismissed = output<void>();
 

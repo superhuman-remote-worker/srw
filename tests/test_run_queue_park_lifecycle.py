@@ -173,6 +173,7 @@ def test_queue_block_shapes_parked_and_idle():
         "pending_input": True,
         # Filled by queue_block_for_thread from the transcript.
         "unknown_tool_calls": [],
+        "pool_stalled": False,
     }
     refused = sqs.queue_block(
         {

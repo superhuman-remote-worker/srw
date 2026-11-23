@@ -787,3 +787,62 @@ def test_a_worker_counts_mcp_by_delivery_form(datasources, attached):
 
     request = SimpleNamespace(datasources=datasources)
     assert StatelessTurnExecutor._worker_mcp_attached(request) is attached
+
+
+# -- What the README says a connector is for (connectors UX pass, decision 3) --
+
+
+def _facts(entries: list[dict]) -> list[str]:
+    from agent.connectors.registry import ConnectorRegistry
+
+    return ConnectorRegistry.default().facts(
+        deliveries_from_payload(entries),
+        RuntimeContext(execution="session", workspace_manager=None),
+    )
+
+
+def test_a_connector_s_description_is_the_line_under_it():
+    lines = _facts(
+        [
+            {
+                "type": "generic",
+                "name": "Billing API",
+                "description": "Invoices only.\n  Never   send them.",
+                "credentials": {"env_vars": {"BILLING_TOKEN": "x"}},
+            }
+        ]
+    )
+    at = next(i for i, line in enumerate(lines) if "**Billing API**" in line)
+    assert lines[at + 1] == "  Description: Invoices only. Never send them."
+
+
+def test_no_description_adds_no_line():
+    for description in (None, "", "   \n "):
+        lines = _facts(
+            [
+                {
+                    "type": "generic",
+                    "name": "Billing API",
+                    "description": description,
+                    "credentials": {"env_vars": {"BILLING_TOKEN": "x"}},
+                }
+            ]
+        )
+        assert not any("Description:" in line for line in lines)
+
+
+def test_a_long_description_is_cut_at_a_word():
+    from agent.connectors.registry import DESCRIPTION_LIMIT, description_line
+
+    line = description_line({"description": "word " * 400})
+    assert line is not None
+    text = line.removeprefix("  Description: ")
+    assert text.endswith(" …")
+    assert len(text) <= DESCRIPTION_LIMIT + 2
+    assert "wor …" not in text
+
+
+def test_an_unknown_type_gets_its_description_too():
+    lines = _facts([{"type": "redis", "name": "Cache", "description": "Sessions"}])
+    at = next(i for i, line in enumerate(lines) if "**Cache**" in line)
+    assert lines[at + 1] == "  Description: Sessions"

@@ -402,6 +402,14 @@ class TestTheBrief:
     def test_a_loops_copy_says_a_conflict_free_diff_is_applied(self):
         assert "applies the changes you commit" in self._block("applied")
 
+    def test_an_applied_copy_says_what_happens_on_a_conflict(self):
+        """The same notice serves a loop's copy and a full-autonomy job's:
+        applied when the cloud did not move, held for review otherwise."""
+        block = self._block("applied", "reviewed_write_back")
+        assert "applies the changes you commit under `projects/hand_book/`" in block
+        assert "otherwise the job waits for review" in block
+        assert "shown to the job's owner as a diff" not in block
+
     def test_the_seeds_record_is_the_truth(self):
         block = self._block(
             "discarded",
@@ -641,6 +649,133 @@ class TestCapture:
 
         assert result["state"] == "no_changes"
         db.update_job_cloud_diff.assert_not_awaited()
+
+
+class TestFullAutonomy:
+    """Full autonomy includes the project folder (owner's decision,
+    2026-11-16): such a job applies its own conflict-free changes instead of
+    holding them for an accept. It lifts the review, never the level."""
+
+    @pytest.mark.parametrize(
+        "autonomy, context, baseline, unattended",
+        [
+            ("full", {"cloud_checkout": {"access": "reviewed_write_back"}}, "b", True),
+            ("full", {}, "b", True),  # an older job's implicit copy
+            ("full", {"cloud_checkout": {"access": "read_only"}}, "b", False),
+            ("full", {}, None, False),  # no copy at all
+            (
+                "review",
+                {"cloud_checkout": {"access": "reviewed_write_back"}},
+                "b",
+                False,
+            ),
+            (
+                "partial",
+                {"cloud_checkout": {"access": "reviewed_write_back"}},
+                "b",
+                False,
+            ),
+            (None, {"cloud_checkout": {"access": "reviewed_write_back"}}, "b", False),
+        ],
+    )
+    def test_which_jobs_apply_their_own_changes(
+        self, autonomy, context, baseline, unattended
+    ):
+        job = {"context": context, "cloud_diff_baseline_commit": baseline}
+        assert checkout.unattended_write_back(job, autonomy=autonomy) is unattended
+
+    @pytest.mark.parametrize(
+        "access, loop, unattended, edits",
+        [
+            ("reviewed_write_back", False, False, "reviewed"),
+            ("reviewed_write_back", False, True, "applied"),
+            ("read_only", False, True, "discarded"),
+            (None, False, False, "reviewed"),
+            (None, False, True, "applied"),
+            (None, True, False, "applied"),
+        ],
+    )
+    def test_what_happens_to_edits(self, access, loop, unattended, edits):
+        assert (
+            checkout.checkout_edits(access, loop=loop, unattended=unattended) == edits
+        )
+
+    def _context(self, edits="reviewed", access="reviewed_write_back"):
+        return {
+            "cloud_checkout": {"datasource_id": CHECKOUT_ID, "access": access},
+            "cloud_connectors": [
+                checkout_entry(
+                    project_slug="hand_book",
+                    folder="Hand Book",
+                    edits=edits,
+                    access=access,
+                    datasource_id=CHECKOUT_ID,
+                ),
+                outbox_entry(datasource_id=OUTBOX_ID),
+            ],
+        }
+
+    def _job(self, context):
+        return {"context": context, "cloud_diff_baseline_commit": "b"}
+
+    def test_a_full_autonomy_job_is_told_its_changes_are_applied(self):
+        context = self._context()
+        restated = checkout.restated_for_autonomy(
+            context, job=self._job(context), autonomy="full"
+        )
+        copy = connector_entry(restated, "cloud_folder_checkout")
+        assert copy["edits"] == "applied"
+        # Everything else about the copy, and the outbox beside it, is as
+        # admission wrote it.
+        assert copy["path"] == "projects/hand_book/"
+        assert copy["access"] == "reviewed_write_back"
+        assert copy["datasource_id"] == CHECKOUT_ID
+        assert connector_entry(restated, "cloud_outbox") == outbox_entry(
+            datasource_id=OUTBOX_ID
+        )
+        # The stored context is not touched: the row keeps admission's entry.
+        assert connector_entry(context, "cloud_folder_checkout")["edits"] == "reviewed"
+
+    @pytest.mark.parametrize("autonomy", ["review", "partial", "guided", None])
+    def test_a_job_below_full_autonomy_is_told_nothing_new(self, autonomy):
+        context = self._context()
+        assert (
+            checkout.restated_for_autonomy(
+                context, job=self._job(context), autonomy=autonomy
+            )
+            is None
+        )
+
+    def test_a_read_only_copy_stays_discarded_at_full_autonomy(self):
+        context = self._context(edits="discarded", access="read_only")
+        assert (
+            checkout.restated_for_autonomy(
+                context, job=self._job(context), autonomy="full"
+            )
+            is None
+        )
+
+    def test_a_copy_already_told_applied_is_left_alone(self):
+        context = self._context(edits="applied")
+        assert (
+            checkout.restated_for_autonomy(
+                context, job=self._job(context), autonomy="full"
+            )
+            is None
+        )
+
+    def test_a_job_without_a_copy_entry_is_told_nothing(self):
+        context = {"cloud_checkout": {"access": "reviewed_write_back"}}
+        assert (
+            checkout.restated_for_autonomy(
+                context, job=self._job(context), autonomy="full"
+            )
+            is None
+        )
+        assert (
+            checkout.restated_for_autonomy(None, job=self._job({}), autonomy="full")
+            is None
+        )
 
 
 class TestCriticApproval:

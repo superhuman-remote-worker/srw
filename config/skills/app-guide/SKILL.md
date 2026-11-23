@@ -209,7 +209,7 @@ that does not depend on the missing fact.
 | The agent roster: which expert for which task, custom experts | `experts` | `references/experts.md` |
 | Projects, members, shared context, settings | `projects-and-loops` | `references/projects-and-loops.md` |
 | Project loops: Standard/parallel stages, Campaign scheduling, budgets, pause/resume/stop | `project-loops` | `references/project-loops.md` |
-| Connector overview: supported types, access, attachment, databases, WebDAV, repositories, MCP, credential files | `datasources` | `references/datasources.md` |
+| Connector overview: supported types, access, attachment, databases, WebDAV, repositories, MCP (server questions and files), credential files | `datasources` | `references/datasources.md` |
 | Connecting Email: providers, app passwords, access tiers, folder and recipient limits, attaching a mailbox | `datasources-email` | `references/datasources-email.md` |
 | Connecting an external OKF Knowledge Base: Git source, indexing, readiness, reindexing, read-only behavior | `datasources-okf` | `references/datasources-okf.md` |
 | Protected Cloud sessions: eligibility, staging, whole-diff review/apply/reject, troubleshooting | `protected-cloud` | `references/protected-cloud.md` |

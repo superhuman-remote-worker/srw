@@ -1418,6 +1418,25 @@ PAPER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 
 
 # research/web
+IMAGE_GENERATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
+    "generate_image": {
+        "module": "image_generation.tool",
+        "function": "generate_image",
+        "description": (
+            "Generate or edit images with the installation's pinned image model "
+            "and save them in the workspace (one image or a numbered contact "
+            "sheet comes back to look at)."
+        ),
+        "category": "image_generation",
+        "effect": "write",
+        "short_description": (
+            "Generate or edit images (pinned image model); saves them in the workspace."
+        ),
+        "phases": ["strategic", "tactical"],
+    },
+}
+
+
 RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "web_search": {
         "module": "research.web",
@@ -1649,6 +1668,17 @@ FILE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "workspace.files",
         "function": "edit_file",
         "description": "Edit a file: replace text, or use position='end'/'start' to append/prepend (requires read_file first)",
+        "category": "workspace",
+        "effect": "write",
+        "phases": ["strategic", "tactical"],
+    },
+    "compose_images": {
+        "module": "workspace.images",
+        "function": "compose_images",
+        "description": (
+            "Put several workspace images into one labelled grid (contact "
+            "sheet, character sheet) and save it as a PNG"
+        ),
         "category": "workspace",
         "effect": "write",
         "phases": ["strategic", "tactical"],

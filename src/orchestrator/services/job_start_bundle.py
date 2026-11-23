@@ -46,6 +46,9 @@ from orchestrator.services import connector_bind_time, connector_credential_leas
 from orchestrator.services.config_resolver import unrouted_model_slots
 from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
 from orchestrator.services.job_datasource_selection import shell_connector_names
+from orchestrator.services.implied_project_knowledge import (
+    with_implied_project_knowledge,
+)
 from orchestrator.services.job_workspace_runtime import (
     JobWorkspaceRuntimeDependencies,
     apply_sticky_sudo_denial,
@@ -510,6 +513,15 @@ async def build_job_start_request(
         )
         dependencies.apply_cloud_storage_override(resolved_ds, job_context)
         datasources_payload = dependencies.build_datasources_payload(resolved_ds)
+        # The agent binds a knowledge base only when its connector is among
+        # these entries. A job that was never offered its project's
+        # knowledge-base connector keeps the knowledge base all the same.
+        datasources_payload = await with_implied_project_knowledge(
+            datasources_payload,
+            store=postgres_db,
+            project_ids=[job.get("project_id")],
+            created_at=job.get("created_at"),
+        )
 
         # Apply datasource-driven tool override (inject/strip db tool categories)
         if resolved_ds:
@@ -923,6 +935,27 @@ async def build_job_start_request(
                         )
                     return _refused("connector_bind_refused", str(exc)[:1000])
                 return None
+
+        # What the job is told about its project-folder copy follows the
+        # autonomy it really runs at, which only this point knows: admission
+        # wrote the entry before the configuration was resolved. A job that
+        # will apply its own changes at completion is told so. The row keeps
+        # admission's entry; every start restates it from the same rule
+        # completion applies (job_cloud_checkout.unattended_write_back).
+        if resolved_config:
+            from orchestrator.services.completion import get_autonomy_level
+            from orchestrator.services.job_cloud_checkout import (
+                restated_for_autonomy,
+            )
+            from shared.job_cloud_connectors import CLOUD_CONNECTORS_CONTEXT_KEY
+
+            restated = restated_for_autonomy(
+                remaining_context,
+                job=job,
+                autonomy=get_autonomy_level({"resolved_config": resolved_config}),
+            )
+            if restated is not None:
+                remaining_context[CLOUD_CONNECTORS_CONTEXT_KEY] = restated
 
         # Build job start request. resolved_config and config_override are
         # mutually exclusive on the wire: a delivered blob is complete, so we

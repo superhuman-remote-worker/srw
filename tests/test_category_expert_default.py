@@ -86,8 +86,9 @@ def _preparation(
     )
 
 
-def _grant_store(grants) -> SimpleNamespace:
-    """What prepare_srw_snapshot reads for a non-admin owner."""
+def _grant_store(grants, restricted=()) -> SimpleNamespace:
+    """What prepare_srw_snapshot reads for a non-admin owner: ``grants`` are
+    user-scope allows, ``restricted`` an administrator's global denies."""
     return SimpleNamespace(
         manifest_runtime_image="installed:1",
         get_user_settings=AsyncMock(return_value={"default_model": "gpt-4o"}),
@@ -98,7 +99,7 @@ def _grant_store(grants) -> SimpleNamespace:
             return_value={
                 "user": [{"key": key, "value_json": True} for key in grants],
                 "project": [],
-                "global": [],
+                "global": [{"key": key, "value_json": False} for key in restricted],
             }
         ),
     )
@@ -124,6 +125,7 @@ def harness(monkeypatch):
         slot_patch=None,
         ticket_tags=None,
         grants=GRANTED,
+        restricted=(),
         preview=None,
         bundled=Mock(return_value=True),
         custom_harness_grant=True,
@@ -153,7 +155,9 @@ def harness(monkeypatch):
     def preview(**kwargs):
         if state.preview is not None:
             return state.preview(**kwargs)
-        return preview_expert_refusals(_grant_store(state.grants), **kwargs)
+        return preview_expert_refusals(
+            _grant_store(state.grants, state.restricted), **kwargs
+        )
 
     def config_deps():
         return JobAdmissionConfigDependencies(
@@ -530,13 +534,30 @@ async def test_no_recognized_category_leaves_the_fallback_alone(harness, categor
 
 
 @pytest.mark.asyncio
-async def test_an_owner_without_shell_grants_keeps_the_worker_that_runs(
+async def test_an_owner_with_default_grants_gets_the_category_default(harness):
+    """Shell and delegation are granted by default since 2026-11-11, so a
+    non-admin owner with no grant rows is staffed by the category default
+    (engineer) itself, with nothing refused."""
+    harness.grants = ()
+
+    inputs = await harness.admit(work_category="executor")
+
+    assert inputs.config_name == "engineer"
+    selection = inputs.context["expert_selection"]
+    assert selection["source"] == "category"
+    assert not selection.get("denied_defaults")
+
+
+@pytest.mark.asyncio
+async def test_an_owner_whose_delegation_is_restricted_keeps_the_worker_that_runs(
     harness, caplog
 ):
-    """engineer, scholar and product-qa all carry a shell and delegation; a
-    non-admin owner without those grants would have the create refused (422)
-    by the snapshot renderer. The fallback is kept, and it is admissible."""
+    """engineer, scholar and product-qa all carry delegation; under an
+    administrator's global ``delegation: false`` a non-admin owner would have
+    the create refused (422) by the snapshot renderer. The fallback is kept,
+    and it is admissible."""
     harness.grants = ()
+    harness.restricted = ("delegation",)
 
     with caplog.at_level(logging.WARNING):
         inputs = await harness.admit(work_category="executor")
@@ -549,12 +570,12 @@ async def test_an_owner_without_shell_grants_keeps_the_worker_that_runs(
     assert selection["source"] == "application"
     [denied] = selection["denied_defaults"]
     assert (denied["source"], denied["expert"]) == ("category", "engineer")
-    assert any(r.startswith("shell_tools:") for r in denied["reasons"])
+    assert not any(r.startswith("shell_tools:") for r in denied["reasons"])
     assert any(r.startswith("delegation:") for r in denied["reasons"])
-    assert "delegation, shell_tools" in caplog.text
+    assert "refused for owner" in caplog.text and "(delegation)" in caplog.text
     assert (
         await preview_expert_refusals(
-            _grant_store(()),
+            _grant_store((), ("delegation",)),
             config_name=inputs.config_name,
             owner_id=USER,
             project_id=PROJECT,

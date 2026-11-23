@@ -321,9 +321,9 @@ async def test_read_only_hides_write_tools_before_any_process_sees_them(pod):
     try:
         names = {t.metadata["mcp_tool_name"] for t in manager.get_langchain_tools()}
         assert names == set(READ_TOOLS)
-        from mcp.shared.exceptions import McpError
+        from mcp.shared.exceptions import MCPError
 
-        with pytest.raises(McpError) as refused:
+        with pytest.raises(MCPError) as refused:
             await manager._handles[0].session.call_tool("notes_write", {})
         assert "Unknown tool" in str(refused.value)
         assert manager.statuses == {"Memory": "connected"}
@@ -428,7 +428,7 @@ async def test_a_crashed_process_is_replaced_when_the_client_reconnects(pod):
         # The call the process died on is answered at once as a session
         # that ended: the client reconnects (and retries it once, on a
         # process that dies too) instead of waiting for its call timeout.
-        assert "MCP tool error" in await _text(crash)
+        assert (await _text(crash)).startswith("Error: MCP tool Memory/crash failed")
         assert time.monotonic() - began < manager_module.MCP_CALL_TIMEOUT / 2
         assert await _until(lambda: not _alive(first))
         answer = json.loads(await _text(whoami))

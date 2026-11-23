@@ -6,7 +6,9 @@ account needs, what its real limits are — comes from enrichment. The rules
 tested here are the ones that keep a bulk import honest:
 
 * a media-generation model advertised beside the chat models is never imported
-  as a chat model, even when explicitly selected;
+  as a chat model, even when explicitly selected; an image-generation model is
+  imported as an ``image_generation`` row (no chat protocol) since 2026-11-17,
+  a video model stays refused;
 * an already-registered model is skipped, never rewritten, so a rediscovery
   cannot clobber an admin's label/limits/enabled state;
 * a failed enrichment yields *incomplete metadata*, never an authoritative
@@ -123,6 +125,34 @@ class TestModalityClassification:
 
     def test_a_name_that_merely_contains_a_word_is_not_swept_up(self):
         assert discovery.is_chat_candidate("vision-pro-chat", None)
+
+
+class TestImageModels:
+    @pytest.mark.asyncio
+    async def test_image_models_are_importable_image_rows_and_video_is_not(self, wired):
+        wired["probe"] = _probe(
+            ["gpt-image-2", "gpt-image-2.6-flare", "grok-imagine-video", "gpt-6"]
+        )
+        wired["attribution"] = (
+            {
+                "gpt-image-2": [_account("codex-1.json", "codex")],
+                "gpt-image-2.6-flare": [_account("codex-1.json", "codex")],
+                "grok-imagine-video": [_account("grok-1.json", "xai")],
+                "gpt-6": [_account("codex-1.json", "codex")],
+            },
+            [],
+        )
+        result = await _discover()
+        by_id = {c.model_id: c for c in result.candidates}
+        for image in ("gpt-image-2", "gpt-image-2.6-flare"):
+            assert by_id[image].support == discovery.SUPPORT_SUPPORTED
+            assert by_id[image].capabilities == ("image_generation",)
+            assert by_id[image].client_protocol is None
+        assert (
+            by_id["grok-imagine-video"].support
+            == discovery.SUPPORT_UNSUPPORTED_MODALITY
+        )
+        assert by_id["gpt-6"].capabilities == ("chat", "auxiliary")
 
 
 class TestAttribution:
@@ -446,19 +476,52 @@ class TestImport:
             endpoint_id=ENDPOINT_ID,
             candidates=[
                 self._candidate(
-                    model_id="gpt-image-2",
+                    model_id="grok-imagine-video",
                     support=discovery.SUPPORT_UNSUPPORTED_MODALITY,
                     support_reason="media_generation",
                     capabilities=(),
                 )
             ],
-            requested_ids=["gpt-image-2"],
+            requested_ids=["grok-imagine-video"],
             include_review=False,
         )
         assert outcome.rejected == [
-            {"id": "gpt-image-2", "reason": "unsupported_modality"}
+            {"id": "grok-imagine-video", "reason": "unsupported_modality"}
         ]
         db.create_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_image_model_is_registered_as_an_image_row(self):
+        db = self._db()
+        outcome = await discovery.import_candidates(
+            db=db,
+            endpoint_id=ENDPOINT_ID,
+            candidates=[
+                self._candidate(
+                    model_id="gpt-image-2",
+                    display_label="gpt-image-2",
+                    sources=("codex",),
+                    providers=("codex",),
+                    client_protocol=None,
+                    capabilities=("image_generation",),
+                    context_window=None,
+                    max_output_tokens=None,
+                )
+            ],
+            requested_ids=["gpt-image-2"],
+            include_review=False,
+        )
+        assert outcome.created == ["gpt-image-2"]
+        kwargs = db.create_model.await_args.kwargs
+        assert kwargs["capabilities"] == ["image_generation"]
+        assert kwargs["context_window"] is None
+        params = kwargs["params_json"]
+        assert params["provider"] == "openai-images"
+        assert params["ops"] == ["generate", "edit"]
+        assert params["billing"] == "subscription"
+        # Provenance only: an image row has no chat protocol to route by.
+        assert "client_protocol" not in params["routing"]
+        assert params["routing"]["subscription_sources"] == ["codex"]
 
     @pytest.mark.asyncio
     async def test_needs_review_is_excluded_from_add_all(self):

@@ -658,3 +658,43 @@ async def test_four_editable_gates_agree_for_writable_office_and_reject_memory(
     )
     monkeypatch.setattr(canvas_files.shutil, "which", lambda name: f"/usr/bin/{name}")
     assert gateway.supports_editing(_thread(backend="virtual"), record) is False
+
+
+def test_putfile_runs_inside_the_vm_write_authority(monkeypatch) -> None:
+    """A VM Office save holds the durable VM write lease around edit_file.
+
+    The authority is a no-op for this container thread; the wrapper is what a
+    VM Session's save goes through (tests/test_canvas_vm_workspace.py).
+    """
+
+    from contextlib import asynccontextmanager
+
+    from orchestrator.routers import wopi
+
+    client, _, gateway, service = _wopi_client(monkeypatch)
+    entered: list[tuple[str, object]] = []
+    inside: list[bool] = []
+    original_edit = service.edit_file
+
+    @asynccontextmanager
+    async def authority(thread, *, store):
+        entered.append((thread["id"], store))
+        inside.append(True)
+        try:
+            yield
+        finally:
+            inside.append(False)
+
+    async def edit_file(*args, **kwargs):
+        assert inside and inside[-1] is True
+        return await original_edit(*args, **kwargs)
+
+    monkeypatch.setattr(wopi, "vm_canvas_write_authority", authority)
+    monkeypatch.setattr(service, "edit_file", edit_file)
+
+    response = _putfile(client)
+
+    assert response.status_code == 200
+    assert entered == [(THREAD_ID, client.app.state.store)]
+    assert inside == [True, False]
+    assert gateway.writes == [NEW_BYTES]

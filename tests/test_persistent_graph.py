@@ -2144,15 +2144,38 @@ class TestExecuteTurnKnowledgeRetrieval:
         assert "[docs] docs:external-0" in carrier.content
 
     @pytest.mark.asyncio
-    async def test_knowledge_search_called_with_project_ids(self):
-        """hybrid_search called with project_ids as UUIDs."""
+    @pytest.mark.parametrize(
+        "scope",
+        [
+            {"project_id": "550e8400-e29b-41d4-a716-446655440000"},
+            {
+                "project_ids": [
+                    "550e8400-e29b-41d4-a716-446655440000",
+                    "660e8400-e29b-41d4-a716-446655440001",
+                ]
+            },
+        ],
+        ids=["one-project", "two-projects"],
+    )
+    async def test_a_project_without_its_knowledge_base_attached_is_not_searched(
+        self, scope
+    ):
+        """The attached connectors decide what a session reads. A session in
+        a project whose knowledge-base connector is not attached has no
+        binding, and its project id alone starts no search."""
         ks = MagicMock()
         ks.hybrid_search = AsyncMock(return_value=[])
+        ks.search_chunks = AsyncMock(return_value=[])
+        context = MagicMock()
+        context.knowledge_bindings = []
+        context.citation_engine = None
+        context.subagent_runtime = None
+        context.consume_freeze_request.return_value = None
 
         messages = [SystemMessage(content="sys"), HumanMessage(content="what auth?")]
         callbacks = _make_callbacks()
 
-        await _execute_turn(
+        result = await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
             context_manager=AsyncMock(
@@ -2164,13 +2187,14 @@ class TestExecuteTurnKnowledgeRetrieval:
             auxiliary_llm=None,
             config=_make_config(),
             knowledge_store=ks,
-            project_id="550e8400-e29b-41d4-a716-446655440000",
+            tool_context=context,
+            **scope,
         )
 
-        ks.hybrid_search.assert_called_once()
-        call_kwargs = ks.hybrid_search.call_args[1]
-        assert call_kwargs["match_count"] == 5
-        assert call_kwargs["query"] == "what auth?"
+        assert result.error is None
+        ks.hybrid_search.assert_not_called()
+        ks.search_chunks.assert_not_called()
+        assert not [m for m in messages if is_context_entry(m)]
 
     @pytest.mark.asyncio
     async def test_knowledge_not_called_without_project_id(self):
@@ -2225,8 +2249,28 @@ class TestExecuteTurnKnowledgeRetrieval:
     @pytest.mark.asyncio
     async def test_knowledge_timeout_is_non_fatal(self):
         """Timeout on knowledge retrieval is non-fatal."""
+        import uuid
+
+        from agent.services.knowledge.bindings import KnowledgeBinding
+
+        project_id = "550e8400-e29b-41d4-a716-446655440000"
         ks = MagicMock()
-        ks.hybrid_search = AsyncMock(side_effect=asyncio.TimeoutError)
+        ks.embedding_service.model = "test-embed"
+        ks.embedding_service.expected_dimensions = 16
+        ks.search_chunks = AsyncMock(side_effect=asyncio.TimeoutError)
+        context = MagicMock()
+        context.knowledge_bindings = [
+            KnowledgeBinding(
+                kb_id=uuid.UUID(project_id),
+                alias="project",
+                name="Project Knowledge",
+                kind="native",
+                writable=True,
+            )
+        ]
+        context.citation_engine = None
+        context.subagent_runtime = None
+        context.consume_freeze_request.return_value = None
 
         messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
         callbacks = _make_callbacks()
@@ -2243,41 +2287,12 @@ class TestExecuteTurnKnowledgeRetrieval:
             auxiliary_llm=None,
             config=_make_config(),
             knowledge_store=ks,
-            project_id="550e8400-e29b-41d4-a716-446655440000",
+            project_id=project_id,
+            tool_context=context,
         )
 
         assert result.error is None
-
-    @pytest.mark.asyncio
-    async def test_knowledge_uses_project_ids_list(self):
-        """project_ids takes priority over project_id."""
-        ks = MagicMock()
-        ks.hybrid_search = AsyncMock(return_value=[])
-
-        messages = [SystemMessage(content="sys"), HumanMessage(content="q")]
-        callbacks = _make_callbacks()
-
-        pid1 = "550e8400-e29b-41d4-a716-446655440000"
-        pid2 = "660e8400-e29b-41d4-a716-446655440001"
-
-        await _execute_turn(
-            llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
-            tool_map={},
-            context_manager=AsyncMock(
-                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
-            ),
-            messages=messages,
-            callbacks=callbacks,
-            llm_timeout=600,
-            auxiliary_llm=None,
-            config=_make_config(),
-            knowledge_store=ks,
-            project_ids=[pid1, pid2],
-        )
-
-        ks.hybrid_search.assert_called_once()
-        call_kwargs = ks.hybrid_search.call_args[1]
-        assert len(call_kwargs["project_ids"]) == 2
+        ks.search_chunks.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

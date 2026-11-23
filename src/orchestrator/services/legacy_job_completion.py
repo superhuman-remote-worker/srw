@@ -34,7 +34,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
-from shared.workspace_disk import WorkspaceVolumeGrowth
+from shared.workspace_disk import WorkspaceTermination, WorkspaceVolumeGrowth
 
 
 CompletionCallback = Callable[..., Any]
@@ -67,6 +67,16 @@ def _checkout_capture_applies(job: dict[str, Any]) -> bool:
     from orchestrator.services.job_cloud_checkout import capture_applies
 
     return capture_applies(job)
+
+
+def _unattended_write_back(job: dict[str, Any]) -> bool:
+    """Whether the job applies its own project-folder changes at completion:
+    it runs at full autonomy and its copy's changes go back at all
+    (``job_cloud_checkout.unattended_write_back``)."""
+    from orchestrator.services.completion import get_autonomy_level
+    from orchestrator.services.job_cloud_checkout import unattended_write_back
+
+    return unattended_write_back(job, autonomy=get_autonomy_level(job))
 
 
 @dataclass(frozen=True, slots=True)
@@ -972,6 +982,17 @@ async def complete_job_legacy(
                         expected_runtime_incarnation=str(runtime_incarnation),
                     )
 
+                async def _read_pod_termination() -> WorkspaceTermination | None:
+                    runtime_incarnation = _get_container_context(job).get(
+                        WORKSPACE_RUNTIME_INCARNATION_KEY
+                    )
+                    if not runtime_incarnation:
+                        return None
+                    return await container_provisioner.read_workspace_termination(
+                        WorkspaceOwner.job(job_id),
+                        expected_runtime_incarnation=str(runtime_incarnation),
+                    )
+
                 async def _recover_pod_workspace() -> dict[str, Any]:
                     return await handle_pod_workspace_recovery(
                         job,
@@ -981,6 +1002,7 @@ async def complete_job_legacy(
                         delete_workspace=_delete_pod,
                         cleanup_service=container_provisioner,
                         grow_workspace_volume=_grow_pod_volume,
+                        read_termination=_read_pod_termination,
                         trigger_dispatch=_trigger_dispatch,
                         completion_command_id=(
                             _effect_runner.command_id
@@ -1656,17 +1678,35 @@ async def complete_job_legacy(
                 )
 
         # 1a. Project-cloud delivery. Every project job receives a cloud
-        # baseline in its isolated repo. Ordinary jobs retain the human
-        # accept/reject workflow. Loop jobs auto-apply only a completely
-        # readable, conflict-free diff; any conflict, backend failure, or
-        # partial write parks the member at pending_review, so its loop barrier
-        # cannot rotate past an unresolved durable-file state.
+        # baseline in its isolated repo. Loop jobs, and jobs that run at full
+        # autonomy, auto-apply only a completely readable, conflict-free
+        # diff; any conflict, backend failure, or partial write parks the job
+        # at pending_review, so a loop barrier cannot rotate past an
+        # unresolved durable-file state and a full-autonomy job never
+        # overwrites newer cloud state. Every other job keeps the human
+        # accept/reject workflow.
         from orchestrator.services.project_loops import job_loop_id
 
         _completion_loop_id = job_loop_id(job)
         if _completion_loop_id:
             completion_idle_branch = None
-        if _completion_loop_id and new_status == "completed":
+        # Full autonomy includes the project folder (owner's decision,
+        # 2026-11-16): the review a completed job's diff used to wait for is
+        # the one stop such a job has no person for. A read-only copy and a
+        # job below full autonomy are untouched.
+        _unattended_copy = bool(
+            not _completion_loop_id
+            and new_status == "completed"
+            and job.get("cloud_diff_baseline_commit")
+            and gitea_client.is_initialized
+            and _unattended_write_back(job)
+        )
+        if _unattended_copy:
+            completion_idle_branch = None
+        _delivery_label = (
+            "loop cloud delivery" if _completion_loop_id else "project folder delivery"
+        )
+        if (_completion_loop_id or _unattended_copy) and new_status == "completed":
 
             async def _deliver_loop_project_cloud() -> dict[str, Any]:
                 if delivery_control_claim_id is not None:
@@ -1714,9 +1754,9 @@ async def complete_job_legacy(
                         else "completed"
                     )
                     action = (
-                        f"loop cloud delivery {delivery_status} -> pending_review"
+                        f"{_delivery_label} {delivery_status} -> pending_review"
                         if status == "pending_review"
-                        else f"loop cloud delivery -> {delivery_status}"
+                        else f"{_delivery_label} -> {delivery_status}"
                     )
                     result = {
                         "new_status": status,
@@ -1727,10 +1767,11 @@ async def complete_job_legacy(
                         result["legacy_loop_delivery"] = loop_delivery
                     return result
                 except Exception as exc:
-                    # Fail closed for loops. Advancing here would strand the only
+                    # Fail closed. Advancing here would strand the only
                     # durable copy of this turn's project-file contribution.
                     logger.exception(
-                        "Loop cloud delivery failed for job %s; parking for review",
+                        "%s failed for job %s; parking for review",
+                        _delivery_label.capitalize(),
                         job_id,
                     )
                     try:
@@ -1756,7 +1797,7 @@ async def complete_job_legacy(
                     return {
                         "new_status": "pending_review",
                         "delivery_status": "cloud-unavailable",
-                        "action": "loop cloud delivery failed -> pending_review",
+                        "action": f"{_delivery_label} failed -> pending_review",
                     }
 
             loop_delivery_result = await _run_completion_effect(
@@ -1792,7 +1833,20 @@ async def complete_job_legacy(
                     loop_context["loop_cloud_delivery"] = legacy_loop_delivery
                     job["context"] = loop_context
             actions.append(str(loop_delivery_result["action"]))
-        elif (
+            # A full-autonomy job nobody is watching says on its row why it
+            # waits, like a seal whose delivery could not be proven.
+            if _unattended_copy and new_status == "pending_review":
+                if not error_message:
+                    error_message = (
+                        "Project folder changes were not applied "
+                        f"({loop_delivery_result['delivery_status']}); they "
+                        "wait for review."
+                    )[:1000]
+        # A full-autonomy job whose delivery settled (applied, or nothing to
+        # apply) has no diff left to review. One the delivery parked is
+        # captured like every other job's, so its owner finds the same diff
+        # and the same accept and reject as before.
+        if (
             job.get("cloud_diff_baseline_commit")
             # ``reviewing``: a job whose critic runs first is captured now; the
             # critic's approval then lands on pending_review while the diff
@@ -1801,6 +1855,7 @@ async def complete_job_legacy(
             and gitea_client.is_initialized
             and not _completion_loop_id
             and _checkout_capture_applies(job)
+            and (not _unattended_copy or new_status == "pending_review")
         ):
 
             async def _capture_mode_a_diff() -> dict[str, Any]:

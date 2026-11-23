@@ -126,6 +126,36 @@ async def expect_state(reader, predicate, timeout: float = 30.0):
                 return state
 
 
+async def expect_frame_size(reader, width: int, height: int, timeout: float = 20.0):
+    """The next FRAME whose CSS size is width x height: (header, jpeg)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"no {width}x{height} frame")
+        header, jpeg = BE.decode_frame_payload(
+            await expect_frame(reader, BE.T_FRAME, timeout=remaining)
+        )
+        if (round(header.get("w") or 0), round(header.get("h") or 0)) == (
+            width,
+            height,
+        ):
+            return header, jpeg
+
+
+async def collect_states(reader, seconds: float) -> list:
+    """Every STATE for ``seconds``; stops only between whole frames."""
+    deadline = time.monotonic() + seconds
+    states = []
+    while time.monotonic() < deadline:
+        frame_type, payload = await asyncio.wait_for(
+            BE.read_stream_frame(reader), timeout=20
+        )
+        if frame_type == BE.T_STATE:
+            states.append(json.loads(payload.decode()))
+    return states
+
+
 async def close_writer(writer) -> None:
     if writer is None:
         return
@@ -306,12 +336,84 @@ setInterval(() => { document.getElementById("t").textContent =
         )
         await asyncio.sleep(0.5)
 
+        # The viewer sizes the page: opt in, then each size reaches STATE and
+        # the frames 1:1 (the window is resized; a phone width is emulated
+        # inside Chromium's narrowest window).
+        await send_json(
+            writer,
+            BE.T_CONTROL,
+            {"op": "client_features", "features": ["viewport_control"]},
+        )
+        state = await expect_state(reader, lambda item: "viewport_control" in item)
+        check(
+            "viewport control advertised after opt-in",
+            state.get("viewport_control") is True,
+        )
+        for width, height, label in (
+            (1024, 700, "pane-sized"),
+            (390, 844, "phone width (emulated)"),
+            (768, 1024, "tablet portrait"),
+            (1440, 900, "desktop"),
+        ):
+            await send_json(
+                writer,
+                BE.T_CONTROL,
+                {"op": "set_viewport", "width": width, "height": height},
+            )
+            wanted = {"width": width, "height": height}
+            state = await expect_state(
+                reader, lambda item, wanted=wanted: item.get("viewport") == wanted
+            )
+            header, jpeg = await expect_frame_size(reader, width, height)
+            check(
+                f"set_viewport {label}",
+                state["viewport"] == wanted,
+                f"{width}x{height}, frame {len(jpeg)} bytes",
+            )
+        await send_json(
+            writer,
+            BE.T_CONTROL,
+            {"op": "set_viewport", "width": 5000, "height": 5000},
+        )
+        state = await expect_state(
+            reader, lambda item: item["viewport"]["width"] > 1440
+        )
+        check(
+            "set_viewport stays inside the screen",
+            state["viewport"]["width"] <= BE.SCREEN_WIDTH
+            and state["viewport"]["height"] < BE.SCREEN_HEIGHT,
+            str(state["viewport"]),
+        )
+        await send_json(
+            writer,
+            BE.T_CONTROL,
+            {"op": "set_viewport", "width": 1280, "height": 800},
+        )
+        await expect_state(
+            reader,
+            lambda item: item["viewport"] == {"width": 1280, "height": 800},
+        )
+        # A frame captured before the resize can still be in flight; its size
+        # would briefly move STATE back. Drain to a frame of the new size.
+        await expect_frame_size(reader, 1280, 800)
+
         # Release to browser-use and click its indexed target=_blank link. The
         # ClickElementEvent path owns agent focus; raw CDP clicks intentionally
         # leave a newly opened background tab out of focus.
         await send_json(writer, BE.T_CONTROL, {"op": "release_baton"})
         state = await expect_state(reader, lambda item: item.get("baton") == "agent")
         check("baton released", state["baton"] == "agent")
+        await send_json(
+            writer,
+            BE.T_CONTROL,
+            {"op": "set_viewport", "width": 800, "height": 600},
+        )
+        states = await collect_states(reader, 1.5)
+        check(
+            "set_viewport ignored while the agent drives",
+            all(item["viewport"] == {"width": 1280, "height": 800} for item in states),
+            str([item["viewport"] for item in states]),
+        )
         snapshot = unix_action("snapshot", {})
         check(
             "target-blank page snapshot",

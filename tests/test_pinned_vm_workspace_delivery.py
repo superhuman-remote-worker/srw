@@ -51,6 +51,7 @@ def vm_delivery(monkeypatch):
         "rootdisk_pvc_uid": "99999999-9999-4999-8999-999999999999",
         "active_pod_uid": LAUNCHER,
         "ssh_registration_id": "registration-1",
+        "ssh_ready_source": "provisioner_probe",
         "ssh_host_key_fingerprint": FINGERPRINT,
         "ssh_host": "10.42.1.23",
         "ssh_port": 22,
@@ -186,11 +187,77 @@ async def test_attested_vm_delivery_reaches_real_remote_backend(
     assert remote.host == "10.42.1.23"
     assert remote._port == 22
     assert remote._workspace_tier == "vm"
-    assert not remote.supports_canvas_presentation
+    # A controller-authenticated same-cluster VM gets the file Canvas; the
+    # live-app proxy has no VM path, and the browser follows its own flag.
+    assert remote.supports_canvas_presentation
     assert not remote.supports_canvas_live_apps
     assert not remote.supports_canvas_shared_browser
     assert session.workspace_generation == GENERATION
     assert session.workspace_runtime_incarnation == LAUNCHER
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("browser_flag", "expected"),
+    [("true", (True, False, True)), (None, (True, False, False))],
+)
+async def test_vm_canvas_capabilities_reach_the_agent_backend(
+    vm_delivery, monkeypatch, browser_flag, expected
+):
+    # A tailnet VM (VM_MODE=external) is covered at the gate itself in
+    # tests/test_canvas_vm_workspace.py: its delivery needs the NATS bridge.
+    monkeypatch.setenv("CANVAS_LIVE_PREVIEW_ENABLED", "true")
+    if browser_flag is None:
+        monkeypatch.delenv("CANVAS_SHARED_BROWSER_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", browser_flag)
+    payload = await _deliver(vm_delivery)
+    assert (
+        payload["canvas_presentation_available"],
+        payload["canvas_live_apps_available"],
+        payload["canvas_shared_browser_available"],
+    ) == expected
+
+    normalized = await _normalize(payload)
+
+    assert normalized["backend"] == "vm"
+    assert (
+        normalized["canvas_presentation_available"],
+        normalized["canvas_live_apps_available"],
+        normalized["canvas_shared_browser_available"],
+    ) == expected
+
+
+@pytest.mark.asyncio
+async def test_canvas_vm_attestation_uses_the_real_provisioner_proof(
+    vm_delivery, monkeypatch
+):
+    """The Canvas proof is the provisioner's own signed attestation."""
+    from orchestrator.services import canvas_ssh
+    from orchestrator.services import vm_provisioner as vm_provisioner_module
+
+    monkeypatch.setattr(
+        vm_provisioner_module, "vm_provisioner", vm_delivery.provisioner
+    )
+    target = canvas_ssh.resolve_canvas_workspace_target(
+        vm_delivery.thread, canvas_ssh.canvas_workspace_generation(vm_delivery.thread)
+    )
+
+    assert target.vm_runtime == (
+        GENERATION,
+        "vm-uid",
+        LAUNCHER,
+        vm_delivery.vm["rootdisk_pvc_uid"],
+    )
+    assert await canvas_ssh.attest_vm_workspace_target(target) == "current"
+
+    # The controller now sees another launcher Pod for the same VM.
+    vm_delivery.observed["active_pod_uid"] = SUCCESSOR
+    assert await canvas_ssh.attest_vm_workspace_target(target) == "changed"
+
+    # The controller cannot answer: never a positive proof.
+    vm_delivery.provisioner._query_http = AsyncMock(side_effect=OSError("down"))
+    assert await canvas_ssh.attest_vm_workspace_target(target) == "unknown"
 
 
 @pytest.mark.asyncio

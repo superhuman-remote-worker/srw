@@ -31,8 +31,10 @@ class FakeManager:
             for name in names
         ]
         self.statuses = {"fake": "connected"}
+        self.image_checks = []
 
-    def get_langchain_tools(self):
+    def get_langchain_tools(self, sees_images=None, save_file=None):
+        self.image_checks.append(sees_images)
         return self._tools
 
 
@@ -86,6 +88,9 @@ def test_load_tools_pulls_from_manager():
     tools = load_tools(["mcp__a__one"], context)
 
     assert [tool.name for tool in tools] == ["mcp__a__one"]
+    # The tools are bound to this context's own "does the model see
+    # images" check, so a subagent's model never decides for its parent.
+    assert manager.image_checks[-1] == context.get_phase_multimodal
 
 
 def test_load_tools_without_manager_warns_not_raises():

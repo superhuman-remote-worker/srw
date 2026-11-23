@@ -1,12 +1,15 @@
 """Tests for ReasoningChatOpenAI — Layer 0 overflow protection and reasoning capture.
 
 Tests count_request_tokens, ContextOverflowError raising, reasoning_content
-extraction, _extract_responses_api_reasoning, and the _is_quota_error heuristic.
+extraction, _extract_responses_api_reasoning, the _is_quota_error heuristic,
+and the pinned endpoint certificate on both capture clients.
 """
+# ruff: noqa: F811  (the imported fixture is requested by name as a test argument)
 
 import json
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from shared.runtime.llm.exceptions import ContextOverflowError
@@ -21,7 +24,17 @@ from shared.runtime.llm.reasoning_chat import (
     _dump_codex_raw_response,
     _SSEReasoningTap,
     ReasoningCapturingClient,
+    ReasoningChatOpenAI,
+    record_wire_attempts,
 )
+from shared.tls_pinning import (
+    AsyncPinnedTransport,
+    CertificateChangedError,
+    PinnedTransport,
+    TlsPin,
+)
+from tests.tls_pin_fixtures import caused_by
+from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 
 # =============================================================================
@@ -706,3 +719,72 @@ class TestInstallStreamingReasoningTap:
         for _ in resp.iter_bytes():
             pass
         assert tap.reasoning_content == "hello"
+
+
+# =============================================================================
+# Pinned endpoint certificate: both capture clients trust only the pin
+# =============================================================================
+
+
+class TestPinnedCertificate:
+    def _llm(self, base_url, pin=None, **kwargs):
+        return ReasoningChatOpenAI(
+            model="m1",
+            api_key="sk-test",
+            base_url=base_url,
+            max_retries=0,
+            timeout=20,
+            tls_pin=pin,
+            **kwargs,
+        )
+
+    def test_both_capture_clients_use_the_pinned_transport(self, tls_certs):
+        pin = TlsPin.from_pem(tls_certs.leaf.read_text())
+        llm = self._llm("https://127.0.0.1:9/v1", pin)
+        sync_transport = llm._reasoning_client._transport
+        async_transport = llm._async_reasoning_client._transport
+        assert type(sync_transport) is PinnedTransport and sync_transport._pin == pin
+        assert type(async_transport) is AsyncPinnedTransport
+        assert async_transport._pin == pin
+        # The SDK sends through exactly these two clients.
+        assert llm.http_client is llm._reasoning_client
+        assert llm.http_async_client is llm._async_reasoning_client
+
+    def test_no_pin_keeps_the_default_transports(self):
+        llm = self._llm("https://127.0.0.1:9/v1")
+        assert type(llm._reasoning_client._transport) is httpx.HTTPTransport
+        assert type(llm._async_reasoning_client._transport) is httpx.AsyncHTTPTransport
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_call_is_recorded_as_it_went_out(self, tls_certs):
+        pin = TlsPin.from_pem(tls_certs.leaf.read_text())
+        with tls_server(tls_certs.leaf, tls_certs.leaf_key) as server:
+            llm = self._llm(server.url, pin)
+            with record_wire_attempts() as mine:
+                reply = await llm.ainvoke("hi")
+        assert reply.content == "ok"
+        assert [a["status"] for a in mine] == [200]
+        assert mine[0]["path"] == "/v1/chat/completions"
+
+    @pytest.mark.asyncio
+    async def test_a_changed_certificate_is_recorded_and_nothing_sent(self, tls_certs):
+        pin = TlsPin.from_pem(tls_certs.leaf.read_text())
+        with tls_server(tls_certs.swap, tls_certs.swap_key) as server:
+            llm = self._llm(server.url, pin)
+            with record_wire_attempts() as mine:
+                with pytest.raises(Exception) as raised:
+                    await llm.ainvoke("hi")
+        assert caused_by(raised.value, CertificateChangedError)
+        assert [a["error"] for a in mine] == ["CertificateChangedError"]
+        assert "TLS certificate changed" in mine[0]["error_message"]
+        assert server.requests == []
+
+    def test_the_sync_client_is_pinned_too(self, tls_certs):
+        pin = TlsPin.from_pem(tls_certs.leaf.read_text())
+        with tls_server(tls_certs.leaf, tls_certs.leaf_key) as server:
+            assert self._llm(server.url, pin).invoke("hi").content == "ok"
+        with tls_server(tls_certs.swap, tls_certs.swap_key) as server:
+            with pytest.raises(Exception) as raised:
+                self._llm(server.url, pin).invoke("hi")
+        assert caused_by(raised.value, CertificateChangedError)
+        assert server.requests == []

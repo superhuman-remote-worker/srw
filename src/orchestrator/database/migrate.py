@@ -660,8 +660,7 @@ async def _require_migration_ledger_shape(conn: asyncpg.Connection) -> None:
             f"{sorted(missing)}; this is most likely a legacy table "
             f"from before the migration runner. Drop it manually "
             f"(DROP TABLE public.schema_migrations) and let the runner "
-            f"recreate it. See knowledge-base/knowledge/db_migration.md "
-            f"§Operational runbook."
+            f"recreate it."
         )
 
 
@@ -881,10 +880,14 @@ async def run_migrations(
                 ]
                 if unrecoverable_dirty:
                     dirty = unrecoverable_dirty[0]
+                    # Developer runbook: knowledge-base/knowledge/db_migration.md
+                    # §Operational runbook. The operator-facing page is public.
                     raise RuntimeError(
-                        f"dirty migration {dirty['filename']!r}: "
-                        f"{dirty['error']!s}; manual repair required "
-                        f"(see knowledge-base/knowledge/db_migration.md §Operational runbook)"
+                        f"dirty migration {dirty['filename']!r} in the "
+                        f"{migrations_dir.name} database: "
+                        f"{dirty['error']!s}; manual repair required (see "
+                        f"https://docs.superhuman-remote-worker.com/troubleshooting/"
+                        f"#the-orchestrator-restarts-with-dirty-migration)"
                     )
                 for dirty in dirty_rows:
                     path = next(

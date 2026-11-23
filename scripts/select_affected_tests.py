@@ -104,6 +104,7 @@ DATA_PREFIXES = (
     "scripts",
     "vm",
     "docker",
+    "cli",
 )
 
 #: Tests that assert a repo-wide invariant without naming a path a literal scan

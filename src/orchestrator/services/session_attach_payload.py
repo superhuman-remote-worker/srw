@@ -36,6 +36,9 @@ from fastapi import HTTPException
 
 from shared.permission_modes import DEFAULT_PERMISSION_MODE, normalize_permission_mode
 from orchestrator.services.config_overrides import deep_merge_dicts as _deep_merge_dicts
+from orchestrator.services.implied_project_knowledge import (
+    with_implied_project_knowledge,
+)
 from orchestrator.services.model_availability import ModelUnavailable
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
@@ -254,6 +257,15 @@ async def assemble_session_attach_payload(
 
         resolved_datasources = apply_review_delivery_branch(_meta, resolved_datasources)
         datasources = _build_datasources_payload(resolved_datasources)
+        # The agent binds a knowledge base only when its connector is among
+        # these entries. A session that was never offered its project's
+        # knowledge-base connector keeps the knowledge base all the same.
+        datasources = await with_implied_project_knowledge(
+            datasources,
+            store=postgres_db,
+            project_ids=project_ids,
+            created_at=_thread.get("created_at"),
+        )
         config_override = _build_datasource_tool_override(
             resolved_datasources, config_override
         )

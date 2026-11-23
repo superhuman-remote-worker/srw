@@ -70,6 +70,40 @@ kubectl -n srw delete pvc srw-workspace
 
 With `ReadWriteOnce`, workspace pods run on one node at a time.
 
+## Jobs stay in `created` and nothing is dispatched
+
+**Symptom.** New jobs stay in `created` although agents and workspaces are
+available. The orchestrator log has no `Dispatcher:` line for minutes, and
+shows:
+
+```text
+ERROR orchestrator.services.dispatch_watchdog: Dispatcher stalled: a scheduling pass has been running for 240 s (2 workspace preparation(s) running, 14 job(s) waiting for one)
+```
+
+**Cause.** The job dispatcher runs on one orchestrator replica (the leader)
+and makes a scheduling pass every 30 seconds. A pass that waits on something
+that never answers stops all dispatch. The orchestrator logs this error once
+no pass has finished for `orchestrator.dispatcher.stallAlarmSeconds` (180 by
+default) and repeats it every five minutes.
+
+**Fix.** Restart the leader:
+
+```bash
+kubectl -n srw rollout restart deploy/srw-orchestrator
+```
+
+Jobs that were waiting are picked up by the next pass; running jobs are not
+affected. To have SRW do this by itself, set
+`orchestrator.dispatcher.stallRestartSeconds` (for example `600`): the replica
+then ends itself after a stall of that length, and Kubernetes starts it again.
+It is off by default.
+
+A related line, `workspace preflight for job … did not return within 1800 s;
+cancelled it and freed its slot`, means one job's workspace preparation hung.
+SRW prepares two workspaces at a time, so it cancels a preparation after
+`orchestrator.dispatcher.preflightTimeoutSeconds` and retries that job later
+instead of letting it block the others.
+
 ## Certificates are not issued
 
 **Symptom.** The browser warns about an untrusted or self-signed certificate on
@@ -353,6 +387,54 @@ kubectl -n srw exec srw-postgres-0 -- sh -c 'psql -U "$POSTGRES_USER" -d "${POST
 Fix what `last_error` names, such as a service that is down or a credential
 that changed. The next background pass then finishes the delete; nothing else
 is needed.
+
+## The orchestrator restarts with "dirty migration"
+
+**Symptom.** The orchestrator Pod restarts in a loop. Its log ends with
+`dirty migration '<file>.sql' in the <name> database: ...; manual repair
+required`.
+
+**Cause.** The orchestrator applies database migrations when it starts and
+records each one in the `schema_migrations` table of its database: `app`,
+`vector` or `audit`. A migration that failed stays recorded as failed, with its
+error. The orchestrator does not start on top of a failed migration, because
+it cannot tell how much of it was applied. SRW retries some known failures on
+its own; this message means the failure is not one of them.
+
+**Fix.**
+
+1. Read the error after the file name. Common causes are a lock timeout
+   because a long query held the table, a full disk, or a database role that
+   lacks a privilege. Fix that cause first.
+2. Check how much was applied. A file ending in `.sql` runs in one
+   transaction, so a failure leaves nothing behind. A file ending in
+   `.notx.sql` runs statement by statement and can stop halfway. Its statements
+   are usually `CREATE INDEX CONCURRENTLY`, and a failed one leaves an invalid
+   index of that name, which you drop. The file is in
+   [`src/orchestrator/database/migrations/<name>/`](../src/orchestrator/database/migrations/)
+   for your release.
+3. Remove the failed record, so the next start applies the migration again.
+   Open the database named in the message:
+
+   ```bash
+   kubectl -n srw exec -it srw-postgres-0 -c postgres -- psql -U postgres -d srw              # app
+   kubectl -n srw exec -it srw-pgvector-0 -c pgvector -- psql -U postgres -d srw_vector      # vector
+   kubectl -n srw exec -it srw-auditdb-0 -c auditdb -- psql -U postgres -d srw_audit         # audit
+   ```
+
+   ```sql
+   SELECT filename, error FROM schema_migrations WHERE success = false;
+   DELETE FROM schema_migrations WHERE filename = '<file>.sql' AND success = false;
+   ```
+
+4. Restart the orchestrator:
+   `kubectl -n srw rollout restart deploy/srw-orchestrator`.
+
+These commands are for the bundled `statefulset` databases. On the `cnpg`
+engine, open the cluster's primary Pod instead
+(`kubectl -n srw get pods -l cnpg.io/instanceRole=primary`). If the error does
+not say what went wrong, open an issue with the log before you delete the
+record.
 
 ## Still stuck
 

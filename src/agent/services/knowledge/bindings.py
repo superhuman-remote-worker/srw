@@ -61,22 +61,44 @@ def build_knowledge_bindings(
     datasources: Iterable[dict[str, Any]] = (),
     runtime_actor: RuntimeActorContext | None = None,
 ) -> list[KnowledgeBinding]:
-    """Build deterministic native-first bindings from runtime metadata.
+    """Build deterministic native-first bindings from the attached connectors.
 
-    The first native project remains the sole write target, matching the
-    existing primary-project behavior. External KB datasource payloads are
-    always read-only in Slice 4 v1. The connector registry routes the
-    knowledge-index form here (``agent.connectors.knowledge``); an entry whose
-    driver delivers no knowledge index is skipped all the same, so a caller
-    passing a whole payload never binds another connector as a KB.
+    **The attached connectors decide.** A knowledge base is bound only when
+    its connector was delivered to this runtime. That holds for a project's
+    own knowledge base too: its connector row (auto-created with the project)
+    carries the native marker, and without that row among ``datasources`` the
+    project's knowledge base is not bound, however the job or session came by
+    its project. ``project_ids`` only says which of the delivered native rows
+    are *this work's own* projects, and in which order.
 
-    A project's own KB datasource (auto-attached at project creation) is keyed
-    by its *project* id, not its datasource id — its notes are indexed under
-    the project. So when it is selected alongside its own project it collapses
-    into the native binding already emitted above, which keeps the project's
-    knowledge base writable and stops the same KB being offered twice under
-    two aliases (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §6).
+    A delivered native row of one of ``project_ids`` becomes the
+    ``kind="native"`` binding, keyed by the *project* id (its notes are
+    indexed under the project, not under the datasource id). The first
+    project of ``project_ids`` is the sole write target, so its knowledge base
+    is writable when attached and nothing is writable when it is not. A native
+    row of any other project binds read-only as ``kind="datasource"``, against
+    that project's index. External KB datasource payloads are always
+    read-only in Slice 4 v1.
+
+    The connector registry routes the knowledge-index form here
+    (``agent.connectors.knowledge``); an entry whose driver delivers no
+    knowledge index is skipped all the same, so a caller passing a whole
+    payload never binds another connector as a KB
+    (knowledge-base/knowledge/features/knowledge_base_repo_separation.md §6,
+    knowledge-base/knowledge/issues/project_knowledge_base_is_bound_without_its_connector.md).
     """
+    knowledge_rows = [
+        datasource
+        for datasource in datasources
+        if delivers_in(datasource, "knowledge_index")
+    ]
+    attached_native: set[uuid.UUID] = set()
+    for datasource in knowledge_rows:
+        try:
+            attached_native.add(uuid.UUID(str(native_kb_project_id(datasource))))
+        except (TypeError, ValueError):
+            continue
+
     bindings: list[KnowledgeBinding] = []
     used: set[str] = set()
     bound_kb_ids: set[uuid.UUID] = set()
@@ -86,7 +108,7 @@ def build_knowledge_bindings(
             project_id = uuid.UUID(str(raw_project_id))
         except (TypeError, ValueError):
             continue
-        if project_id in bound_kb_ids:
+        if project_id in bound_kb_ids or project_id not in attached_native:
             continue
         bound_kb_ids.add(project_id)
         base = "project" if index == 0 else f"project-{project_id.hex[:8]}"
@@ -113,9 +135,7 @@ def build_knowledge_bindings(
     prepared_datasources: list[
         tuple[str, uuid.UUID, str, dict[str, Any], dict[str, Any]]
     ] = []
-    for datasource in datasources:
-        if not delivers_in(datasource, "knowledge_index"):
-            continue
+    for datasource in knowledge_rows:
         raw_id = datasource.get("datasource_id") or datasource.get("id")
         native_project = native_kb_project_id(datasource)
         try:
@@ -135,9 +155,9 @@ def build_knowledge_bindings(
     prepared_datasources.sort(key=lambda item: (item[0], item[1].hex))
     for base, kb_id, name, config, datasource in prepared_datasources:
         if kb_id in bound_kb_ids:
-            # Already bound — the project's own KB reached here as a datasource
-            # row. A second binding would be the same notes under a second
-            # alias, read-only, shadowing the writable native one.
+            # Already bound: this is the row that attached the project's own
+            # KB above. A second binding would be the same notes under a
+            # second alias, read-only, shadowing the writable native one.
             continue
         bound_kb_ids.add(kb_id)
         root_path = str(config.get("root_path") or "")

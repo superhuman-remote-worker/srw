@@ -226,6 +226,114 @@ provider. Endpoint model IDs are sent unchanged.
   `agent.networkPolicy`, add an `agent.networkPolicy.extraEgress` rule for a
   server on a cluster or private address.
 
+## Self-signed or unverifiable certificates
+
+SRW always verifies the certificate of an `https://` model endpoint. Two tools
+cover an endpoint that fails verification:
+
+- **A private CA.** When the certificate is valid for its address but signed by
+  your own certificate authority, add the CA with `trust.extraCaCertificates`
+  in the Helm values. Every endpoint signed by that CA then verifies.
+- **Trusting one certificate.** When the certificate is self-signed or cannot
+  be verified for its address, an administrator can trust that one certificate
+  for that one endpoint, as described below. Other endpoints keep normal
+  verification.
+
+Plain `http://` endpoints still need **Allow http**; pinning applies only to
+`https://`.
+
+### Trust a certificate
+
+1. In **Admin → Models → Providers**, save the endpoint with its `https://`
+   address and select **Test**.
+2. When the certificate does not verify, Test shows why (self-signed,
+   untrusted issuer, not valid for this address, expired or not yet valid). It
+   also shows the certificate's SHA-256 fingerprint, subject, issuer and
+   validity. The fingerprint has the same format as
+   `openssl x509 -noout -fingerprint -sha256`. Compare it with the one the
+   server's operator gives you.
+3. Select **Trust this certificate** and confirm.
+
+SRW refuses Trust, and stores nothing, when:
+
+- the endpoint's address is `http://` (`400` "Pinning applies to https://
+  endpoints.");
+- the endpoint is the subscription proxy (`400` "The subscription proxy can't
+  be pinned.");
+- every model on the endpoint is served by a search, fetch or text-to-speech
+  adapter, which doesn't use a pin (`400`);
+- a model on the endpoint has the live voice capability (`400` "Live voice
+  does not support pinned certificates yet; …");
+- the certificate already verifies normally (`400` "This certificate verifies
+  normally; no pin is needed.");
+- the server, read again at that moment, presents a different certificate
+  than the one you reviewed (`409` "The server now presents a different
+  certificate (SHA-256 …). Test again and compare.");
+- SRW can't use the certificate as a pin, for example because its key is too
+  weak (`400` "SRW can't use this certificate even when pinned: …").
+
+When the endpoint can't be pinned (the subscription proxy, adapters only, or
+live voice), Test shows that reason where it would otherwise offer **Trust**.
+
+From then on SRW accepts exactly that certificate for that endpoint, wherever
+the endpoint is used: Test and Discover, chat in sessions and jobs, embedding,
+rerank, vision, speech to text, text to speech, message triage, image
+generation, knowledge-base indexing and memory.
+
+Jobs and Sessions read the pin when they are dispatched, so trusting,
+re-trusting or removing a pin reaches them like a rotated API key: a running
+job keeps the pin it started with until it is resumed, a stateless Session
+uses the new pin from its next turn, and an open Session on a pinned agent
+(`agent.stateless.enabled: false`) keeps its old pin until it resumes.
+
+### When the certificate changes
+
+Nothing is accepted automatically. If the server presents a different
+certificate, calls fail with `TLS certificate changed for host:port: pinned
+SHA-256 …, server presents …. An admin must re-trust it in Admin → Models.`
+Test then shows the old and the new fingerprint, and **Trust the new
+certificate** replaces the pin.
+
+- **Expired.** A pinned certificate keeps working after its expiry date:
+  SRW trusts that exact certificate, not its validity period. The endpoint
+  shows "certificate expired" with the date as a reminder that the server's
+  operator should replace it. When they do, calls fail as "certificate
+  changed" until you trust the new certificate.
+- **Publicly valid later.** If the server gets a certificate that verifies
+  normally, calls still fail as "certificate changed", because the pinned one
+  is no longer presented. Test offers **Remove pin**, which returns the
+  endpoint to normal verification.
+- **New address.** Editing the endpoint's host, port or path, in the Cockpit or
+  in Helm values, keeps the pin. If the new address presents a different
+  certificate, calls fail until you trust it or remove the pin.
+
+### Not supported yet
+
+These fail closed, so a pinned endpoint is never reached unverified:
+
+- Live voice is refused with "Live voice does not support pinned certificates
+  yet; give the endpoint a certificate that verifies."
+- The Claude Code harness image does not use the pin, so its normal
+  verification fails.
+- Search, fetch and text-to-speech adapter rows do not use pins. Trust is
+  refused when every row on the endpoint is served by an adapter. On a mixed
+  endpoint, the search and fetch rows are dropped from dispatch while a pin is
+  set.
+
+### Audit
+
+Trusting, re-trusting and removing a pin are recorded as security events,
+one type each. List them with:
+
+```
+GET /api/admin/security-events?event_type=endpoint_certificate_trusted
+GET /api/admin/security-events?event_type=endpoint_certificate_retrusted
+GET /api/admin/security-events?event_type=endpoint_certificate_pin_removed
+```
+
+Each event names the admin, the endpoint and the fingerprint (and, for a
+re-trust, the previous one). Security events are kept for 90 days.
+
 ## Upgraded installations
 
 Releases before the rerank role used the embedding host's `/rerank` route

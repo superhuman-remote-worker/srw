@@ -120,12 +120,12 @@ class ShellManager:
                 support. The local (in-pod) libtmux execution path was removed —
                 shells only run on the workspace, never in the agent pod.
         """
+        # Design: knowledge-base/knowledge/features/no_workspace_agent_mode.md §9.
         if backend is None or not getattr(backend, "supports_shell", False):
             raise RuntimeError(
                 "ShellManager requires a workspace backend with shell support "
                 "(backend.supports_shell=True). Local in-pod tmux execution was "
-                "removed — shells run only on the workspace. See "
-                "knowledge-base/knowledge/features/no_workspace_agent_mode.md §9."
+                "removed — shells run only on the workspace."
             )
 
         self.job_id = job_id

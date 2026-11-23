@@ -349,9 +349,9 @@ async def admin_list_security_events(
     lands in ``security_events``. Filters: ``user_id`` (the denied
     caller), ``event_type`` (``access_denied`` / ``admin_denied``),
     ``since`` (ISO 8601). Rows are pruned on retention
-    (``SECURITY_EVENTS_RETENTION_DAYS``, default 90). Design:
-    knowledge-base/knowledge/features/security_event_log.md.
+    (``SECURITY_EVENTS_RETENTION_DAYS``, default 90).
     """
+    # Design: knowledge-base/knowledge/features/security_event_log.md.
     await dependencies.require_admin(request)
     return await user_administration.admin_list_security_events(
         limit=limit,

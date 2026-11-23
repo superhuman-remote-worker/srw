@@ -56,6 +56,8 @@ PATCH  /api/admin/providers/endpoints/{endpoint_id}                             
 POST   /api/admin/providers/endpoints/{endpoint_id}/discover                            pat=admin           admin:_require_admin
 POST   /api/admin/providers/endpoints/{endpoint_id}/models/import                       pat=admin           admin:_require_admin
 POST   /api/admin/providers/endpoints/{endpoint_id}/test                                pat=admin           admin:_require_admin
+DELETE /api/admin/providers/endpoints/{endpoint_id}/tls-pin                             pat=admin           admin:_require_admin
+PUT    /api/admin/providers/endpoints/{endpoint_id}/tls-pin                             pat=admin           admin:_require_admin
 GET    /api/admin/providers/keys                                                        pat=admin           admin:_require_admin
 DELETE /api/admin/providers/keys/{provider}                                             pat=admin           admin:_require_admin
 PUT    /api/admin/providers/keys/{provider}                                             pat=admin           admin:_require_admin
@@ -72,6 +74,8 @@ POST   /api/admin/run-queue/executor-pods/{pod_name}/attest-gone                
 POST   /api/admin/run-queue/{unit_id}/attest-claimant-gone                              pat=admin           admin:_require_admin
 POST   /api/admin/run-queue/{unit_id}/unpark                                            pat=admin           admin:_require_admin
 GET    /api/admin/security-events                                                       pat=admin           admin:_require_admin
+GET    /api/admin/system-settings/image_generation                                      pat=admin           admin:_require_admin
+PUT    /api/admin/system-settings/image_generation                                      pat=admin           admin:_require_admin
 DELETE /api/admin/system-settings/main_cloud                                            pat=admin           admin:_require_admin
 GET    /api/admin/system-settings/main_cloud                                            pat=admin           admin:_require_admin
 PUT    /api/admin/system-settings/main_cloud                                            pat=admin           admin:_require_admin
@@ -79,6 +83,8 @@ POST   /api/admin/system-settings/main_cloud/backfill-instance-authority        
 POST   /api/admin/system-settings/main_cloud/reload                                     pat=admin           admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/repair-thread-mounts                       pat=admin           admin:_require_admin
 POST   /api/admin/system-settings/main_cloud/test                                       pat=admin           admin:_require_admin
+GET    /api/admin/system-settings/mcp_server_questions                                  pat=admin           admin:_require_admin
+PUT    /api/admin/system-settings/mcp_server_questions                                  pat=admin           admin:_require_admin
 GET    /api/admin/system-settings/tts_library                                           pat=admin           admin:_require_admin
 PUT    /api/admin/system-settings/tts_library                                           pat=admin           admin:_require_admin
 GET    /api/admin/system-settings/user_experts                                          pat=admin           admin:_require_admin
@@ -235,6 +241,7 @@ PATCH  /api/ide/{job_id}/proxy/{path:path}                                      
 POST   /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
 PUT    /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
 WS     /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
+GET    /api/internal/image-generation/proxy-quota                                       pat=refused         internal:require_internal
 POST   /api/internal/infrastructure-metering/v1/snapshots/begin                         pat=refused         internal:_dispatch_infrastructure_ingestion
 POST   /api/internal/infrastructure-metering/v1/snapshots/finalize                      pat=refused         internal:_dispatch_infrastructure_ingestion
 POST   /api/internal/infrastructure-metering/v1/snapshots/items                         pat=refused         internal:_dispatch_infrastructure_ingestion
@@ -282,6 +289,7 @@ GET    /api/jobs                                                                
 POST   /api/jobs                                                                        pat=jobs:write      gated:require_project_member
 DELETE /api/jobs/{job_id}                                                               pat=jobs:write      gated:require_job_access
 GET    /api/jobs/{job_id}                                                               pat=jobs:read       gated:require_job_access
+PATCH  /api/jobs/{job_id}                                                               pat=jobs:write      gated:require_job_access
 POST   /api/jobs/{job_id}/accept                                                        pat=jobs:write      gated:require_job_access
 PUT    /api/jobs/{job_id}/agent-release                                                 pat=refused         internal:require_internal
 POST   /api/jobs/{job_id}/approve                                                       pat=jobs:write      gated:require_internal_or_job_access
@@ -361,11 +369,11 @@ POST   /api/jobs/{job_id}/workspace-recovery/retry                              
 GET    /api/jobs/{job_id}/workspace-status                                              pat=refused         internal:require_internal
 POST   /api/jobs/{target_job_id}/verification/rounds                                    pat=refused         internal:require_internal
 POST   /api/live/webhooks/{connector_id}                                                pat=refused         public:Standard Webhooks signature and timestamp verified inside the handler against the connector's webhook_secret.
-POST   /api/manifests/apply                                                             pat=admin           gated:require_approved_user
-POST   /api/manifests/export                                                            pat=admin           gated:require_approved_user
-POST   /api/manifests/preview                                                           pat=admin           gated:require_approved_user
+POST   /api/manifests/apply                                                             pat=resources:write gated:require_approved_user
+POST   /api/manifests/export                                                            pat=jobs:read       gated:require_approved_user
+POST   /api/manifests/preview                                                           pat=jobs:read       gated:require_approved_user
 GET    /api/manifests/schema                                                            pat=jobs:read       gated:require_approved_user
-POST   /api/manifests/validate                                                          pat=admin           gated:require_approved_user
+POST   /api/manifests/validate                                                          pat=jobs:read       gated:require_approved_user
 GET    /api/mcp-tokens                                                                  pat=refused         gated:require_approved_user
 POST   /api/mcp-tokens                                                                  pat=refused         gated:require_approved_user
 DELETE /api/mcp-tokens/{token_id}                                                       pat=refused         gated:require_approved_user
@@ -512,7 +520,7 @@ PUT    /api/projects/{project_id}/workspace-defaults                            
 GET    /api/requests/{doc_id}                                                           pat=jobs:read       gated:require_job_access
 PUT    /api/resource-secrets/{name}                                                     pat=admin           gated:require_approved_user
 GET    /api/resources                                                                   pat=jobs:read       gated:require_approved_user
-DELETE /api/resources/{resource_id}                                                     pat=admin           gated:require_approved_user
+DELETE /api/resources/{resource_id}                                                     pat=resources:write gated:require_approved_user
 GET    /api/resources/{resource_id}                                                     pat=jobs:read       gated:require_approved_user
 POST   /api/resources/{resource_id}/outcome                                             pat=admin           gated:require_approved_user
 POST   /api/runtime-actors/authorize                                                    pat=refused         internal:require_internal
@@ -589,6 +597,7 @@ GET    /api/users/me/product-capabilities                                       
 DELETE /api/users/{user_id}                                                             pat=admin           admin:_require_admin
 GET    /api/users/{user_id}                                                             pat=admin           gated:require_approved_user
 PUT    /api/users/{user_id}                                                             pat=admin           admin:_require_admin
+GET    /api/version                                                                     pat=any             gated:get_current_user
 GET    /api/vms                                                                         pat=admin           admin:_require_admin
 POST   /api/vms                                                                         pat=jobs:write      gated:require_job_access
 DELETE /api/vms/{job_id}                                                                pat=jobs:write      gated:require_job_access

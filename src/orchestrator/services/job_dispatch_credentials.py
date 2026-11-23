@@ -27,8 +27,14 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
+from orchestrator.security.config_redaction import strip_in_flight_only_keys
+from orchestrator.services.dispatch_credentials import (
+    endpoint_tls_pin_wire,
+    refused_endpoint_pin,
+)
 from orchestrator.services.live.dispatch import live_session_config
 from orchestrator.services.model_availability import (
+    EndpointPinUnreadable,
     ModelUnavailable,
     UnavailableModel,
     endpoint_key_unreadable,
@@ -43,6 +49,7 @@ from shared.runtime.core.model_registry import (
 )
 from shared.runtime.core.transport_resolution import env_endpoint_names
 from shared.subscription_routing import subscription_request_headers
+from shared.tls_pinning import TLS_PINNED_CERT_SUFFIX, UNREADABLE_PIN
 
 
 class DispatchCredentialStore(Protocol):
@@ -76,6 +83,9 @@ class DispatchCredentialDependencies:
         [dict[str, Any], dict[str, Any] | None], str | None
     ]
     nested_model_slots: Callable[[dict[str, Any]], list[tuple[str, Any, str]]]
+    # Optional so older call sites and test doubles keep constructing the
+    # bundle; the application binds it (application/preparation.py).
+    inject_image_credentials: Callable[..., Awaitable[Any]] | None = None
 
 
 async def _usable_account_default(
@@ -142,6 +152,9 @@ async def inject_dispatch_credentials(
     run once all slots are injected (a roster entry inheriting its parent's
     model excepted). A model the registry cannot resolve is never routed by a
     provider guessed from its name (unavailable_model_handling.md D1).
+    An endpoint's pinned TLS certificate travels next to its base URL
+    (``tls_pinned_cert``, ``{PREFIX}_TLS_PINNED_CERT``), written only from the
+    endpoint row; one that can't be read refuses its slot.
     ``strict=False`` only logs them: for the flat override built next to a
     delivered blob, which is not what the agent runs.
     """
@@ -161,6 +174,10 @@ async def inject_dispatch_credentials(
         user_settings = await postgres_db.get_user_settings(user_id_str) or {}
 
     config_override = config_override or {}
+    # Every pin in the dispatched config comes from an endpoint row: drop any
+    # the override brought before an injector runs (the image injector last
+    # among them), so a slot no injector touches cannot carry one.
+    strip_in_flight_only_keys(config_override)
     llm_over = config_override.setdefault("llm", {})
     model_id = llm_over.get("model")
     meta = None
@@ -182,6 +199,11 @@ async def inject_dispatch_credentials(
     # chosen later (account or system default) does not inherit it as if the
     # caller had named that route.
     no_model_route: dict[str, Any] = {}
+    # The endpoint row's pinned TLS certificate, written next to its base_url
+    # by the endpoint branch below (a refused row's too, or the marker, for a
+    # base URL a stored override kept); every other route sends `None` (see
+    # the `served_model` sentinel).
+    main_pin: str | None = None
 
     if (
         meta is not None
@@ -214,15 +236,48 @@ async def inject_dispatch_credentials(
             unavailable.append(
                 UnavailableModel(slot="llm", model=str(model_id), reason=unreadable)
             )
+            # A base URL kept in a stored override keeps the row's pin.
+            main_pin = refused_endpoint_pin(endpoint_row)
         elif endpoint_row:
-            if endpoint_row.get("base_url"):
-                llm_over["base_url"] = endpoint_row["base_url"]
-            if endpoint_row.get("api_key"):
-                llm_over["api_key"] = endpoint_row["api_key"]
-            logger.info(
-                f"Dispatch: routed {model_id} to {meta.origin} endpoint "
-                f"{endpoint_row.get('label') or meta.endpoint_id}"
-            )
+            try:
+                pin_wire = endpoint_tls_pin_wire(endpoint_row)
+            except ValueError as exc:
+                # Same refusal as inject_model_credentials: sent without its
+                # pin, the base URL would be verified against the CA list
+                # instead. A pin that can't be read is never treated as no pin.
+                logger.error(
+                    "Dispatch: job %s main model %r refused: endpoint %r (%s) "
+                    "has a pinned TLS certificate that can't be read (%s); "
+                    "trust its certificate again or remove the pin in Admin → "
+                    "Models.",
+                    job_id,
+                    model_id,
+                    endpoint_row.get("label"),
+                    meta.endpoint_id,
+                    exc,
+                )
+                unavailable.append(
+                    UnavailableModel(
+                        slot="llm",
+                        model=str(model_id),
+                        reason=EndpointPinUnreadable(
+                            endpoint_row.get("label") or meta.endpoint_id
+                        ),
+                    )
+                )
+                # A base URL kept in a stored override gets the marker the
+                # agent refuses, never "no pin".
+                main_pin = UNREADABLE_PIN
+            else:
+                if endpoint_row.get("base_url"):
+                    llm_over["base_url"] = endpoint_row["base_url"]
+                    main_pin = pin_wire
+                if endpoint_row.get("api_key"):
+                    llm_over["api_key"] = endpoint_row["api_key"]
+                logger.info(
+                    f"Dispatch: routed {model_id} to {meta.origin} endpoint "
+                    f"{endpoint_row.get('label') or meta.endpoint_id}"
+                )
     elif resolved_keys and not main_unavailable:
         if meta is not None and meta.api_key_ref:
             provider_for_key: str | None = meta.api_key_ref
@@ -311,6 +366,10 @@ async def inject_dispatch_credentials(
     llm_over["client_protocol"] = (
         effective_client_protocol(meta) if meta is not None else None
     )
+    # The endpoint's pinned TLS certificate: only the endpoint branch above
+    # sets one, never a caller. Same `None` sentinel as `served_model`, so a
+    # re-dispatch after a model change cannot keep the previous route's pin.
+    llm_over["tls_pinned_cert"] = main_pin
 
     if resolved_keys:
         # The stored vision key belongs to the vision provider's own endpoint:
@@ -477,6 +536,11 @@ async def inject_dispatch_credentials(
                 continue
             env_keys_block = config_override.setdefault("env_keys", {})
             if f"{_prefix}_MODEL" in env_keys_block:
+                # No injector runs for a slot an override already named, so
+                # nothing here vouches for a pin next to it: only an endpoint
+                # row's injection writes one. A backstop: the strip at this
+                # function's entry already removed any pin the override brought.
+                env_keys_block.pop(f"{_prefix}_{TLS_PINNED_CERT_SUFFIX}", None)
                 continue
             await dependencies.inject_env_key_credentials(
                 env_keys=env_keys_block,
@@ -488,7 +552,8 @@ async def inject_dispatch_credentials(
             )
             # The citation_engine package reads CITATION_LLM_URL (not _BASE_URL)
             # and falls back to OPENAI_API_KEY for auth. Alias the URL key here
-            # so the upstream package picks up the dispatched endpoint.
+            # so the upstream package picks up the dispatched endpoint. The pin
+            # needs no alias: CITATION_LLM_TLS_PINNED_CERT serves either name.
             if _kind == "citation" and "CITATION_LLM_BASE_URL" in env_keys_block:
                 env_keys_block.setdefault(
                     "CITATION_LLM_URL", env_keys_block["CITATION_LLM_BASE_URL"]
@@ -631,6 +696,13 @@ async def inject_dispatch_credentials(
         user_id=user_id_str,
         resolved_keys=resolved_keys,
     )
+    if dependencies.inject_image_credentials is not None:
+        await dependencies.inject_image_credentials(
+            config_override,
+            user_settings=user_settings,
+            user_id=user_id_str,
+            resolved_keys=resolved_keys,
+        )
 
     if unavailable:
         if strict:

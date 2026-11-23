@@ -6,8 +6,11 @@ capability grants:
 
 * :func:`check_vm_permission` — may this principal get a VM at all? A global
   kill-switch in ``system_settings`` blocks EVERYONE including admins; a
-  non-admin additionally needs ``can_use_vm``. This is the operator gate that
-  runs *alongside* the ``vm_workspace`` capability grant, never instead of it.
+  non-admin additionally needs the effective ``vm_workspace`` grant
+  (``user_can_use_vm``, granted by default since 2026-11-11; the legacy
+  ``can_use_vm`` column is read only when the grant read fails). This is the
+  operator gate that runs *alongside* the PDP's ``vm_workspace`` check, never
+  instead of it.
 * :func:`vm_needs_release` — does a stored VM context still own cluster
   resources worth reclaiming?
 
@@ -63,7 +66,7 @@ async def check_vm_permission(
     Raises HTTPException(403) when either:
       - The global kill-switch `system_settings['vm_workspaces']` is set
         to `{"enabled": false}` (blocks everyone, including admins).
-      - The user is a non-admin without `can_use_vm=True`.
+      - The user is a non-admin whose effective `vm_workspace` grant is off.
 
     No-op when ``job_needs_vm`` is False. Absent/malformed setting row is
     treated as enabled (fail-open for fresh installs).

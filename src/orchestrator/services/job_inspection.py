@@ -14,6 +14,7 @@ from uuid import UUID
 from fastapi import HTTPException
 
 from orchestrator.services.subagent_projection import subagent_thread_payload
+from shared.operator_pause_hold import explicit_resume_hold_source
 
 
 ME_ACTIVE_JOB_STATUSES = {"created", "processing", "paused", "pending_review"}
@@ -66,6 +67,7 @@ class JobInspectionDependencies:
     ]
     mcp_scope_project_id: Callable[[dict[str, Any]], UUID | None]
     active_job_statuses: Collection[str]
+    completion_commands_enabled: bool = False
 
 
 async def get_job_progress(
@@ -89,6 +91,7 @@ async def get_job_progress(
             authorized_job,
             audit_reader=dependencies.audit_reader,
             db=dependencies.store,
+            completion_commands_enabled=dependencies.completion_commands_enabled,
         )
         elapsed_seconds = await compute_job_elapsed_seconds(
             job_id, progress, audit_reader=dependencies.audit_reader
@@ -98,6 +101,10 @@ async def get_job_progress(
             "elapsed_seconds": elapsed_seconds,
             **liveness,
             "workspace_recovery": workspace_recovery_projection(authorized_job),
+            # A paused job is resumed by the dispatcher unless it is held.
+            # Null: not held. Otherwise the job waits for an explicit resume,
+            # and the value says who or what set the hold.
+            "held_by": explicit_resume_hold_source(authorized_job.get("context")),
         }
     except HTTPException:
         raise

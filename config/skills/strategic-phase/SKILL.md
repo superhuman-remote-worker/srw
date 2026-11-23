@@ -27,6 +27,7 @@ Do NOT execute domain work. No document processing, no database writes, no file 
 5. Identify blockers, completed tasks, and next priorities.
 6. Update plan.md with revised strategy if needed.
 7. Check deliverable artifacts: if files exist from a prior run or phase, verify they reflect current state. Edit them in place — work committed earlier in THIS run is yours and your context for it is intact. Regenerate from scratch only when an artifact predates this run, or when you cannot account for how it got its contents.
+8. Match each deliverable against your available skills. When one covers it (a PDF report, a chart, a spreadsheet, a slide deck, a Word document, a data analysis), the first todo that builds that deliverable starts with loading the skill via use_skill and then follows it.
 
 Knowledge maintenance:
 - SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.

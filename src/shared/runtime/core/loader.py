@@ -17,6 +17,7 @@ from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from urllib.parse import urlsplit
 
 import yaml
 from langchain_core.language_models import BaseChatModel
@@ -44,6 +45,7 @@ from shared.runtime.core.tool_policy import (
     normalize_tool_policy,
 )
 from shared.runtime.llm.reasoning_chat import ReasoningChatOpenAI
+from shared.tls_pinning import TlsPin, pin_applies
 from shared.tool_catalog.names import SKILL_TOOL_NAME
 
 logger = logging.getLogger(__name__)
@@ -334,9 +336,11 @@ def _log_legacy_tiers_once(source: str, blocks: Dict[str, Any], summary: str) ->
     if len(_TIER_LOG_SEEN) >= _TIER_LOG_SEEN_MAX:
         _TIER_LOG_SEEN.clear()
     _TIER_LOG_SEEN.add(key)
+    # Deprecated in U1: knowledge-base/knowledge/features/
+    # universal_experts_and_subagents.md §1.1.
     logger.warning(
-        "config: legacy llm tier(s) %s in %s → %s (deprecated since U1; see "
-        "universal_experts_and_subagents.md §1.1)",
+        "config: legacy llm tier(s) %s in %s → %s (deprecated: an expert sets "
+        "one llm.model)",
         sorted(blocks),
         source,
         summary,
@@ -460,11 +464,12 @@ def _log_legacy_delegation_once(source: str, dropped: Dict[str, Any]) -> None:
     if len(_DELEGATION_LOG_SEEN) >= _DELEGATION_LOG_SEEN_MAX:
         _DELEGATION_LOG_SEEN.clear()
     _DELEGATION_LOG_SEEN.add(key)
+    # Changed in U3: knowledge-base/knowledge/features/
+    # universal_experts_and_subagents.md §0 D2/D7.
     logger.warning(
         "config: legacy delegation key(s) %s in %s dropped — the delegation "
-        "block is {enabled, max_concurrent, run_in_background_default} since "
-        "U3 (delegate_work / spawn_subagent were deleted; see "
-        "universal_experts_and_subagents.md §0 D2/D7)",
+        "block is {enabled, max_concurrent, run_in_background_default} now "
+        "(delegate_work / spawn_subagent were deleted)",
         sorted(dropped),
         source,
     )
@@ -527,9 +532,10 @@ def normalize_interactive_permission_mode(fragment: Any, *, source: str) -> Any:
         if len(_PERMISSION_MODE_LOG_SEEN) >= _DELEGATION_LOG_SEEN_MAX:
             _PERMISSION_MODE_LOG_SEEN.clear()
         _PERMISSION_MODE_LOG_SEEN.add(source)
+        # Rename: knowledge-base/knowledge/features/tool_permission_tiers.md D2.
         logger.warning(
             "config: interactive.permission_mode %r in %s read as %r (renamed; "
-            "see tool_permission_tiers.md)",
+            "write the new value in this config)",
             mode,
             source,
             canonical,
@@ -563,6 +569,7 @@ LLM_INHERITED_KEYS = (
     "api_key",
     "model_max_context_tokens",
     "served_model",
+    "tls_pinned_cert",
 )
 
 
@@ -1085,6 +1092,21 @@ def resolve_model_settings(
     # Strip 'limits' — callers want LLM inference params only
     settings.pop("limits", None)
     return settings
+
+
+def replays_reasoning_content(model: str) -> bool:
+    """Whether ``model``'s family gets its earlier reasoning sent back.
+
+    The family setting ``replay_reasoning_content`` (model_config_matrix.yaml):
+    on, every assistant turn of a Chat Completions request carries the
+    ``reasoning_content`` the model returned for it (see
+    ``attach_reasoning_content``). Read by the client factories and by the
+    local token count, which then counts that text too.
+    """
+    try:
+        return resolve_model_settings(model).get("replay_reasoning_content") is True
+    except Exception:  # an unreadable matrix must not fail a client or a count
+        return False
 
 
 def bundled_settings_for_family(family: str, name: str) -> Any:
@@ -1949,6 +1971,13 @@ class InstructionMatrixResolver(MatrixResolver):
         "live_tactical_todos": "live_tactical_todos.yaml",
         "live_post_session_todos": "live_post_session_todos.yaml",
         "workspace_template": "workspace_template.md",
+        # Jobs without phases (shared.job_phases): the one to-do at the start
+        # and after a resume, and the standing instructions for an expert that
+        # has no instructions file of its own. Frozen only for such a job,
+        # under the keys the worker already reads (serialize_resolved_config).
+        "direct_task_todos_initial": "direct_task_todos_initial.yaml",
+        "direct_task_todos_resume": "direct_task_todos_resume.yaml",
+        "direct_task_instructions": "direct_task_instructions.md",
     }
 
 
@@ -2068,6 +2097,8 @@ class PhaseLLMOverride:
     extra_headers: Optional[Dict[str, str]] = None
     # The string this phase's catalog row sends upstream (LLMConfig.served_model).
     served_model: Optional[str] = None
+    # The endpoint's pinned certificate (LLMConfig.tls_pinned_cert).
+    tls_pinned_cert: Optional[str] = None
 
 
 @dataclass
@@ -2134,6 +2165,12 @@ class LLMConfig:
     # None = send ``model`` (minus a routing prefix), and a dispatch writes
     # None to clear it on a session model switch. See ``wire_model_name``.
     served_model: Optional[str] = None
+    # The endpoint's pinned certificate as ``TlsPin.wire`` (one-line base64
+    # DER), injected at DISPATCH next to ``base_url`` from the endpoint row —
+    # never set from YAML. Kept opaque here; the chat factories parse it and
+    # verify the server against it. None = ordinary verification, and a
+    # dispatch writes None to clear it on a session model switch.
+    tls_pinned_cert: Optional[str] = None
     # OpenAI cache-routing hint, injected at RUNTIME by callers that own a
     # stable conversation identity (the session paths pass a per-thread key so
     # the provider-side prefix cache survives pod rotation on the stateless
@@ -2145,6 +2182,15 @@ class LLMConfig:
     # endpoints (vLLM et al.) may reject unknown body fields and run their own
     # keyless prefix caches, so they get neither.
     prompt_cache_key: Optional[str] = None
+
+    # ``False`` stops the reasoning replay for a family that has it on
+    # (``replay_reasoning_content`` in the family matrix, which writes its own
+    # value here): an expert or a job's ``llm.replay_reasoning_content: false``
+    # sends every assistant turn without its earlier reasoning. It cannot turn
+    # the replay on for a family that does not declare it — the factory asks
+    # the family of the model the client is built for, so a summarization or
+    # roster model of another family is never sent a field it does not know.
+    replay_reasoning_content: Optional[bool] = None
 
     # How a long context is compacted for this model: ``{strategy, recipe}``,
     # ``strategy: native`` = the model writes its own summary with the named
@@ -2182,7 +2228,10 @@ class LLMConfig:
         # A key follows its endpoint: when the overlay moves the call to a
         # different base_url without bringing its own key, the parent's key
         # must not ride along to the new host.
-        from shared.runtime.core.transport_resolution import endpoint_within
+        from shared.runtime.core.transport_resolution import (
+            endpoint_within,
+            same_endpoint,
+        )
 
         if override.api_key is not None:
             api_key = override.api_key
@@ -2201,6 +2250,16 @@ class LLMConfig:
             served_model = override.served_model
         else:
             served_model = self.served_model
+
+        # A pin belongs to its endpoint, like the key: it follows the base URL.
+        if override.tls_pinned_cert is not None:
+            tls_pinned_cert = override.tls_pinned_cert
+        elif override.base_url is not None and not same_endpoint(
+            override.base_url, self.base_url
+        ):
+            tls_pinned_cert = None
+        else:
+            tls_pinned_cert = self.tls_pinned_cert
 
         # Create new config with overrides applied (don't copy phase fields)
         return LLMConfig(
@@ -2246,6 +2305,8 @@ class LLMConfig:
             if override.extra_headers is not None
             else self.extra_headers,
             served_model=served_model,
+            tls_pinned_cert=tls_pinned_cert,
+            replay_reasoning_content=self.replay_reasoning_content,
             compaction=self.compaction,
             # Phase overrides not inherited to resolved config
             summarization=None,
@@ -2315,6 +2376,7 @@ class ToolsConfig:
     skills: List[str] = field(default_factory=list)
     core: List[str] = field(default_factory=list)
     research: List[str] = field(default_factory=list)
+    image_generation: List[str] = field(default_factory=list)
     browser_direct: List[str] = field(default_factory=list)
     citation: List[str] = field(default_factory=list)
     graph: List[str] = field(default_factory=list)
@@ -2464,14 +2526,16 @@ class LimitsConfig:
     # max_tool_calls_per_job; kept so an operator who deliberately wants a
     # per-phase guard can still set one.
     max_tool_calls_per_phase: int = 0
-    # Job-level tool-call ceiling — the real backstop, and the only automatic
-    # stop a runaway job has. Nothing else terminates: the progress nudge and
-    # act-ratio tripwire only inject reminders, loop detection only masks tools,
-    # and the orchestrator has no job-duration ceiling. Hitting it freezes with
-    # budget_exceeded, which is NOT in AUTO_REDISPATCH_FREEZE_TYPES, so it parks
-    # for a human instead of looping. 0 disables it entirely — only do that if
-    # something else is watching the spend.
-    max_tool_calls_per_job: int = 5000
+    # Optional job-level tool-call ceiling. DEFAULT 0 = OFF, like every limit
+    # on a job's own work: a job runs until it finishes unless its expert or
+    # the job itself sets one. Nothing else stops a job by itself: the progress
+    # nudge and act-ratio tripwire only inject reminders, loop detection only
+    # masks tools, and the orchestrator has no job-duration ceiling. Hitting
+    # it freezes with budget_exceeded, which is NOT in
+    # AUTO_REDISPATCH_FREEZE_TYPES, so the job waits for review instead of
+    # looping. The count lives in the worker process, so on the stateless lane
+    # it starts again with every lease.
+    max_tool_calls_per_job: int = 0
     # Act-ratio tripwire: consecutive tool actions touching ONLY process
     # artifacts (see process_artifact_patterns) before a "stop planning"
     # nudge is injected. 0 disables the tripwire.
@@ -2497,6 +2561,15 @@ class LimitsConfig:
     # so this is the floor that stops mail being stranded. 0 disables it,
     # leaving delivery entirely break-driven.
     queued_reply_max_wait_seconds: int = 300
+    # Optional cap on the model calls of one round of work (from the job's
+    # start or its last resume with feedback), counted on checkpointed graph
+    # state so it holds across batch rotations. At the cap the worker stops
+    # the job before the next call; the job ends failed. 0 = off.
+    max_llm_calls_per_job: int = 0
+    # Optional stop after this many replies in a row without a tool call
+    # while a todo is pending (any wording): with 3, two reminders, and the
+    # third such reply ends the job as failed. 0 = off.
+    max_plain_replies_in_a_row: int = 0
 
 
 @dataclass
@@ -2808,6 +2881,8 @@ class AuxiliaryConfig:
     # The aux row's upstream model string (LLMConfig.served_model), injected
     # at dispatch; threaded for the same reason as ``extra_headers``.
     served_model: Optional[str] = None
+    # The aux row's endpoint pin (LLMConfig.tls_pinned_cert), injected at dispatch.
+    tls_pinned_cert: Optional[str] = None
     temperature: float = 0.0
     max_iterations: int = 15  # Cap for agent mode loops
     timeout: float = 120.0  # Seconds per LLM call (quick interactive tasks)
@@ -3058,6 +3133,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         extra_body=data.get("extra_body"),
         extra_headers=data.get("extra_headers"),
         served_model=data.get("served_model"),
+        tls_pinned_cert=data.get("tls_pinned_cert"),
     )
 
 
@@ -3098,6 +3174,8 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         extra_body=llm_data.get("extra_body"),
         extra_headers=llm_data.get("extra_headers"),
         served_model=llm_data.get("served_model"),
+        tls_pinned_cert=llm_data.get("tls_pinned_cert"),
+        replay_reasoning_content=llm_data.get("replay_reasoning_content"),
         compaction=llm_data.get("compaction"),
         summarization=_parse_phase_override(llm_data.get("summarization")),
     )
@@ -3421,6 +3499,7 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         provider=data.get("provider"),
         extra_headers=data.get("extra_headers"),
         served_model=data.get("served_model"),
+        tls_pinned_cert=data.get("tls_pinned_cert"),
         temperature=data.get("temperature", 0.0),
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),
@@ -3575,6 +3654,7 @@ def load_agent_config(
         skills=tools_data.get("skills", []),
         core=tools_data.get("core", []),
         research=tools_data.get("research", []),
+        image_generation=tools_data.get("image_generation", []),
         browser_direct=tools_data.get("browser_direct", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
@@ -3632,7 +3712,7 @@ def load_agent_config(
         tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
         max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 0),
-        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 5000),
+        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 0),
         act_ratio_nudge_threshold=limits_data.get("act_ratio_nudge_threshold", 6),
         process_artifact_patterns=_parse_process_artifact_patterns(limits_data),
         progress_push_interval_seconds=limits_data.get(
@@ -3644,6 +3724,8 @@ def load_agent_config(
         queued_reply_max_wait_seconds=limits_data.get(
             "queued_reply_max_wait_seconds", 300
         ),
+        max_llm_calls_per_job=limits_data.get("max_llm_calls_per_job", 0),
+        max_plain_replies_in_a_row=limits_data.get("max_plain_replies_in_a_row", 0),
     )
 
     context_data = data.get("context_management", {})
@@ -3851,6 +3933,7 @@ def load_agent_config_from_dict(
         skills=tools_data.get("skills", []),
         core=tools_data.get("core", []),
         research=tools_data.get("research", []),
+        image_generation=tools_data.get("image_generation", []),
         browser_direct=tools_data.get("browser_direct", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
@@ -3908,7 +3991,7 @@ def load_agent_config_from_dict(
         tool_category_timeouts=tool_category_timeouts,
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
         max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 0),
-        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 5000),
+        max_tool_calls_per_job=limits_data.get("max_tool_calls_per_job", 0),
         act_ratio_nudge_threshold=limits_data.get("act_ratio_nudge_threshold", 6),
         process_artifact_patterns=_parse_process_artifact_patterns(limits_data),
         progress_push_interval_seconds=limits_data.get(
@@ -3920,6 +4003,8 @@ def load_agent_config_from_dict(
         queued_reply_max_wait_seconds=limits_data.get(
             "queued_reply_max_wait_seconds", 300
         ),
+        max_llm_calls_per_job=limits_data.get("max_llm_calls_per_job", 0),
+        max_plain_replies_in_a_row=limits_data.get("max_plain_replies_in_a_row", 0),
     )
 
     context_data = data.get("context_management", {})
@@ -4520,6 +4605,7 @@ def build_auxiliary_llm_config(
         provider=aux.provider,
         extra_headers=aux.extra_headers,
         served_model=aux.served_model,
+        tls_pinned_cert=aux.tls_pinned_cert,
         temperature=aux.temperature,
         top_p=model_settings.get("top_p"),
         top_k=model_settings.get("top_k"),
@@ -4727,6 +4813,60 @@ def _subscription_proxy_session_headers(
     return {}
 
 
+def _pin_value_present(wire: Any) -> bool:
+    """Whether ``tls_pinned_cert`` holds a pin: ``None`` and blank mean none.
+
+    Anything else counts, a non-string included, so it is refused rather
+    than read as "no pin".
+    """
+    return wire is not None and (not isinstance(wire, str) or bool(wire.strip()))
+
+
+def _endpoint_tls_pin(config: LLMConfig) -> Optional[TlsPin]:
+    """The endpoint's pinned certificate (``config.tls_pinned_cert``), or None.
+
+    A pin belongs to the https:// endpoint it was trusted for and travels with
+    that base URL (dispatch writes both from the endpoint row). One that can't
+    be read (garbage, the ``UNREADABLE_PIN`` marker, or a certificate OpenSSL
+    won't load as a trust anchor), or that comes without an https:// base URL,
+    raises ``ValueError`` naming the model when the model is built: a broken
+    pin never builds an unpinned client.
+    """
+    wire = config.tls_pinned_cert
+    if not _pin_value_present(wire):
+        return None
+    try:
+        if not isinstance(wire, str):
+            raise ValueError(f"expected base64 text, got {type(wire).__name__}")
+        pin = TlsPin.from_wire(wire)  # OpenSSL must load it as a trust anchor
+    except ValueError as exc:
+        raise ValueError(
+            f"Model {config.model!r} at {config.base_url or '(no base URL)'} "
+            f"has an unusable pinned certificate: {exc}"
+        ) from exc
+    if not pin_applies(config.base_url):
+        raise ValueError(
+            f"Model {config.model!r} has a pinned certificate, but its base URL "
+            f"{config.base_url or '(none)'} is not https://; a pin applies only "
+            "to the https:// endpoint it was trusted for."
+        )
+    return pin
+
+
+def _refuse_tls_pin(config: LLMConfig, provider: str) -> None:
+    """Refuse a pin in a factory that reaches only its provider's own API."""
+    if _pin_value_present(config.tls_pinned_cert):
+        raise ValueError(
+            "A pinned certificate applies to endpoint-backed models; the "
+            f"{provider} factory reaches only its provider's own API."
+        )
+
+
+def _tls_pin_note(pin: Optional[TlsPin]) -> str:
+    """The factory log's pin field: empty without a pin."""
+    return f", tls_pin={pin.sha256}" if pin is not None else ""
+
+
 def _create_openai_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -4745,6 +4885,8 @@ def _create_openai_llm(
     rotate through them on auth/quota failures.
     """
     from shared.runtime.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    tls_pin = _endpoint_tls_pin(config)
 
     # Parse API keys (supports comma-separated list for fallback)
     raw_key = config.api_key or _env_fallback_key(
@@ -4887,7 +5029,9 @@ def _create_openai_llm(
     # OpenAI only: an explicit base_url means an OpenAI-compatible endpoint,
     # which may reject unknown body fields and prefix-caches without a key.
     # setdefault so an explicitly declared value keeps winning.
-    if config.prompt_cache_key and (not base_url or "api.openai.com" in base_url):
+    if config.prompt_cache_key and (
+        not base_url or urlsplit(base_url).hostname == "api.openai.com"
+    ):
         extra_body.setdefault("prompt_cache_key", config.prompt_cache_key)
 
     claude_via_proxy = bool(
@@ -4961,6 +5105,17 @@ def _create_openai_llm(
     # only (Qwen3.8 raises on any other) — see fold_system_messages.
     if resolve_model_settings(config.model).get("single_system_message") is True:
         llm_kwargs["single_system_message"] = True
+    # An endpoint that ignores `max_completion_tokens` gets the cap as
+    # `max_tokens` (family setting, see ReasoningChatOpenAI.send_max_tokens).
+    if resolve_model_settings(config.model).get("send_max_tokens") is True:
+        llm_kwargs["send_max_tokens"] = True
+
+    # Family setting for providers that continue from their earlier reasoning
+    # only when it is sent back (DeepSeek) — see attach_reasoning_content.
+    if config.replay_reasoning_content is not False and replays_reasoning_content(
+        config.model
+    ):
+        llm_kwargs["replay_reasoning_content"] = True
 
     # Claude through the subscription proxy: without explicit breakpoints the
     # proxy marks the last message, which is the per-turn injection tail, and
@@ -4982,6 +5137,9 @@ def _create_openai_llm(
             config.model,
         )
 
+    if tls_pin is not None:
+        llm_kwargs["tls_pin"] = tls_pin
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
@@ -4993,6 +5151,7 @@ def _create_openai_llm(
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}, "
         f"headers={sorted(config.extra_headers) if config.extra_headers else 'none'}"
+        f"{_tls_pin_note(tls_pin)}"
     )
 
     return llm
@@ -5067,6 +5226,7 @@ def _create_anthropic_llm(
     from langchain_anthropic import ChatAnthropic
     from shared.runtime.llm.key_ring import parse_key_string
 
+    tls_pin = _endpoint_tls_pin(config)
     via_proxy = bool(config.base_url and _is_codex_proxy_url(config.base_url))
     raw_key = config.api_key or os.getenv("ANTHROPIC_API_KEY")
     if not raw_key and via_proxy:
@@ -5143,7 +5303,14 @@ def _create_anthropic_llm(
     if headers:
         llm_kwargs["default_headers"] = headers
 
-    llm = ChatAnthropic(**llm_kwargs)
+    if tls_pin is not None:
+        # langchain-anthropic takes no http_client and shares one per base URL
+        # (lru_cache); the subclass builds its own client on the pin.
+        from shared.runtime.llm.pinned_anthropic import PinnedChatAnthropic
+
+        llm = PinnedChatAnthropic(tls_pin=tls_pin, **llm_kwargs)
+    else:
+        llm = ChatAnthropic(**llm_kwargs)
 
     logger.info(
         f"Created Anthropic LLM: model={config.model}, "
@@ -5152,6 +5319,7 @@ def _create_anthropic_llm(
         f"timeout={llm_kwargs.get('timeout')}s, max_retries={config.max_retries}, "
         f"max_tokens={llm_kwargs['max_tokens']}, reasoning={reasoning_mode}, "
         f"betas={betas}, headers={sorted(headers) if headers else 'none'}"
+        f"{_tls_pin_note(tls_pin)}"
     )
 
     return llm
@@ -5200,6 +5368,8 @@ def _create_google_llm(
 
     Requires GOOGLE_API_KEY environment variable or config.api_key.
     """
+    # Google ignores base_url: no endpoint row routes here, so no pin can apply.
+    _refuse_tls_pin(config, "google")
     # Lazy import to avoid requiring the package when not used
     from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -5286,6 +5456,8 @@ def _create_groq_llm(
     Requires GROQ_API_KEY environment variable or config.api_key.
     Groq hosts open models (Llama, Mixtral, Gemma) with fast inference.
     """
+    # Provider-key rows only: no endpoint row routes here, so no pin applies.
+    _refuse_tls_pin(config, "groq")
     # Lazy import to avoid requiring the package when not used
     from langchain_groq import ChatGroq
 
@@ -5365,6 +5537,8 @@ def _create_openrouter_llm(
     - OPENROUTER_TITLE: Your app name
     """
     from shared.runtime.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    tls_pin = _endpoint_tls_pin(config)
 
     # Parse API keys (supports comma-separated list for fallback)
     raw_key = config.api_key or _env_fallback_key(
@@ -5506,6 +5680,20 @@ def _create_openrouter_llm(
     # only (Qwen3.8 raises on any other) — see fold_system_messages.
     if resolve_model_settings(config.model).get("single_system_message") is True:
         llm_kwargs["single_system_message"] = True
+    # An endpoint that ignores `max_completion_tokens` gets the cap as
+    # `max_tokens` (family setting, see ReasoningChatOpenAI.send_max_tokens).
+    if resolve_model_settings(config.model).get("send_max_tokens") is True:
+        llm_kwargs["send_max_tokens"] = True
+
+    # Family setting for providers that continue from their earlier reasoning
+    # only when it is sent back (DeepSeek) — see attach_reasoning_content.
+    if config.replay_reasoning_content is not False and replays_reasoning_content(
+        config.model
+    ):
+        llm_kwargs["replay_reasoning_content"] = True
+
+    if tls_pin is not None:
+        llm_kwargs["tls_pin"] = tls_pin
 
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
@@ -5523,6 +5711,7 @@ def _create_openrouter_llm(
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}, "
         f"prompt_cache={'requested' if 'cache_control' in extra_body else 'provider'}"
+        f"{_tls_pin_note(tls_pin)}"
     )
 
     return llm
@@ -5556,6 +5745,7 @@ def _create_mistral_llm(
     mistral-small-latest, codestral-latest, …). A defensive ``mistral/`` prefix
     is stripped if present; the API expects the bare id.
     """
+    tls_pin = _endpoint_tls_pin(config)
     api_key = config.api_key or _env_fallback_key(
         config, "MISTRAL_API_KEY", canonical_base_url="https://api.mistral.ai/v1"
     )
@@ -5609,6 +5799,9 @@ def _create_mistral_llm(
     # persistent path gets turn metrics — same as the openrouter factory.
     llm_kwargs["stream_usage"] = True
 
+    if tls_pin is not None:
+        llm_kwargs["tls_pin"] = tls_pin
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     logger.info(
@@ -5617,6 +5810,7 @@ def _create_mistral_llm(
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, "
         f"max_context_tokens={max_context_tokens or 'default'}, max_tokens={max_tokens}"
+        f"{_tls_pin_note(tls_pin)}"
     )
 
     return llm
@@ -5648,6 +5842,8 @@ def _create_codex_llm(
     not needed as CLIProxyAPI handles auth).
     """
     from shared.runtime.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    tls_pin = _endpoint_tls_pin(config)
 
     # Parse API keys — CLIProxyAPI handles OAuth, so "not-needed" is the default
     raw_key = config.api_key or _env_fallback_key(
@@ -5752,6 +5948,9 @@ def _create_codex_llm(
     # Pass KeyRing for automatic key rotation
     llm_kwargs["key_ring"] = key_ring
 
+    if tls_pin is not None:
+        llm_kwargs["tls_pin"] = tls_pin
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
@@ -5761,6 +5960,7 @@ def _create_codex_llm(
         f"base_url={base_url}, timeout={llm_kwargs.get('timeout')}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
         f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
+        f"{_tls_pin_note(tls_pin)}"
     )
 
     return llm
@@ -5829,8 +6029,10 @@ def render_placeholders(text: str, **known: str) -> str:
 # persistent, protected message (src/core/workspace_injection.py), not
 # re-rendered into every request. An expert overrides a body by shipping
 # ``config/experts/<expert>/skills/<skill>/SKILL.md`` next to its config.yaml
-# (location-primary, like prompt files). A DB expert's ``prompts.strategic`` /
-# ``prompts.tactical`` stays an addendum: fenced and appended to the block.
+# (location-primary, like prompt files). A DB expert has no phase text of its
+# own: the editor's strategic/tactical prompt fields were retired (migration
+# 0567), so a copy of a bundled expert gets its phase skills from the asset
+# directory it points at, and a UI-made expert gets the bundled ones.
 # Design: knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.2.
 
 #: phase name -> the bundled skill that carries that phase's instructions.
@@ -5877,6 +6079,213 @@ def ensure_phase_skill_bindings(
     return (missing + entries, [b["skill"] for b in missing])
 
 
+# =============================================================================
+# A job without phases (shared.job_phases) — one task, written at admission
+# =============================================================================
+#
+# A job whose configuration does not ask for phases runs on the unchanged
+# worker graph: it stays in strategic phase 0, works through one predefined
+# to-do and ends on one job_complete. Everything that makes it do so is
+# written into the frozen configuration by the orchestrator's resolver
+# (apply_no_phases on the merged config, serialize_resolved_config for the
+# frozen texts); the worker never reads the setting itself.
+
+#: Instruction types that exist only for jobs without phases. They are frozen
+#: under the keys the worker already reads (``strategic_todos_*``,
+#: ``instructions``) and never under their own names, so the blob of a job
+#: with phases does not change.
+DIRECT_TASK_INSTRUCTION_TYPES: Tuple[str, ...] = (
+    "direct_task_todos_initial",
+    "direct_task_todos_resume",
+    "direct_task_instructions",
+)
+
+
+def _tactical_only_tool_names() -> List[str]:
+    """Catalog tools the per-call phase gate refuses in a strategic phase.
+
+    Read from the framework-free tool catalog with the gate's own default (a
+    tool without ``phases`` metadata runs in both phases), in catalog order.
+    """
+    from shared.tool_catalog import TOOL_REGISTRY
+
+    both = ("strategic", "tactical")
+    names: List[str] = []
+    for name, meta in TOOL_REGISTRY.items():
+        phases = meta.get("phases", both)
+        if phases is None:
+            phases = both
+        if "strategic" not in phases:
+            names.append(name)
+    return names
+
+
+def apply_no_phases(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the merged worker config ``data`` rewritten for a job without phases.
+
+    * ``tools.core`` loses the phase-procedure tools and gains ``job_complete``
+      when it is missing; the order of the remaining names is kept.
+    * ``instruction_files`` loses every binding of a phase-procedure skill
+      (whatever its trigger) and every ``before_tool`` gate on a removed tool.
+      The remaining ``phase_start:tactical`` entries move to
+      ``phase_start:strategic``, because the job never enters a tactical phase
+      and an expert's domain guide bound there must still arrive. The
+      ``direct-task`` skill is bound first, at ``phase_start:strategic``.
+    * ``phase_settings.strategic_tools`` gains every tactical-only tool of the
+      catalog and ``job_complete``, so the per-call phase gate refuses none of
+      the job's tools in its one strategic phase.
+
+    Pure (``data`` is not modified) and idempotent. The caller decides whether
+    the job plans in phases; subagent roster entries are not touched.
+    """
+    from shared.job_phases import (
+        DIRECT_TASK_SKILL,
+        PHASE_PROCEDURE_SKILLS,
+        PHASE_PROCEDURE_TOOLS,
+    )
+
+    job_complete = "job_complete"
+    result = dict(data)
+
+    tools = dict(result["tools"]) if isinstance(result.get("tools"), dict) else {}
+    core = tools.get("core")
+    if core is None:
+        core = []
+    elif not isinstance(core, (list, tuple)):
+        # Layers are normalised before they merge, so this is a list in
+        # practice; a policy shape (true, {only: ...}) is expanded first.
+        from shared.runtime.core.tool_policy import normalize_tool_policy
+
+        core = normalize_tool_policy({"tools": {"core": core}}, source="job-phases")[
+            "tools"
+        ]["core"]
+        if not isinstance(core, (list, tuple)):
+            core = []
+    kept_tools = [name for name in core if name not in PHASE_PROCEDURE_TOOLS]
+    if job_complete not in kept_tools:
+        kept_tools.append(job_complete)
+    tools["core"] = kept_tools
+    result["tools"] = tools
+
+    bindings: List[Any] = [
+        {
+            "skill": DIRECT_TASK_SKILL,
+            "trigger": "phase_start:strategic",
+            "enforce": False,
+        }
+    ]
+    entries = result.get("instruction_files")
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            bindings.append(entry)
+            continue
+        skill = entry.get("skill")
+        if skill in PHASE_PROCEDURE_SKILLS or skill == DIRECT_TASK_SKILL:
+            continue
+        kind, _, target = str(entry.get("trigger") or "").partition(":")
+        if kind == "before_tool" and target in PHASE_PROCEDURE_TOOLS:
+            continue
+        if kind in ("phase_start", "phase") and target == "tactical":
+            entry = {**entry, "trigger": "phase_start:strategic"}
+        bindings.append(entry)
+    result["instruction_files"] = bindings
+
+    phase_settings = (
+        dict(result["phase_settings"])
+        if isinstance(result.get("phase_settings"), dict)
+        else {}
+    )
+    current = phase_settings.get("strategic_tools")
+    strategic_tools: List[str] = []
+    for name in [
+        *(current if isinstance(current, (list, tuple)) else ()),
+        *_tactical_only_tool_names(),
+        job_complete,
+    ]:
+        if name not in strategic_tools:
+            strategic_tools.append(name)
+    phase_settings["strategic_tools"] = strategic_tools
+    result["phase_settings"] = phase_settings
+    return result
+
+
+def _is_single_todo_template(
+    content: Optional[str], tool_names: List[str], origin: str
+) -> bool:
+    """True when ``content`` renders and parses to exactly one to-do.
+
+    A job without phases that has more than one to-do can never end: ``job_complete``
+    closes the open to-do only when exactly one is pending. The template is
+    rendered with the configured tool names, as the worker renders it with the
+    loaded ones.
+    """
+    if not isinstance(content, str) or not content.strip():
+        return False
+    try:
+        rendered = render_instruction_content(content, tool_names, origin=origin)
+        return len(_parse_strategic_todos_yaml_from_string(rendered)) == 1
+    except Exception:
+        return False
+
+
+def _freeze_direct_task_instructions(
+    instructions: Dict[str, Any], config: "AgentConfig", model_family: str
+) -> None:
+    """Write the texts of a job without phases into ``instructions`` (the frozen map).
+
+    The one to-do (``direct_task_todos_initial``) is frozen under both
+    ``strategic_todos_initial`` and ``strategic_todos_transition`` and the
+    resume to-do (``direct_task_todos_resume``) under ``strategic_todos_resume``:
+    the keys the worker's three to-do getters read. Lookup is location-first,
+    so an expert may ship its own files; one that does not parse to exactly
+    one to-do is replaced by the framework's. ``direct_task_instructions`` replaces
+    ``instructions`` only when the job would otherwise get the framework's
+    default file; an expert's own ``instructions.md`` stays.
+    """
+    resolver = InstructionMatrixResolver(config._deployment_dir, model_family)
+    framework = InstructionMatrixResolver(None, model_family)
+    tool_names = get_all_tool_names(config)
+
+    def one_todo(instruction_type: str) -> Optional[str]:
+        try:
+            content: Optional[str] = resolver.load(instruction_type)
+        except FileNotFoundError:
+            content = None
+        if _is_single_todo_template(
+            content, tool_names, origin=f"template {instruction_type!r}"
+        ):
+            return content
+        if content is not None:
+            logger.warning(
+                "Expert %r: %s does not hold exactly one to-do; the framework's "
+                "template is used instead",
+                getattr(config, "agent_id", "?"),
+                instruction_type,
+            )
+        try:
+            return framework.load(instruction_type, bundled_only=True)
+        except FileNotFoundError:
+            return None
+
+    initial = one_todo("direct_task_todos_initial")
+    instructions["strategic_todos_initial"] = initial
+    instructions["strategic_todos_transition"] = initial
+    instructions["strategic_todos_resume"] = one_todo("direct_task_todos_resume")
+
+    try:
+        source = resolver._resolve_path("instructions").resolve()
+        framework_default = source.is_relative_to(
+            resolver._file_resolver.framework_dir.resolve()
+        )
+    except FileNotFoundError:
+        framework_default = True
+    if framework_default:
+        try:
+            instructions["instructions"] = resolver.load("direct_task_instructions")
+        except FileNotFoundError:
+            pass
+
+
 def resolve_bound_skill_dir(skill: str, deployment_dir: Optional[str]) -> Path:
     """Directory a bound skill's ``SKILL.md`` is read from — location-primary
     like prompt files: ``<deployment_dir>/skills/<skill>`` when the expert
@@ -5901,56 +6310,6 @@ def resolve_bound_skill_dir(skill: str, deployment_dir: Optional[str]) -> Path:
         if (local / "SKILL.md").is_file():
             return local
     return skill_dir_under(get_project_root() / "config" / "skills", skill)
-
-
-def expert_phase_prompt_bodies(expert_dir: Union[str, Path]) -> Dict[str, str]:
-    """``{"strategic": body, "tactical": body}`` of an expert directory —
-    the expert-local phase skill bodies with frontmatter stripped.
-
-    Managed-expert seeding and the fork bundle write these into the DB row's
-    ``prompts.strategic`` / ``prompts.tactical`` (shape unchanged); at
-    delivery they become the fenced ``<expert_workflow>`` addendum of the
-    phase block.
-    """
-    from shared.runtime.core.skill_format import skill_body
-
-    expert_dir = Path(expert_dir)
-    out: Dict[str, str] = {}
-    for phase, skill in PHASE_SKILLS.items():
-        skill_md = expert_dir / "skills" / skill / "SKILL.md"
-        if skill_md.is_file():
-            out[phase] = skill_body(skill_md.read_text(encoding="utf-8"))
-    return out
-
-
-def db_phase_addendum(config: Any, phase_name: str) -> Optional[str]:
-    """A DB expert's own ``strategic`` / ``tactical`` prompt for ``phase_name``
-    (present in ``_resolved_prompts`` AND marked DB-authored in
-    ``_db_prompt_keys``), fenced as ``<expert_workflow>``; None otherwise.
-
-    Untrusted text: fenced (braces stripped, subordinated to system rules)
-    exactly as the legacy swap fenced it into the system prompt — never
-    Jinja-rendered.
-    """
-    extra = getattr(config, "extra", None)
-    if not isinstance(extra, dict):
-        return None
-    if phase_name not in (extra.get("_db_prompt_keys") or ()):
-        return None
-    resolved = extra.get("_resolved_prompts")
-    text_value = resolved.get(phase_name) if isinstance(resolved, dict) else None
-    if not isinstance(text_value, str) or not text_value.strip():
-        return None
-    from shared.runtime.core.expert_resolution import fence_phase_directive
-
-    return fence_phase_directive(text_value)
-
-
-def append_expert_workflow_addendum(body: str, addendum: str) -> str:
-    """The phase block body with the fenced DB addendum appended — ONE block
-    per (phase, path), so the addendum shares the skill's protected identity
-    (see src/core/workspace_injection.create_phase_instruction_message)."""
-    return f"{body.rstrip()}\n\n{addendum}\n"
 
 
 def cloud_mount_system_floor(
@@ -7699,10 +8058,28 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
     instr_resolver = InstructionMatrixResolver(config._deployment_dir, model_family)
     instructions = {}
     for it in InstructionMatrixResolver.HARDCODED_DEFAULTS:
+        if it in DIRECT_TASK_INSTRUCTION_TYPES:
+            continue
         try:
             instructions[it] = instr_resolver.load(it)
         except FileNotFoundError:
             instructions[it] = None
+
+    # The to-dos and standing instructions of a job without phases replace the
+    # procedure's under the keys the worker reads. Only a config the worker
+    # resolver rewrote for such a job gets them (apply_no_phases binds the
+    # direct-task skill at the strategic phase start): a session never gets
+    # that binding, so the setting does nothing there. ``phases`` is no
+    # AgentConfig field, so it arrives in ``extra``.
+    from shared.job_phases import DIRECT_TASK_SKILL, PHASES_KEY, plans_in_phases
+
+    if not plans_in_phases(
+        {PHASES_KEY: getattr(config, PHASES_KEY, config.extra.get(PHASES_KEY))}
+    ) and any(
+        entry.skill == DIRECT_TASK_SKILL and entry.trigger == "phase_start:strategic"
+        for entry in config.instruction_files
+    ):
+        _freeze_direct_task_instructions(instructions, config, model_family)
 
     # Also resolve custom instruction files from config.instruction_files
     # (e.g. research_guide.md) AND bound skills (skill:) — these aren't in the

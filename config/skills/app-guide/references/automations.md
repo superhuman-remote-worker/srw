@@ -17,10 +17,10 @@ graph.
 
 ## Coverage boundary: a schedule does not attach other features
 
-An automation can schedule a worker job with a prompt, expert, autonomy,
-priority, and optional project. Mentioning a connector or product feature in
-the prompt does not attach it to the resulting job. Related features are not
-proof of a supported combined workflow.
+An automation can schedule a worker job with a prompt, expert, autonomy, job
+mode, priority, and optional project. Mentioning a connector or product
+feature in the prompt does not attach it to the resulting job. Related
+features are not proof of a supported combined workflow.
 
 In particular, an exact recurring flow that needs any connector—for example,
 scheduled work that reads a mailbox or database, or sends through
@@ -55,11 +55,15 @@ move the next scheduled run.
 ## What the schedule creates
 
 Each fire creates a normal job with the automation's current prompt, expert,
-autonomy, priority, and optional project. Project scope supplies the project's
-context and knowledge, but automation-fired jobs do not attach connectors:
-there is no connector selector on an automation today. If recurring work needs
-a mailbox, database, MCP server, cloud folder, or other connector, use another
-workflow until per-automation connector selection is implemented.
+autonomy, priority, and optional project. Whether the job plans in phases
+follows its expert: most experts do the task directly, without a plan or
+phases, which suits one step with an obvious end. An expert meant for long,
+open-ended work has **Plans in phases** on. Project scope
+supplies the project's context and knowledge, but automation-fired jobs do
+not attach connectors: there is no connector selector on an automation today.
+If recurring work needs a mailbox, database, MCP server, cloud folder, or
+other connector, use another workflow until per-automation connector
+selection is implemented.
 
 An expert selected from the database-backed worker roster is pinned by its
 stable ID, so renaming it does not silently repoint the schedule; later edits

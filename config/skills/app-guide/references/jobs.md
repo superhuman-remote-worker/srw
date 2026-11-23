@@ -24,19 +24,34 @@ Open **Jobs → New Job**. A session can create one for you only when its actual
 tool list includes Fleet Management; loading this App Guide does not grant
 those tools. The form includes:
 
+- **The task box** — one box at the top for what the agent should do. State
+  the desired outcome, constraints, and what evidence would count as done.
+  **Attach** (or dropping files on the box) adds input files. **Create Job**
+  is in the box; Ctrl+Enter creates the job too. After creating, the app
+  returns to the job list.
 - **Project** — use a project when the work should share its goal, eligible
   connectors, repositories, knowledge, and (when enabled) project memory.
-- **Description** — the main task brief. State the desired outcome,
-  constraints, and what evidence would count as done.
-- **Kick-off message** — an optional first instruction sent when work starts.
-- **Expert** — a worker expert; session experts are not eligible for jobs.
-- **Documents** — optional input files.
+- **Autonomy** — when the job stops for a person's review.
+- **Plans in phases** — a setting of the expert, not of the form. Most experts
+  have it off: the job does its task directly and ends when it is done. An
+  expert meant for long work has it on: the job plans, works through todos in
+  phases and reviews its result. A job without phases stops once, at its end,
+  so Partial, Guided and Dependent act like Review there.
 - **Priority** — **Low (backfill)**, **Normal (default)**, or **High (preempts
   lower)**.
+- **Expert** — a worker expert; session experts are not eligible for jobs.
 - Project cloud access, when the selected project has cloud storage.
 - **Agent Settings** — autonomy, models, tool categories, selected connectors,
   custom instructions, memory, quality helpers, and limits.
 - **Workspace** — see below.
+
+A new job is listed by its task text. When that text is long, the user's
+auxiliary model gives the job a short name a few seconds after it is created;
+a short one-line task stays its own name, and jobs that loops, officers and
+automations start keep the description they were given. To set a name
+yourself, hover the job's row in **Jobs** and use the pencil; a name you set
+is never replaced. The task text does not change, and search finds the job by
+either.
 
 ### Choosing a workspace
 
@@ -67,9 +82,9 @@ A template's tier is **Container**, eligible **VM (QEMU)**, or **Virtual (cloud 
 browser, and git tools. None also disables file tools. Container and VM are the full workspace
 tiers; their exact tools still depend on the expert and grants.
 
-To run commands in a workspace, for example to try an image, pick an Expert with the shell
-tools, such as Engineer; General Worker has none. A non-admin also needs the
-`shell_tools` grant from an administrator.
+To run commands in a workspace, for example to try an image or to produce a PDF, pick an Expert
+with the shell tools: the default General Worker and Engineer both have them. The `shell_tools`
+grant is on by default; an administrator can restrict it.
 
 ## Choose the review cadence
 
@@ -107,10 +122,11 @@ be reached — never present it as "no activity".
 
 ## Watch the work
 
-Workspace-backed worker jobs normally alternate strategic planning and
-tactical execution. With file tools, the workspace can contain `plan.md`,
-todos, archives, inputs, notes, and `output/` deliverables. The exact files
-depend on the expert and task.
+A job on an expert that plans in phases alternates strategic planning and
+tactical execution; with file tools its workspace can contain `plan.md`,
+todos, archives, inputs, notes, and `output/` deliverables. A job without
+phases does its task directly, without `plan.md` or todos, and leaves its
+deliverables in `output/`. The exact files depend on the expert and task.
 
 Use **View** for the durable job record. **Workspace** appears when a repository
 URL is available, and **IDE** appears only for eligible live, snapshotted, or

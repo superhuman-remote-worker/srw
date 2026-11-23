@@ -17,6 +17,21 @@ from shared.runtime.core.capability_grants import (
 )
 
 DEFAULTS = {k: v["default"] for k, v in CATALOG.items()}
+#: The defaults under an administrator's global ``shell_tools: false`` — the
+#: shell gate's mechanics, now that the grant itself is on by default.
+SHELL_RESTRICTED = {**DEFAULTS, "shell_tools": False}
+#: The pre-2026-11-11 defaults, which an administrator restores with global
+#: grants: every gate the owner's decision opened, closed again. Tests of a
+#: gate's mechanics use it, since the defaults no longer trip those gates.
+RESTRICTED = {
+    **DEFAULTS,
+    "shell_tools": False,
+    "delegation": False,
+    "vm_workspace": False,
+    "catalog_authoring": False,
+    "permission_mode": "auto_accept",
+    "autonomy_ceiling": "review",
+}
 
 
 def _rows(**kv):
@@ -45,20 +60,25 @@ def test_catalog_keys_and_defaults():
         "custom_harness_images",
     }
     assert all(spec["restrict_only"] for spec in CATALOG.values())
+    assert all(
+        isinstance(spec.get("description"), str) and spec["description"].strip()
+        for spec in CATALOG.values()
+    ), "every key needs the one-line description the Grants page shows"
     assert CATALOG["personal_default_experts"]["default"] is True
-    assert CATALOG["vm_workspace"]["default"] is False
-    assert CATALOG["shell_tools"]["default"] is False  # deny-by-default
-    assert CATALOG["delegation"]["default"] is False
+    # Granted by default since 2026-11-11 (owner decision): what the user's
+    # own agent needs to get work done in its own workspace. An administrator
+    # restricts each with a global grant.
+    assert CATALOG["vm_workspace"]["default"] is True
+    assert CATALOG["shell_tools"]["default"] is True
+    assert CATALOG["delegation"]["default"] is True
+    assert CATALOG["catalog_authoring"]["default"] is True
+    assert CATALOG["permission_mode"]["default"] == "autonomous"
     assert CATALOG["public_datasources"]["default"] is False  # deny-by-default
     assert CATALOG["email_autonomous_send"]["default"] is False  # deny-by-default
-    # Deny-by-default AND not backfilled: nobody held it before, so unlike
-    # 0030's shell_tools/delegation there is nothing to grandfather.
-    assert CATALOG["catalog_authoring"]["default"] is False
     assert CATALOG["browser"]["default"] is True  # spec-deferred allow
     assert CATALOG["datasource_tools"]["default"] is True
     assert CATALOG["model_selection"]["default"] is None
-    assert CATALOG["autonomy_ceiling"]["default"] == "review"
-    assert CATALOG["permission_mode"]["default"] == "auto_accept"
+    assert CATALOG["autonomy_ceiling"]["default"] == "full"
     # Deny-by-default and NOT backfilled: the gate can only fire on a job that
     # carries a recorded context.pull_request, and no such job existed when the
     # key was introduced, so there is nothing to grandfather.
@@ -83,11 +103,11 @@ def test_meet_bool_enum_list():
 
 def test_lone_user_grant_widens_past_default():
     g = resolve_grants(
-        user_rows=_rows(shell_tools=True), project_rows=[], global_rows=[]
+        user_rows=_rows(unattended_operations=True), project_rows=[], global_rows=[]
     )
-    assert g["shell_tools"] is True
-    assert g["vm_workspace"] is False and g["model_selection"] is None
-    assert g["autonomy_ceiling"] == "review" and g["permission_mode"] == "auto_accept"
+    assert g["unattended_operations"] is True
+    assert g["custom_harness_images"] is False and g["model_selection"] is None
+    assert g["autonomy_ceiling"] == "full" and g["permission_mode"] == "autonomous"
 
 
 def test_project_cap_clamps_user_grant():
@@ -137,10 +157,58 @@ def test_flags_ungranted_shell_and_vm_and_autonomy():
             "tools": {"shell": ["ls"]},
             "autonomy": "full",
         },
-        DEFAULTS,
+        RESTRICTED,
     )
     j = " ".join(v)
     assert "shell_tools" in j and "vm_workspace" in j and "autonomy_ceiling" in j
+
+
+def test_defaults_open_vm_delegation_authoring_and_autonomous_sessions():
+    """The 2026-11-11 defaults: none of these needs a grant row any more."""
+    fragment = {
+        "workspace": {"backend": "vm"},
+        "tools": {
+            "shell": ["run_command"],
+            "delegation": ["delegate_agent"],
+            "catalog_authoring": ["set_expert_bundle"],
+        },
+        "delegation": {"enabled": True},
+        "interactive": {"permission_mode": "autonomous"},
+    }
+    assert evaluate(fragment, DEFAULTS) == []
+    assert evaluate(fragment, {}) == []
+    # Each closes again under the administrator's global restriction.
+    flagged = {v.split(":", 1)[0] for v in evaluate(fragment, RESTRICTED)}
+    assert flagged == {
+        "vm_workspace",
+        "shell_tools",
+        "delegation",
+        "catalog_authoring",
+        "permission_mode",
+    }
+
+
+def test_default_principal_may_use_shell_tools():
+    """shell_tools is granted by default: a shell needs no grant row."""
+    assert evaluate({"tools": {"shell": ["run_command"]}}, DEFAULTS) == []
+    assert evaluate({"tools": {"shell": ["run_command"]}}, {}) == []
+    assert (
+        resolve_grants(user_rows=[], project_rows=[], global_rows=[])["shell_tools"]
+        is True
+    )
+
+
+def test_global_shell_restriction_caps_every_scope_below_it():
+    """The administrator's way back to the old posture: a global
+    ``shell_tools: false`` row wins over a user-scope ``true`` (restrict-only)."""
+    grants = resolve_grants(
+        user_rows=_rows(shell_tools=True),
+        project_rows=[],
+        global_rows=_rows(shell_tools=False),
+    )
+    assert grants["shell_tools"] is False
+    v = evaluate({"tools": {"shell": ["run_command"]}}, grants)
+    assert len(v) == 1 and v[0].startswith("shell_tools:")
 
 
 def test_datasource_grant_covers_every_datasource_tool_category():
@@ -164,7 +232,7 @@ def test_workspace_upgrade_gate_vm_vs_sandbox():
     # sandbox upgrade — passes by default (no backend gate, no declared tools).
     assert evaluate({"workspace": {"backend": "sandbox"}}, DEFAULTS) == []
     # vm upgrade without the grant — refused.
-    v = evaluate({"workspace": {"backend": "vm"}}, DEFAULTS)
+    v = evaluate({"workspace": {"backend": "vm"}}, RESTRICTED)
     assert len(v) == 1 and "vm_workspace" in v[0]
     # vm upgrade with the grant — clean.
     assert (
@@ -186,20 +254,25 @@ def test_workspace_upgrade_gate_refuses_shell_restricted_principal():
 
 def test_delegation_reads_enabled_not_dict_presence():
     # A disabled delegation settings-dict must NOT trip the gate.
-    assert evaluate({"delegation": {"enabled": False, "max_depth": 3}}, DEFAULTS) == []
+    assert (
+        evaluate({"delegation": {"enabled": False, "max_depth": 3}}, RESTRICTED) == []
+    )
     assert evaluate(
-        {"delegation": {"enabled": True}}, DEFAULTS
-    )  # flagged (deny default)
+        {"delegation": {"enabled": True}}, RESTRICTED
+    )  # flagged (delegation restricted)
 
 
 def test_session_permission_mode_gated():
-    # sessions use interactive.permission_mode, NOT autonomy. Default ceiling is
-    # auto_accept (Phase 5): supervised + auto_accept pass without a grant;
-    # autonomous (fully unattended) is gated.
-    v = evaluate({"interactive": {"permission_mode": "autonomous"}}, DEFAULTS)
+    # sessions use interactive.permission_mode, NOT autonomy. The default
+    # ceiling is autonomous since 2026-11-11, so every mode passes without a
+    # grant; under an auto_accept ceiling autonomous is gated.
+    for mode in ("read_only", "auto_accept", "autonomous"):
+        assert evaluate({"interactive": {"permission_mode": mode}}, DEFAULTS) == []
+    v = evaluate({"interactive": {"permission_mode": "autonomous"}}, RESTRICTED)
     assert len(v) == 1 and "permission_mode" in v[0]
-    assert evaluate({"interactive": {"permission_mode": "read_only"}}, DEFAULTS) == []
-    assert evaluate({"interactive": {"permission_mode": "auto_accept"}}, DEFAULTS) == []
+    assert (
+        evaluate({"interactive": {"permission_mode": "auto_accept"}}, RESTRICTED) == []
+    )
 
 
 def test_model_not_in_selection():
@@ -267,8 +340,10 @@ def test_user_grant_cannot_exceed_project_ceiling():
 
 
 def test_null_deletion_of_guardrail_caught_in_merged():
-    d = {k: v["default"] for k, v in CATALOG.items()}
-    assert evaluate({"autonomy": "full"}, d)  # ceiling review -> flagged
+    # The default ceiling is full since 2026-11-11; under a review ceiling a
+    # merged `autonomy: full` is still flagged.
+    assert evaluate({"autonomy": "full"}, DEFAULTS) == []
+    assert evaluate({"autonomy": "full"}, RESTRICTED)  # ceiling review -> flagged
 
 
 def test_cross_layer_credential_assembly_denied():
@@ -579,12 +654,13 @@ def test_a_user_with_every_grant_gets_an_unmodified_copy():
     assert fragment == before  # still not mutated
 
 
-def test_defaults_grant_browser_and_datasource_but_deny_shell_and_delegation():
+def test_defaults_grant_the_working_tools_but_deny_unattended_operations():
     """Sanity check against the REAL catalog defaults (not the permissive-
-    except-one construction above): browser/datasource_tools default True
-    (granted, so untouched), shell_tools/delegation default False (denied, so
-    stripped). A completeness check that assumed every grant defaults False
-    would get browser/datasource_tools backwards."""
+    except-one construction above): browser/datasource_tools/shell_tools/
+    delegation default True (granted, so untouched), unattended_operations
+    defaults False (denied, so its officer flag is stripped). A completeness
+    check that assumed every grant defaults False would get the granted ones
+    backwards."""
     fragment = {
         "tools": {
             "shell": ["run_command"],
@@ -593,11 +669,16 @@ def test_defaults_grant_browser_and_datasource_but_deny_shell_and_delegation():
             "sql": ["run_query"],
         },
         "delegation": {"enabled": True},
+        "officer": {"enabled": True, "slots": 2},
     }
 
     stripped, dropped = strip_to_grants(fragment, DEFAULTS)
 
-    assert sorted(dropped) == ["delegation", "shell_tools"]
+    assert dropped == ["unattended_operations"]
+    assert stripped["officer"] == {"slots": 2}
+    assert stripped["tools"]["shell"] == ["run_command"]
+    assert stripped["tools"]["delegation"] == ["delegate_agent"]
+    assert stripped["delegation"] == {"enabled": True}
     assert stripped["tools"]["browser_direct"] == ["browser_navigate"]
     assert stripped["tools"]["sql"] == ["run_query"]
 
@@ -771,13 +852,13 @@ def test_roster_shell_tools_require_grant():
         },
     }
 
-    v = evaluate(fragment, DEFAULTS)
+    v = evaluate(fragment, SHELL_RESTRICTED)
 
     assert len(v) == 1
     assert v[0].startswith("shell_tools:") and "subagents.roster.fixer" in v[0]
     assert evaluate(fragment, {**DEFAULTS, "shell_tools": True}) == []
 
-    stripped, dropped = strip_to_grants(fragment, DEFAULTS)
+    stripped, dropped = strip_to_grants(fragment, SHELL_RESTRICTED)
 
     assert dropped == ["shell_tools"]
     fixer = stripped["subagents"]["roster"]["fixer"]["tools"]
@@ -787,7 +868,7 @@ def test_roster_shell_tools_require_grant():
         == fragment["subagents"]["roster"]["reader"]
     )
     assert stripped["tools"] == {"git": ["git_status"]}
-    assert evaluate(stripped, DEFAULTS) == []
+    assert evaluate(stripped, SHELL_RESTRICTED) == []
 
 
 @pytest.mark.parametrize(
@@ -884,7 +965,8 @@ def test_resolved_roster_children_are_safe_for_a_new_principal():
         e["interactive"]["permission_mode"] == "autonomous" for e in roster.values()
     )
     assert evaluate(cap["merged_fragment"], DEFAULTS) == []
-    # …and a child that names a shell IS caught on the materialised entry.
+    # …and a child that names a shell IS caught on the materialised entry
+    # where an administrator restricted the (default-on) shell grant.
     parent["config"]["subagents"]["roster"]["inline"]["tools"]["shell"] = [
         "run_command"
     ]
@@ -895,5 +977,6 @@ def test_resolved_roster_children_are_safe_for_a_new_principal():
         expert_type="worker",
         capture=cap,
     )
-    flagged = evaluate(cap["merged_fragment"], DEFAULTS)
+    assert evaluate(cap["merged_fragment"], DEFAULTS) == []
+    flagged = evaluate(cap["merged_fragment"], SHELL_RESTRICTED)
     assert len(flagged) == 1 and "subagents.roster.inline" in flagged[0]

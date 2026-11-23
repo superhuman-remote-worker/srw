@@ -1,9 +1,14 @@
 """Unit tests for EmbeddingService."""
+# ruff: noqa: F811  (the imported fixture is requested by name as a test argument)
 
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError
+from tests.tls_pin_fixtures import caused_by, pin_of
+from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 
 @pytest.fixture
@@ -563,3 +568,186 @@ class TestExplicitConfigOverrides:
         service = EmbeddingService()
         assert service.model == "qwen3-embedding-8b"
         assert service.api_key == "test-key-123"
+
+
+# ---------------------------------------------------------------------------
+# Certificate pinning (A2/A3): the embedding and KB embedding clients
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingPin:
+    @pytest.mark.asyncio
+    async def test_env_url_takes_the_env_pin(self, mock_env, monkeypatch, tls_certs):
+        from shared.runtime.services.embedding_service import EmbeddingService
+
+        with tls_server(tls_certs.leaf, tls_certs.leaf_key) as server:
+            monkeypatch.setenv("EMBEDDING_BASE_URL", server.url)
+            monkeypatch.setenv("EMBEDDING_API_KEY", "k")
+            monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
+            service = EmbeddingService(model="m1", expected_dimensions=2)
+            assert await service.embed("hi") == [0.1, 0.2]
+            await service._client.close()
+        assert server.requests[0]["path"] == "/v1/embeddings"
+
+    @pytest.mark.asyncio
+    async def test_swapped_certificate_fails_with_no_request(self, mock_env, tls_certs):
+        from shared.runtime.services.embedding_service import EmbeddingService
+
+        with tls_server(tls_certs.swap, tls_certs.swap_key) as server:
+            service = EmbeddingService(
+                model="m1",
+                base_url=server.url,
+                api_key="secret",
+                tls_pin=pin_of(tls_certs.leaf),
+                expected_dimensions=2,
+            )
+            with pytest.raises(Exception) as exc:
+                await service.embed("hi")
+            await service._client.close()
+        assert caused_by(exc.value, CertificateChangedError)
+        assert server.requests == []
+
+    def test_an_explicit_url_ignores_the_env_pin(
+        self, mock_env, monkeypatch, tls_certs
+    ):
+        # A caller that passes base_url passes tls_pin too (None: no pin).
+        from shared.runtime.services.embedding_service import EmbeddingService
+
+        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", UNREADABLE_PIN)
+        with patch("shared.runtime.services.embedding_service.AsyncOpenAI") as cls:
+            EmbeddingService(model="m1", base_url="https://other.example/v1")
+        assert "http_client" not in cls.call_args.kwargs
+
+    @pytest.mark.parametrize("value", [UNREADABLE_PIN, "not-base64!"])
+    def test_a_broken_env_pin_builds_no_service(
+        self, mock_env, monkeypatch, mock_openai_client, value
+    ):
+        from shared.runtime.services.embedding_service import EmbeddingService
+
+        _, cls = mock_openai_client
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://env.example/v1")
+        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", value)
+        with pytest.raises(ValueError, match="EMBEDDING_TLS_PINNED_CERT"):
+            EmbeddingService(model="m1")
+        cls.assert_not_called()
+
+    def test_a_pin_on_an_http_url_is_refused(self, mock_env, tls_certs):
+        from shared.runtime.services.embedding_service import EmbeddingService
+
+        with pytest.raises(ValueError, match="https"):
+            EmbeddingService(
+                model="m1",
+                base_url="http://emb.example/v1",
+                tls_pin=pin_of(tls_certs.leaf),
+            )
+
+    def test_an_empty_base_url_still_takes_the_env_pin(
+        self, mock_env, monkeypatch, tls_certs
+    ):
+        # base_url="" falls back to EMBEDDING_BASE_URL: its pin applies too.
+        from shared.runtime.services.embedding_service import EmbeddingService
+
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://env.example/v1")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "k")
+        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
+        service = EmbeddingService(model="m1", base_url="")
+        assert service.tls_pin == pin_of(tls_certs.leaf)
+
+    def test_the_openrouter_provider_refuses_an_env_pin(
+        self, mock_env, monkeypatch, mock_openai_client, tls_certs
+    ):
+        from shared.runtime.services.embedding_service import EmbeddingService
+
+        _, cls = mock_openai_client
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "openrouter")
+        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
+        with pytest.raises(ValueError, match="openrouter"):
+            EmbeddingService(model="m1", api_key="k")
+        cls.assert_not_called()
+
+    def test_env_pin_without_an_env_url_is_refused(
+        self, mock_env, monkeypatch, mock_openai_client, tls_certs
+    ):
+        from shared.runtime.services.embedding_service import EmbeddingService
+
+        monkeypatch.setenv("EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
+        with pytest.raises(ValueError, match="https"):
+            EmbeddingService(model="m1")
+
+    def test_a_pin_without_any_url_is_refused(self, mock_env, monkeypatch, tls_certs):
+        # The default public URL (OpenAI) is no pinned endpoint.
+        from shared.runtime.services.embedding_service import EmbeddingService
+
+        with pytest.raises(ValueError, match="https"):
+            EmbeddingService(model="m1", tls_pin=pin_of(tls_certs.leaf))
+
+
+class TestKbEmbeddingPin:
+    @pytest.fixture(autouse=True)
+    def _fresh(self, mock_env, monkeypatch):
+        import shared.runtime.services.embedding_service as mod
+
+        monkeypatch.setattr(mod, "_kb_embedding_service", None)
+        monkeypatch.setattr(mod, "_kb_embedding_profile", None)
+        monkeypatch.delenv("KB_EMBEDDING_TLS_PINNED_CERT", raising=False)
+        monkeypatch.setenv("KB_EMBEDDING_MODEL", "kb-model")
+        monkeypatch.setenv("KB_EMBEDDING_API_KEY", "kb-key")
+        monkeypatch.setenv("KB_EMBEDDING_BASE_URL", "https://kb.example/v1")
+
+    def test_rebuilt_when_only_the_pin_changes(self, monkeypatch, tls_certs):
+        from shared.runtime.services.embedding_service import (
+            get_kb_embedding_service,
+        )
+
+        monkeypatch.setenv("KB_EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
+        first = get_kb_embedding_service()
+        assert get_kb_embedding_service() is first
+        monkeypatch.setenv("KB_EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.swap).wire)
+        assert get_kb_embedding_service() is not first
+
+    @pytest.mark.asyncio
+    async def test_kb_service_reaches_its_server_with_the_pin(
+        self, monkeypatch, tls_certs
+    ):
+        from shared.runtime.services.embedding_service import (
+            get_kb_embedding_service,
+        )
+
+        with tls_server(tls_certs.leaf, tls_certs.leaf_key) as server:
+            monkeypatch.setenv("KB_EMBEDDING_BASE_URL", server.url)
+            monkeypatch.setenv("KB_EMBEDDING_DIMENSIONS", "2")
+            monkeypatch.setenv(
+                "KB_EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire
+            )
+            service = get_kb_embedding_service()
+            assert await service.embed("hi") == [0.1, 0.2]
+            await service._client.close()
+        assert server.requests[0]["authorization"] == "Bearer kb-key"
+
+    @pytest.mark.asyncio
+    async def test_kb_service_verifies_its_pin(self, monkeypatch, tls_certs):
+        from shared.runtime.services.embedding_service import (
+            get_kb_embedding_service,
+        )
+
+        with tls_server(tls_certs.swap, tls_certs.swap_key) as server:
+            monkeypatch.setenv("KB_EMBEDDING_BASE_URL", server.url)
+            monkeypatch.setenv("KB_EMBEDDING_DIMENSIONS", "2")
+            monkeypatch.setenv(
+                "KB_EMBEDDING_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire
+            )
+            service = get_kb_embedding_service()
+            with pytest.raises(Exception) as exc:
+                await service.embed("hi")
+            await service._client.close()
+        assert caused_by(exc.value, CertificateChangedError)
+        assert server.requests == []
+
+    def test_the_unreadable_marker_builds_no_service(self, monkeypatch):
+        from shared.runtime.services.embedding_service import (
+            get_kb_embedding_service,
+        )
+
+        monkeypatch.setenv("KB_EMBEDDING_TLS_PINNED_CERT", UNREADABLE_PIN)
+        with pytest.raises(ValueError, match="KB_EMBEDDING_TLS_PINNED_CERT"):
+            get_kb_embedding_service()

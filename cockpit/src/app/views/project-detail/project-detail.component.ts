@@ -6,6 +6,7 @@ import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {MarkdownComponent} from 'ngx-markdown';
 import {stripMarkdown} from '../../core/util/strip-markdown';
 import {effectiveJobStatus} from '../../core/util/job-status';
+import {jobDisplayName} from '../../core/util/job-name';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
@@ -17,11 +18,18 @@ import {
 } from '../../core/models/connector-driver.model';
 import {
   accessLevelLabelKey,
+  CLOUD_OUTBOX,
   isCloudConnectorType,
   isPlatformOwned,
   platformKindLabelKey,
   platformManagedLabelKey,
+  platformOwnedKind,
+  PROJECT_CLOUD,
+  PROJECT_CLOUD_CHECKOUT,
+  PROJECT_KB,
+  USER_CLOUD_ROOT,
 } from '../../core/models/platform-connector';
+import {connectorTypeIcon} from '../../core/models/connector-icons';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {ViewportService} from '../../core/services/viewport.service';
@@ -80,6 +88,28 @@ function templateRef(key: string | null): WorkspaceTemplateRef | null {
   if (!key) return null;
   const [kind, name, ...rest] = key.split('/');
   return {name: rest.join('/'), scope: {kind, name}};
+}
+
+/** The order a project's own connectors are listed in: its folder, the copy
+ *  its jobs work on, its knowledge base, then a user's own (a personal
+ *  project's "My cloud"). A kind this cockpit does not know goes last. */
+const INCLUDED_KIND_ORDER: readonly string[] = [
+  PROJECT_CLOUD,
+  PROJECT_CLOUD_CHECKOUT,
+  PROJECT_KB,
+  USER_CLOUD_ROOT,
+  CLOUD_OUTBOX,
+];
+
+function includedKindRank(ds: ProjectDatasource): number {
+  const at = INCLUDED_KIND_ORDER.indexOf(platformOwnedKind(ds) ?? '');
+  return at < 0 ? INCLUDED_KIND_ORDER.length : at;
+}
+
+/** One group of the Connectors tab. */
+export interface ConnectorGroup {
+  id: 'included' | 'linked';
+  rows: ProjectDatasource[];
 }
 
 type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'experts' | 'members' | 'loop' | 'centurion' | 'settings';
@@ -300,7 +330,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                             {{ 'jobs.status.' + effectiveJobStatus(job) | transloco }}
                           </span>
                         </td>
-                        <td class="desc-cell">{{ truncate(job.description, 60) }}</td>
+                        <td class="desc-cell">{{ truncate(jobName(job), 60) }}</td>
                         <td class="mono">{{ job.config_name }}</td>
                         <td class="mono">
                           @if (job.repo_name) {
@@ -573,258 +603,300 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           }
 
           <!-- DATASOURCES TAB -->
+          <!-- One list in two groups: what SRW made with the project and keeps
+               for it, then what its members linked. Every row has the same
+               anatomy (what it is, what the agents are told about it, the
+               access it binds at and what makes that access true), so the two
+               groups read as one list rather than as two tables. -->
           @if (activeTab() === 'datasources') {
-            <div class="table-section">
-              <!-- Link Datasource Form -->
-              <div class="inline-form">
-                <app-input
-                  class="datasource-search"
-                  size="sm"
-                  [value]="datasourceCandidateSearch()"
-                  (valueChange)="onDatasourceCandidateSearch($event)"
-                  [placeholder]="'projectDetail.datasources.searchPlaceholder' | transloco"
-                  [disabled]="datasourceCandidatesLoading()"
-                />
-                <app-select
-                  size="sm"
-                  [value]="dsLinkId()"
-                  (changed)="dsLinkId.set($event ?? '')"
-                  [disabled]="datasourceCandidatesLoading() || datasourceCandidatesError()"
-                >
-                  <option value="">{{ 'projectDetail.datasources.selectPlaceholder' | transloco }}</option>
-                  @for (ds of availableDatasources(); track ds.id) {
-                    <option [value]="ds.id">
-                      {{ ds.name }} ({{ 'datasources.filter.' + ds.type | transloco }})
-                    </option>
-                  }
-                </app-select>
-                <app-button
-                  variant="primary"
-                  size="sm"
-                  [disabled]="!dsLinkId() || datasourceCandidatesLoading() || datasourceCandidatesError()"
-                  (clicked)="linkDatasource()"
-                >
-                  {{ 'projectDetail.datasources.link' | transloco }}
-                </app-button>
-              </div>
-              @if (datasourceCandidatesLoading()) {
-                <div class="datasource-candidate-state">
-                  <app-spinner size="sm" />
-                  <span>{{ 'projectDetail.datasources.loadingCandidates' | transloco }}</span>
-                </div>
-              } @else if (datasourceCandidatesError()) {
-                <div class="datasource-candidate-state error" role="alert">
-                  <span>{{ 'projectDetail.datasources.candidatesLoadFailed' | transloco }}</span>
-                  <app-button variant="secondary" size="sm" (clicked)="loadDatasourceCandidates()">
-                    {{ 'projectDetail.datasources.retry' | transloco }}
-                  </app-button>
-                </div>
-              } @else if (availableDatasources().length === 0) {
-                <div class="datasource-candidate-state">
-                  {{ 'projectDetail.datasources.noCandidates' | transloco }}
-                </div>
-              }
-              @if (datasourceCandidatesNextCursor() && !datasourceCandidatesError()) {
-                <div class="datasource-candidate-actions">
-                  <app-button
-                    variant="secondary"
-                    size="sm"
-                    [loading]="datasourceCandidatesLoadingMore()"
-                    [disabled]="datasourceCandidatesLoadingMore()"
-                    (clicked)="loadMoreDatasourceCandidates()"
-                  >
-                    {{ 'datasources.catalog.loadMore' | transloco }}
-                  </app-button>
-                </div>
-              }
+            <div class="connectors" data-connectors-tab>
+              @for (group of connectorGroups(); track group.id) {
+                <section class="cx-group" [attr.data-connector-group]="group.id">
+                  <header class="cx-group-head">
+                    <div class="cx-group-text">
+                      <h3 class="cx-group-title">{{ 'projectDetail.datasources.groups.' + group.id + '.title' | transloco }}</h3>
+                      <p class="cx-group-hint">{{ 'projectDetail.datasources.groups.' + group.id + '.hint' | transloco }}</p>
+                    </div>
+                    @if (group.id === 'linked') {
+                      <app-button
+                        [variant]="linkPickerOpen() ? 'secondary' : 'primary'"
+                        size="sm"
+                        data-link-open
+                        [attr.aria-expanded]="linkPickerOpen()"
+                        (clicked)="toggleLinkPicker()"
+                      >
+                        <app-icon size="sm">{{ linkPickerOpen() ? 'close' : 'add_link' }}</app-icon>
+                        {{ (linkPickerOpen() ? 'projectDetail.datasources.picker.close' : 'projectDetail.datasources.picker.open') | transloco }}
+                      </app-button>
+                    }
+                  </header>
 
-              <!-- The project's own cloud folders, and any link whose driver
-                   has strict levels: the link holds a default level its
-                   work binds at when it chooses none (main cloud slice 5),
-                   never the read-only switch. -->
-              @if (cloudFolderLinks().length) {
-                <div class="cloud-folder-links" data-cloud-folders>
-                  <h3 class="settings-heading">{{ 'projectDetail.datasources.cloudFolders.title' | transloco }}</h3>
-                  <p class="cloud-folder-hint">{{ 'projectDetail.datasources.cloudFolders.hint' | transloco }}</p>
-                  @if (cloudFolderError(); as message) {
+                  @if (group.id === 'included' && cloudFolderError(); as message) {
                     <div class="cloud-folder-error" role="alert">{{ message }}</div>
                   }
-                  <div class="table-scroll">
-                  <table class="data-table app-table">
-                    <thead>
-                      <tr>
-                        <th>{{ 'projectDetail.datasources.colName' | transloco }}</th>
-                        <th>{{ 'projectDetail.datasources.colType' | transloco }}</th>
-                        <th>{{ 'projectDetail.datasources.cloudFolders.colAccess' | transloco }}</th>
-                        <th>{{ 'projectDetail.datasources.colActions' | transloco }}</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      @for (ds of cloudFolderLinks(); track ds.id + ':' + linkAccessRevision()) {
-                        <tr data-cloud-folder-link>
-                          <td>{{ ds.name }}</td>
-                          <td>
-                            <span class="role-badge" [class]="'role-' + ds.type">
-                              {{ linkKindLabelKey(ds) | transloco }}
-                            </span>
-                          </td>
-                          <td>
-                            <app-select
-                              size="sm"
-                              [value]="ds.project_access ?? ''"
-                              [disabled]="savingLinkAccess() === ds.id"
-                              (changed)="updateLinkAccess(ds.id, $event ?? '')"
-                            >
-                              <option value="">{{ 'projectDetail.datasources.cloudFolders.defaultOption' | transloco:{ level: levelLabel(linkDefaultLevel(ds)) | transloco } }}</option>
-                              @for (level of linkLevels(ds); track level.id) {
-                                <option [value]="level.id" [disabled]="!level.offered" [attr.title]="level.detail || null">
-                                  {{ levelLabel(level.id) | transloco }}
-                                  @if (!level.offered) {
-                                    · {{ 'projectDetail.datasources.cloudFolders.notOffered' | transloco }}
-                                  }
-                                </option>
+
+                  <!-- What may still be linked: searched on the server, one
+                       click per connector. -->
+                  @if (group.id === 'linked' && linkPickerOpen()) {
+                    <div class="cx-picker" data-link-picker>
+                      <app-input
+                        class="datasource-search"
+                        size="sm"
+                        [value]="datasourceCandidateSearch()"
+                        (valueChange)="onDatasourceCandidateSearch($event)"
+                        [placeholder]="'projectDetail.datasources.searchPlaceholder' | transloco"
+                        [ariaLabel]="'projectDetail.datasources.searchPlaceholder' | transloco"
+                      />
+                      @if (datasourceCandidatesLoading()) {
+                        <div class="datasource-candidate-state">
+                          <app-spinner size="sm" />
+                          <span>{{ 'projectDetail.datasources.loadingCandidates' | transloco }}</span>
+                        </div>
+                      } @else if (datasourceCandidatesError()) {
+                        <div class="datasource-candidate-state error" role="alert">
+                          <span>{{ 'projectDetail.datasources.candidatesLoadFailed' | transloco }}</span>
+                          <app-button variant="secondary" size="sm" (clicked)="loadDatasourceCandidates()">
+                            {{ 'projectDetail.datasources.retry' | transloco }}
+                          </app-button>
+                        </div>
+                      } @else if (availableDatasources().length === 0) {
+                        <div class="datasource-candidate-state">
+                          {{ (datasourceCandidateSearch().trim() ? 'projectDetail.datasources.noCandidates' : 'projectDetail.datasources.picker.nothingLeft') | transloco }}
+                        </div>
+                      } @else {
+                        <ul class="cx-candidates">
+                          @for (ds of availableDatasources(); track ds.id) {
+                            <li class="cx-candidate" data-link-candidate>
+                              <span class="cx-icon cx-icon--sm" [attr.data-type]="ds.type">
+                                <app-icon size="sm">{{ typeIcon(ds.type) }}</app-icon>
+                              </span>
+                              <span class="cx-candidate-text">
+                                <span class="cx-candidate-name">
+                                  {{ ds.name }}
+                                  <span class="cx-type">{{ 'datasources.filter.' + ds.type | transloco }}</span>
+                                </span>
+                                @if (ds.description) {
+                                  <span class="cx-candidate-desc">{{ ds.description }}</span>
+                                }
+                              </span>
+                              <app-button variant="secondary" size="sm" (clicked)="linkCandidate(ds.id)">
+                                {{ 'projectDetail.datasources.link' | transloco }}
+                              </app-button>
+                            </li>
+                          }
+                        </ul>
+                      }
+                      <div class="cx-picker-foot">
+                        @if (datasourceCandidatesNextCursor() && !datasourceCandidatesError()) {
+                          <app-button
+                            variant="secondary"
+                            size="sm"
+                            [loading]="datasourceCandidatesLoadingMore()"
+                            [disabled]="datasourceCandidatesLoadingMore()"
+                            (clicked)="loadMoreDatasourceCandidates()"
+                          >
+                            {{ 'datasources.catalog.loadMore' | transloco }}
+                          </app-button>
+                        }
+                        <span class="cx-picker-new">
+                          {{ 'projectDetail.datasources.picker.notListed' | transloco }}
+                          <button type="button" class="cx-text-link" (click)="openNewConnector()">
+                            {{ 'projectDetail.datasources.picker.create' | transloco }}
+                          </button>
+                        </span>
+                      </div>
+                    </div>
+                  }
+
+                  @if (group.rows.length === 0) {
+                    <div class="cx-empty" data-linked-empty>
+                      <app-icon size="lg">link_off</app-icon>
+                      <div>
+                        <p class="cx-empty-title">{{ 'projectDetail.datasources.empty' | transloco }}</p>
+                        <p class="cx-empty-hint">{{ 'projectDetail.datasources.emptyHint' | transloco }}</p>
+                      </div>
+                    </div>
+                  } @else {
+                    <ul class="cx-list">
+                      @for (ds of group.rows; track ds.id + ':' + linkAccessRevision()) {
+                        <li class="cx-row" [attr.data-cloud-folder-link]="strictLink(ds) ? '' : null">
+                          <span class="cx-icon" [attr.data-type]="ds.type">
+                            <app-icon size="md">{{ typeIcon(ds.type) }}</app-icon>
+                          </span>
+
+                          <div class="cx-main">
+                            <div class="cx-title-line">
+                              <!-- A connector SRW keeps is named for what it
+                                   is to the project ("Project folder"); its
+                                   stored name repeats the project's. -->
+                              @if (linkTitleKey(ds); as titleKey) {
+                                <span class="cx-name" [title]="ds.name">{{ titleKey | transloco }}</span>
+                              } @else {
+                                <span class="cx-name">{{ ds.name }}</span>
+                                <span class="cx-type">{{ 'datasources.filter.' + ds.type | transloco }}</span>
                               }
-                            </app-select>
-                            @if (linkLevelEnforcedBy(ds); as line) {
-                              <div class="link-enforced" [attr.data-level]="linkLevel(ds)">
-                                <strong>{{ 'projectDetail.datasources.accessEnforcedBy' | transloco }}</strong>
-                                {{ line }}
-                              </div>
+                            </div>
+
+                            <!-- What the agents in this project are told about
+                                 it (their README line): the link's own note,
+                                 else the connector's description. A connector
+                                 SRW keeps tells them only the note; its own
+                                 description is SRW's and shows as text. A
+                                 cloud folder reaches them as a mount, not as a
+                                 connector, so it takes no note. -->
+                            @if (ds.description && (!linkNoteEditable(ds) || (keptLink(ds) && !ds.project_description))) {
+                              <p class="cx-desc">{{ ds.description }}</p>
                             }
-                          </td>
-                          <td>
+                            @if (linkNoteEditable(ds) && editingLinkNote() === ds.id) {
+                              <app-input
+                                class="cx-note-input"
+                                size="sm"
+                                data-link-note-input
+                                [value]="linkNote(ds)"
+                                [placeholder]="'projectDetail.datasources.descriptionPlaceholder' | transloco"
+                                [ariaLabel]="'projectDetail.datasources.colDescription' | transloco"
+                                (blurred)="saveLinkNote(ds.id, $any($event.target).value)"
+                                (keydown.enter)="$any($event.target).blur()"
+                                (keydown.escape)="editingLinkNote.set(null)"
+                              />
+                            } @else if (linkNoteEditable(ds)) {
+                              <!-- Named by its text (the note itself); the
+                                   tooltip says that a click edits it. -->
+                              <button
+                                type="button"
+                                class="cx-note"
+                                data-link-note
+                                [class.cx-note--empty]="!linkNote(ds)"
+                                [title]="'projectDetail.datasources.editNote' | transloco"
+                                (click)="startLinkNoteEdit(ds.id)"
+                              >
+                                <span class="cx-note-text">{{ linkNote(ds) || ('projectDetail.datasources.descriptionPlaceholder' | transloco) }}</span>
+                                <app-icon size="xs">edit</app-icon>
+                              </button>
+                            }
+
+                            <!-- What makes the level true (capability matrix).
+                                 A level the agent is only told about says so. -->
+                            @if (strictLink(ds)) {
+                              @if (linkLevelEnforcedBy(ds); as line) {
+                                <p class="link-enforced" [attr.data-level]="linkLevel(ds)">
+                                  <app-icon size="xs">verified_user</app-icon>
+                                  <span><strong>{{ 'projectDetail.datasources.accessEnforcedBy' | transloco }}</strong> {{ line }}</span>
+                                </p>
+                              }
+                            } @else if (linkAccessLevel(ds); as level) {
+                              <p class="link-enforced" [class.link-advisory]="level.advisory" [attr.data-level]="level.id">
+                                <app-icon size="xs">{{ level.advisory ? 'info' : 'verified_user' }}</app-icon>
+                                <span>
+                                  <strong>{{ (level.advisory ? 'projectDetail.datasources.accessAdvisory' : 'projectDetail.datasources.accessEnforcedBy') | transloco }}</strong>
+                                  @if (githubAppReadOnly(ds)) {
+                                    {{ 'projectDetail.datasources.githubAppReadOnly' | transloco }}
+                                  } @else {
+                                    {{ level.enforced_by }}
+                                  }
+                                </span>
+                              </p>
+                            }
+                            @if (!strictLink(ds) && !linkAccessManaged(ds) && linkAccessShown(ds) === 'read_only' && creatorReadOnly(ds)) {
+                              <p class="link-creator" data-creator-read-only>
+                                {{ 'projectDetail.datasources.accessCreatorReadOnly' | transloco }}
+                              </p>
+                            }
+                          </div>
+
+                          <!-- The level the project's work binds at. A strict
+                               link (a cloud folder) holds a default a session
+                               may change; another holds the read-only switch,
+                               or shows its one level. -->
+                          <div class="cx-access">
+                            <span class="cx-access-label">
+                              {{ (strictLink(ds) ? 'projectDetail.datasources.cloudFolders.colAccess' : 'projectDetail.datasources.colAccess') | transloco }}
+                            </span>
+                            @if (strictLink(ds)) {
+                              <app-select
+                                size="sm"
+                                [value]="ds.project_access ?? ''"
+                                [disabled]="savingLinkAccess() === ds.id"
+                                [ariaLabel]="'projectDetail.datasources.cloudFolders.colAccess' | transloco"
+                                (changed)="updateLinkAccess(ds.id, $event ?? '')"
+                              >
+                                <option value="">{{ 'projectDetail.datasources.cloudFolders.defaultOption' | transloco:{ level: levelLabel(linkDefaultLevel(ds)) | transloco } }}</option>
+                                @for (level of linkLevels(ds); track level.id) {
+                                  <option [value]="level.id" [disabled]="!level.offered" [attr.title]="level.detail || null">
+                                    {{ levelLabel(level.id) | transloco }}
+                                    @if (!level.offered) {
+                                      · {{ 'projectDetail.datasources.cloudFolders.notOffered' | transloco }}
+                                    }
+                                  </option>
+                                }
+                              </app-select>
+                            } @else if (linkAccessManaged(ds)) {
+                              <!-- A platform-owned link is not this list's to
+                                   set: it shows the level it binds at. -->
+                              @if (linkAccessLevel(ds); as level) {
+                                <app-badge tone="neutral" size="sm" data-managed-access [attr.data-level]="level.id">
+                                  @if (accessLevelKey(level.id); as key) {
+                                    {{ key | transloco }}
+                                  } @else {
+                                    {{ level.id }}
+                                  }
+                                </app-badge>
+                              }
+                            } @else {
+                              @switch (linkAccessShown(ds)) {
+                                @case ('read_only') {
+                                  <app-badge
+                                    tone="info"
+                                    size="sm"
+                                    [title]="linkAccessLevel(ds) ? '' : ('projectDetail.datasources.accessKbReadOnlyHint' | transloco)"
+                                  >
+                                    {{ 'projectDetail.datasources.accessReadOnly' | transloco }}
+                                  </app-badge>
+                                }
+                                @case ('read_write') {
+                                  <app-badge tone="neutral" size="sm">
+                                    {{ 'projectDetail.datasources.accessReadWrite' | transloco }}
+                                  </app-badge>
+                                }
+                                @default {
+                                  <app-select
+                                    size="sm"
+                                    [value]="boolToText(ds.project_read_only)"
+                                    [ariaLabel]="'projectDetail.datasources.colAccess' | transloco"
+                                    (changed)="updateDatasourceReadOnly(ds.id, $event ?? '')"
+                                  >
+                                    <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
+                                    <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
+                                    <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
+                                  </app-select>
+                                }
+                              }
+                            }
+                          </div>
+
+                          <div class="cx-actions">
                             @if (managedLabelKey(ds); as managedKey) {
-                              <span class="link-managed" data-managed>
-                                <app-icon size="xs">lock</app-icon>
-                                {{ managedKey | transloco }}
+                              <!-- SRW keeps it: nobody unlinks it here. -->
+                              <span
+                                class="link-managed"
+                                data-managed
+                                role="img"
+                                [attr.aria-label]="managedKey | transloco"
+                                [title]="managedKey | transloco"
+                              >
+                                <app-icon size="sm">lock</app-icon>
                               </span>
                             } @else {
-                              <app-button variant="danger" size="sm" (clicked)="unlinkDatasource(ds.id)">
+                              <app-button variant="ghost" size="sm" data-unlink (clicked)="askUnlink(ds)">
                                 {{ 'projectDetail.datasources.unlink' | transloco }}
                               </app-button>
                             }
-                          </td>
-                        </tr>
+                          </div>
+                        </li>
                       }
-                    </tbody>
-                  </table>
-                  </div>
-                </div>
-              }
-
-              @if (projectDatasources().length === 0) {
-                <div class="empty-inline">{{ 'projectDetail.datasources.empty' | transloco }}</div>
-              } @else if (otherLinks().length) {
-                <div class="table-scroll">
-                <table class="data-table app-table">
-                  <thead>
-                    <tr>
-                      <th>{{ 'projectDetail.datasources.colName' | transloco }}</th>
-                      <th>{{ 'projectDetail.datasources.colType' | transloco }}</th>
-                      <th>{{ 'projectDetail.datasources.colDescription' | transloco }}</th>
-                      <th>{{ 'projectDetail.datasources.colAccess' | transloco }}</th>
-                      <th>{{ 'projectDetail.datasources.colActions' | transloco }}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    @for (ds of otherLinks(); track ds.id) {
-                      <tr>
-                        <td>{{ ds.name }}</td>
-                        <td>
-                          <span class="role-badge" [class]="'role-' + ds.type">
-                            {{ 'datasources.filter.' + ds.type | transloco }}
-                          </span>
-                        </td>
-                        <td>
-                          <app-input
-                            size="sm"
-                            [value]="ds.project_description || ds.description || ''"
-                            [placeholder]="'projectDetail.datasources.descriptionPlaceholder' | transloco"
-                            (blurred)="updateDatasourceDescription(ds.id, $any($event.target).value)"
-                          />
-                        </td>
-                        <td>
-                          <!-- Only the levels the connector's driver offers
-                               (capability matrix): one level is shown, not
-                               chosen. The bound level is the stricter of the
-                               link and the creator's read-only tag, so the
-                               bound level's line shows here; a tag the link
-                               cannot lift replaces the switch and says why. -->
-                          @if (linkAccessManaged(ds)) {
-                            <!-- A platform-owned link (the project's own
-                                 cloud folder) is not this table's to set: it
-                                 shows the level it binds at. -->
-                            @if (linkAccessLevel(ds); as level) {
-                              <app-badge tone="neutral" size="sm" data-managed-access [attr.data-level]="level.id">
-                                @if (accessLevelKey(level.id); as key) {
-                                  {{ key | transloco }}
-                                } @else {
-                                  {{ level.id }}
-                                }
-                              </app-badge>
-                            }
-                          } @else {
-                          @switch (linkAccessShown(ds)) {
-                            @case ('read_only') {
-                              <app-badge
-                                tone="info"
-                                size="sm"
-                                [title]="linkAccessLevel(ds) ? '' : ('projectDetail.datasources.accessKbReadOnlyHint' | transloco)"
-                              >
-                                {{ 'projectDetail.datasources.accessReadOnly' | transloco }}
-                              </app-badge>
-                              @if (creatorReadOnly(ds)) {
-                                <div class="link-creator" data-creator-read-only>
-                                  {{ 'projectDetail.datasources.accessCreatorReadOnly' | transloco }}
-                                </div>
-                              }
-                            }
-                            @case ('read_write') {
-                              <app-badge tone="neutral" size="sm">
-                                {{ 'projectDetail.datasources.accessReadWrite' | transloco }}
-                              </app-badge>
-                            }
-                            @default {
-                              <app-select
-                                size="sm"
-                                [value]="boolToText(ds.project_read_only)"
-                                (changed)="updateDatasourceReadOnly(ds.id, $event ?? '')"
-                              >
-                                <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
-                                <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
-                                <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
-                              </app-select>
-                            }
-                          }
-                          }
-                          @if (linkAccessLevel(ds); as level) {
-                            <div class="link-enforced" [class.link-advisory]="level.advisory" [attr.data-level]="level.id">
-                              <strong>{{ (level.advisory ? 'projectDetail.datasources.accessAdvisory' : 'projectDetail.datasources.accessEnforcedBy') | transloco }}</strong>
-                              @if (githubAppReadOnly(ds)) {
-                                {{ 'projectDetail.datasources.githubAppReadOnly' | transloco }}
-                              } @else {
-                                {{ level.enforced_by }}
-                              }
-                            </div>
-                          }
-                        </td>
-                        <td>
-                          @if (managedLabelKey(ds); as managedKey) {
-                            <span class="link-managed" data-managed>
-                              <app-icon size="xs">lock</app-icon>
-                              {{ managedKey | transloco }}
-                            </span>
-                          } @else {
-                            <app-button variant="danger" size="sm" (clicked)="unlinkDatasource(ds.id)">
-                              {{ 'projectDetail.datasources.unlink' | transloco }}
-                            </app-button>
-                          }
-                        </td>
-                      </tr>
-                    }
-                  </tbody>
-                </table>
-                </div>
+                    </ul>
+                  }
+                </section>
               }
             </div>
           }
@@ -1387,9 +1459,30 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
           </app-button>
         </div>
       </app-dialog>
+
+      <!-- Unlink confirmation: the same warning the connector form gives
+           when a project is taken off a connector. -->
+      <app-dialog
+        [open]="pendingUnlink() !== null"
+        size="sm"
+        [title]="'projectDetail.datasources.unlinkDialog.title' | transloco: { name: pendingUnlink()?.name ?? '' }"
+        (closed)="pendingUnlink.set(null)"
+      >
+        <p class="unlink-message">{{ 'projectDetail.datasources.unlinkDialog.message' | transloco }}</p>
+        <div appDialogActions>
+          <app-button variant="secondary" size="sm" (clicked)="pendingUnlink.set(null)">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="danger" size="sm" data-unlink-confirm (clicked)="confirmUnlink()">
+            {{ 'projectDetail.datasources.unlink' | transloco }}
+          </app-button>
+        </div>
+      </app-dialog>
     </div>
   `,
   styles: [`
+    .unlink-message { margin: 0; line-height: 1.5; }
+
     :host { display: block; height: 100%; overflow: auto; overflow-x: hidden; }
 
     .page-container {
@@ -1649,30 +1742,237 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .role-source { background: var(--success-tint); color: var(--success); }
     .role-reference { background: var(--warning-tint); color: var(--warning); }
 
-    /* What a connector link's access level is enforced by (capability matrix),
-       and why a creator's read-only tag stands over the link. */
-    .link-enforced,
-    .link-creator {
-      max-width: 36ch;
-      margin-top: 4px;
-      font-size: 11px;
-      line-height: 1.35;
+    /* Connectors tab: one list in two groups. A group is a heading with a
+       line under it and a bordered list; a row is what the connector is, the
+       access it binds at and the one action it allows. */
+    .connectors {
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+    }
+
+    .cx-group {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .cx-group-head {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .cx-group-text { min-width: 0; }
+
+    .cx-group-title {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .cx-group-hint {
+      margin: 2px 0 0;
+      max-width: 72ch;
+      font-size: 13px;
+      line-height: 1.45;
       color: var(--text-muted);
     }
 
-    .link-enforced.link-advisory { color: var(--warning); }
+    .cx-list,
+    .cx-candidates {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
 
-    .cloud-folder-links {
+    .cx-list {
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-surface);
+      background: var(--panel-bg);
+    }
+
+    /* The two right-hand columns are fixed, so the access controls of every
+       row line up whatever its text is. */
+    .cx-row {
+      display: grid;
+      grid-template-columns: 36px minmax(0, 1fr) 210px 72px;
+      column-gap: 14px;
+      align-items: start;
+      padding: 14px 16px;
+    }
+
+    .cx-row + .cx-row { border-top: 1px solid var(--border-hairline); }
+
+    .cx-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      flex-shrink: 0;
+      border-radius: var(--radius-control);
+      background: var(--surface-1);
+      color: var(--text-secondary);
+    }
+
+    .cx-icon--sm { width: 28px; height: 28px; }
+
+    .cx-icon[data-type='kb'] { color: var(--accent-color); }
+    .cx-icon[data-type='postgresql'],
+    .cx-icon[data-type='repository'],
+    .cx-icon[data-type='mcp'],
+    .cx-icon[data-type^='cloud_'] { color: var(--info); }
+    .cx-icon[data-type='neo4j'] { color: var(--success); }
+    .cx-icon[data-type='email'],
+    .cx-icon[data-type='webdav'] { color: var(--warning); }
+
+    .cx-main {
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 4px;
+      min-width: 0;
     }
-    .cloud-folder-links .settings-heading { margin: 0; }
-    .cloud-folder-hint {
+
+    /* Centred on the icon when the row has one line of text only. */
+    .cx-title-line {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 2px 8px;
+      min-height: 20px;
+    }
+
+    .cx-name {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+      overflow-wrap: anywhere;
+    }
+
+    .cx-type {
+      font-size: 12px;
+      font-weight: 400;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .cx-desc {
       margin: 0;
+      max-width: 78ch;
+      font-size: 13px;
+      line-height: 1.45;
+      color: var(--text-secondary);
+    }
+
+    /* The link's note: text until it is clicked, then a field. */
+    .cx-note {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      align-self: flex-start;
+      max-width: min(78ch, 100%);
+      margin: 0 -6px;
+      padding: 2px 6px;
+      border: 0;
+      border-radius: var(--radius-tag);
+      background: none;
+      font: inherit;
+      font-size: 13px;
+      line-height: 1.45;
+      color: var(--text-secondary);
+      text-align: left;
+      cursor: text;
+    }
+
+    .cx-note:hover { background: var(--hover); }
+
+    .cx-note:focus-visible {
+      outline: 2px solid var(--accent-color);
+      outline-offset: 1px;
+    }
+
+    .cx-note--empty { color: var(--text-muted); font-style: italic; }
+
+    .cx-note app-icon {
+      flex-shrink: 0;
+      align-self: center;
+      color: var(--text-muted);
+      opacity: 0;
+      transition: opacity 0.12s ease;
+    }
+
+    .cx-note:hover app-icon,
+    .cx-note:focus-visible app-icon { opacity: 1; }
+
+    .cx-note-input { max-width: 78ch; }
+
+    /* What a link's access level is enforced by (capability matrix), and why
+       a creator's read-only tag stands over the link. */
+    .link-enforced,
+    .link-creator {
+      margin: 0;
+      max-width: 78ch;
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text-muted);
+    }
+
+    .link-enforced {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+    }
+
+    /* Neutral on purpose: the line says what limits the access, it is not a
+       seal (connector drivers decision 31, no guarantee wording). */
+    .link-enforced app-icon {
+      flex-shrink: 0;
+      margin-top: 2px;
+      color: var(--text-muted);
+    }
+
+    .link-enforced strong { font-weight: 600; color: var(--text-secondary); }
+
+    .link-enforced.link-advisory,
+    .link-enforced.link-advisory strong,
+    .link-enforced.link-advisory app-icon { color: var(--warning); }
+
+    .cx-access {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .cx-access app-select { width: 100%; }
+
+    .cx-access-label {
       font-size: 12px;
       color: var(--text-muted);
     }
+
+    .cx-actions {
+      display: flex;
+      justify-content: flex-end;
+      /* Level with the control, under the access label. */
+      padding-top: 20px;
+    }
+
+    /* A connector SRW keeps: no Unlink, a lock that says who keeps it. */
+    .link-managed {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      color: var(--text-muted);
+      cursor: help;
+    }
+
     .cloud-folder-error {
       padding: 8px 10px;
       border-radius: var(--radius-control);
@@ -1681,14 +1981,137 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       font-size: 12px;
     }
 
-    /* A platform-owned link: SRW keeps it, so no Unlink. */
-    .link-managed {
-      display: inline-flex;
+    .cx-empty {
+      display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 14px;
+      padding: 20px;
+      border: 1px dashed var(--border-color);
+      border-radius: var(--radius-surface);
+      color: var(--text-muted);
+    }
+
+    .cx-empty p { margin: 0; }
+
+    .cx-empty-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .cx-empty-hint {
+      margin-top: 2px;
+      max-width: 64ch;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    /* The connectors that may still be linked. */
+    .cx-picker {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-surface);
+      background: var(--panel-bg);
+    }
+
+    .cx-candidates {
+      max-height: 320px;
+      overflow-y: auto;
+    }
+
+    .cx-candidate {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 4px;
+    }
+
+    .cx-candidate + .cx-candidate { border-top: 1px solid var(--border-hairline); }
+
+    .cx-candidate-text {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      flex: 1;
+      min-width: 0;
+    }
+
+    .cx-candidate-name {
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 2px 8px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .cx-candidate-desc {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
       font-size: 12px;
       color: var(--text-muted);
-      white-space: nowrap;
+    }
+
+    .cx-picker-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+    }
+
+    .cx-picker-new {
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .cx-text-link {
+      padding: 0;
+      border: 0;
+      background: none;
+      font: inherit;
+      color: var(--accent-color);
+      cursor: pointer;
+    }
+
+    .cx-text-link:hover { text-decoration: underline; }
+
+    .cx-text-link:focus-visible {
+      outline: 2px solid var(--accent-color);
+      outline-offset: 2px;
+      border-radius: var(--radius-tag);
+    }
+
+    .datasource-candidate-state {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    .datasource-candidate-state.error { color: var(--danger); }
+
+    /* Narrow: the access control and the action move under the text. */
+    @media (max-width: 768px) {
+      .cx-group-head { align-items: flex-start; flex-direction: column; gap: 10px; }
+
+      .cx-row {
+        grid-template-columns: 36px minmax(0, 1fr) auto;
+        row-gap: 10px;
+        padding: 12px;
+      }
+
+      .cx-main { grid-column: 2 / -1; }
+      .cx-access { grid-column: 2; grid-row: 2; }
+      .cx-actions { grid-column: 3; grid-row: 2; }
     }
 
     /* Inline form */
@@ -1703,19 +2126,14 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       flex-wrap: wrap;
     }
 
-    .datasource-search { min-width: 180px; flex: 1 1 220px; }
-
-    .datasource-candidate-state {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--text-muted);
-      font-size: 12px;
+    /* One row: the fields share it instead of each taking a row of its own
+       (ui/input and ui/select are full width unless told otherwise). Wide
+       screens only; a phone stacks the form (see the media block below). */
+    @media (min-width: 769px) {
+      .inline-form > app-input { flex: 1 1 200px; min-width: 0; }
+      .inline-form > app-select { flex: 0 1 170px; min-width: 0; }
+      .inline-form > app-select:first-child { flex: 1 1 240px; }
     }
-
-    .datasource-candidate-state.error { color: var(--danger); }
-
-    .datasource-candidate-actions { display: flex; justify-content: flex-start; }
 
     /* User cell */
     .user-cell {
@@ -2204,6 +2622,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
   `],
 })
 export class ProjectDetailPageComponent implements OnInit, OnDestroy {
+  readonly jobName = jobDisplayName;
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly api = inject(ApiService);
@@ -2291,6 +2710,25 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly otherLinks = computed(() =>
     this.projectDatasources().filter((ds) => !this.strictLink(ds)),
   );
+  /** The tab's list, in two groups: what SRW made with the project and keeps
+   *  for it (nobody unlinks those here), then what its members linked. The
+   *  first is left out while it is empty; the second always shows, since it
+   *  carries the Link action. */
+  readonly connectorGroups = computed<ConnectorGroup[]>(() => {
+    const rows = this.projectDatasources();
+    const included = rows
+      .filter((ds) => isPlatformOwned(ds))
+      .sort((a, b) => includedKindRank(a) - includedKindRank(b));
+    const linked = rows.filter((ds) => !isPlatformOwned(ds));
+    return [
+      ...(included.length ? [{id: 'included' as const, rows: included}] : []),
+      {id: 'linked' as const, rows: linked},
+    ];
+  });
+  /** Whether the list of connectors that may still be linked is open. */
+  readonly linkPickerOpen = signal(false);
+  /** The link whose note is being edited in place. */
+  readonly editingLinkNote = signal<string | null>(null);
   /** The levels each strict link may default to, as the eligible list
    *  offers them for this project (its provider's, on any tier); a link
    *  missing here falls back to its driver's levels. */
@@ -2824,6 +3262,97 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.loadProjectDatasources();
       }
     });
+  }
+
+  toggleLinkPicker(): void {
+    this.linkPickerOpen.update((open) => !open);
+  }
+
+  /** Link one connector from the picker's list. */
+  linkCandidate(datasourceId: string): void {
+    this.dsLinkId.set(datasourceId);
+    this.linkDatasource();
+  }
+
+  /** A connector that is not in the picker has to be created first: the
+   *  catalog opens with this project as the new connector's scope. */
+  openNewConnector(): void {
+    this.router.navigate(['/datasources'], {queryParams: {project: this.projectId}});
+  }
+
+  typeIcon(type: string): string {
+    return connectorTypeIcon(type);
+  }
+
+  /** What a connector SRW keeps is to the project ("Project folder"), as a
+   *  translation key; null for a member's own connector, which shows its name. */
+  linkTitleKey(ds: Datasource): string | null {
+    return platformKindLabelKey(ds);
+  }
+
+  /** Whether a row's note is written here: every link but a strict one (a
+   *  cloud folder), which shows its connector's own description. */
+  /** Whether a row takes a note for the agents: every connector the agent
+   *  receives as one. A cloud folder (and its copy for jobs, an outbox)
+   *  reaches it as a mount instead, which carries no note, so a note there
+   *  would reach nobody. */
+  linkNoteEditable(ds: Pick<Datasource, 'type'>): boolean {
+    return !isCloudConnectorType(ds.type);
+  }
+
+  /** Whether SRW keeps this connector for the project (or for a person). */
+  keptLink(ds: Datasource): boolean {
+    return isPlatformOwned(ds);
+  }
+
+  /** What the agents are told about a link, as the note shows it: the
+   *  project's note, else the connector's own description, which reaches
+   *  them too. A connector SRW keeps tells them only the note (the server's
+   *  connector_description_for_agent_sql), so without one its note is empty.
+   *  The list's `description` already is the note where there is one. */
+  linkNote(ds: ProjectDatasource): string {
+    if (this.keptLink(ds)) return ds.project_description ?? '';
+    return ds.project_description || ds.description || '';
+  }
+
+  startLinkNoteEdit(datasourceId: string): void {
+    this.editingLinkNote.set(datasourceId);
+    // Focus once the input has replaced the text.
+    setTimeout(() => {
+      if (typeof document === 'undefined') return;
+      document.querySelector<HTMLInputElement>('[data-link-note-input] input')?.focus();
+    });
+  }
+
+  /** Save a note edited in place. A row shows the connector's own
+   *  description while its link has none, so text left as it was shown is
+   *  not a change: saving it would copy that description onto the link, and
+   *  the link would stop following the connector. */
+  saveLinkNote(datasourceId: string, value: string): void {
+    // Escape closed the editor first; a late blur is not a save.
+    if (this.editingLinkNote() !== datasourceId) return;
+    this.editingLinkNote.set(null);
+    const ds = this.projectDatasources().find((row) => row.id === datasourceId);
+    if (!ds) return;
+    if (value.trim() === this.linkNote(ds).trim()) return;
+    this.updateDatasourceDescription(datasourceId, value);
+  }
+
+  /** The link whose Unlink waits for the user to confirm. */
+  readonly pendingUnlink = signal<ProjectDatasource | null>(null);
+
+  /** Unlink asks first: it drops the link's access setting, its note and
+   *  the project's knowledge entry for the connector, as the connector
+   *  form's own project removal says. */
+  askUnlink(ds: ProjectDatasource): void {
+    if (this.managedLabelKey(ds)) return;
+    this.pendingUnlink.set(ds);
+  }
+
+  confirmUnlink(): void {
+    const ds = this.pendingUnlink();
+    this.pendingUnlink.set(null);
+    if (ds) this.unlinkDatasource(ds.id);
   }
 
   unlinkDatasource(datasourceId: string): void {

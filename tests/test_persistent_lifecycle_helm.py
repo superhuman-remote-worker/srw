@@ -160,8 +160,8 @@ def _orchestrator_env(deployment: dict) -> dict:
 
 def test_runtime_authority_migration_defaults_to_rolling_refusal() -> None:
     # Recreate is the chart default, but it comes from the independent
-    # 0197/0198 ServiceAccount cutover flag -- not from acknowledging the
-    # runtime-authority migration. Both halves matter: with every cutover flag
+    # 0197/0198 ServiceAccount cutover and VM remote-operation flags -- not
+    # from acknowledging the runtime-authority migration. Both halves matter: with every cutover flag
     # off the orchestrator is back on RollingUpdate, and an unacknowledged
     # migration gate stays empty either way, so a rolling rollout can never
     # silently pick up the maintenance-gated migration.
@@ -170,6 +170,8 @@ def test_runtime_authority_migration_defaults_to_rolling_refusal() -> None:
         "orchestrator.workspaceLifecycleProtocolCutoverEnabled=false",
         "--set",
         "orchestrator.manifestContractCutoverEnabled=false",
+        "--set",
+        "orchestrator.vmRemoteOperationProtocol.enabled=false",
     )
     assert rolling["spec"]["strategy"] == {"type": "RollingUpdate"}
     assert _orchestrator_env(rolling)["MIGRATION_MAINTENANCE_GATES"] == ""

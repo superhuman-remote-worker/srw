@@ -488,3 +488,179 @@ def _assert_historical_runtime_metadata(value, origin):
     assert value == _runtime_metadata(origin)
     assert value["runtime_actor"]["access_credential"] == _RUNTIME_ACCESS
     assert value["runtime_actor"]["refresh_credential"] == _RUNTIME_REFRESH
+
+
+# ---------------------------------------------------------------------------
+# A real server that goes away and comes back (the unit-level cases, with a
+# fake store, are tests/test_audit_writer_recovery.py)
+# ---------------------------------------------------------------------------
+
+
+def _admin(pg_dsn, sql):
+    async def go():
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            await conn.execute(sql)
+        finally:
+            await conn.close()
+
+    asyncio.run(go())
+
+
+def _fetch(dsn, sql, *args):
+    async def go():
+        conn = await asyncpg.connect(dsn)
+        try:
+            return await conn.fetch(sql, *args)
+        finally:
+            await conn.close()
+
+    return asyncio.run(go())
+
+
+def test_rows_written_during_an_outage_arrive_after_it(pg_dsn, audit_dsn, monkeypatch):
+    """The database refuses connections and drops the open ones, as a restart
+    does. Rows made meanwhile are spooled, then written in order with their
+    references mapped to real ids, and the receipt says the record is whole."""
+    from agent.core.archiver import LLMArchiver
+    from agent.database import audit_writer
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    monkeypatch.setattr(audit_writer, "_RECONNECT_BASE_S", 0.05)
+    monkeypatch.setattr(audit_writer, "_RECONNECT_MAX_S", 0.2)
+    dbname = audit_dsn.rsplit("/", 1)[1].split("?")[0]
+    w = _make_writer(audit_dsn)
+    w._backoff = 0.05
+    archiver = LLMArchiver(writer=w)
+    job = str(uuid4())
+
+    def step(n):
+        request_id = archiver.archive(
+            job, "u", [HumanMessage(f"q{n}")], AIMessage(f"a{n}"), "m", iteration=n
+        )
+        audit_id = archiver.audit_tool_call(
+            job_id=job,
+            agent_type="u",
+            iteration=n,
+            tool_name="t",
+            call_id=f"c{n}",
+            arguments={"n": n},
+        )
+        archiver.update_tool_result(audit_id, f"result {n}", True, 1)
+        return request_id, audit_id
+
+    try:
+        before = step(1)
+        assert before[0] > 0 and before[1] > 0
+
+        _admin(pg_dsn, f'ALTER DATABASE "{dbname}" ALLOW_CONNECTIONS false')
+        _admin(
+            pg_dsn,
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            f"WHERE datname = '{dbname}'",
+        )
+        during = step(2)
+        assert during[0] < 0 and during[1] < 0  # placeholders: nothing was lost
+        assert w.spooled == 4
+        assert archiver.close_job_record(job, "u", flush_timeout_s=0.3)["spooled"] == 4
+
+        _admin(pg_dsn, f'ALTER DATABASE "{dbname}" ALLOW_CONNECTIONS true')
+        assert w.flush(10.0) is True
+        after = step(3)
+        assert after[0] > 0
+        archiver.close_job_record(job, "u", flush_timeout_s=5.0)
+
+        llm = _fetch(
+            audit_dsn,
+            "SELECT id, iteration, metrics FROM llm_requests WHERE job_id=$1::uuid "
+            "ORDER BY id",
+            job,
+        )
+        assert [r["iteration"] for r in llm] == [1, 2, 3]
+        import json as _json
+
+        replayed = [bool(_json.loads(r["metrics"]).get("audit_replayed")) for r in llm]
+        assert replayed == [False, True, False]
+
+        chat = _fetch(
+            audit_dsn,
+            "SELECT request_id FROM chat_history WHERE job_id=$1::uuid ORDER BY id",
+            job,
+        )
+        assert [r["request_id"] for r in chat] == [r["id"] for r in llm]
+
+        # Every tool step has its result row, attached to the right pre row.
+        pairs = _fetch(
+            audit_dsn,
+            "SELECT p.payload->'tool'->>'call_id' AS call, "
+            "       q.payload->'tool'->>'result_preview' AS result "
+            "FROM agent_audit p JOIN agent_audit q "
+            "  ON q.pre_id = p.id AND q.event_phase = 'post' "
+            "WHERE p.job_id=$1::uuid AND p.step_type='tool' AND p.event_phase='pre' "
+            "ORDER BY p.id",
+            job,
+        )
+        assert [(r["call"], r["result"]) for r in pairs] == [
+            ("c1", "result 1"),
+            ("c2", "result 2"),
+            ("c3", "result 3"),
+        ]
+
+        receipts = [
+            _json.loads(r["payload"])["audit_receipt"]
+            for r in _fetch(
+                audit_dsn,
+                "SELECT payload FROM agent_audit WHERE job_id=$1::uuid "
+                "AND step_type='audit_receipt' ORDER BY id",
+                job,
+            )
+        ]
+        assert len(receipts) == 2
+        first, second = receipts
+        # The first receipt was made while the store was down and reached it
+        # after the outage: it counts what had arrived by then.
+        assert first["complete"] is True and first["dropped"] == 0
+        assert first["rows"]["llm"] == {"written": 1, "replayed": 1, "dropped": 0}
+        assert first["outages"] == 1
+        assert second["complete"] is True
+        assert second["rows"]["llm"] == {"written": 1, "replayed": 0, "dropped": 0}
+        assert sum(
+            r["rows"]["llm"]["written"] + r["rows"]["llm"]["replayed"] for r in receipts
+        ) == len(llm)
+    finally:
+        _admin(pg_dsn, f'ALTER DATABASE "{dbname}" ALLOW_CONNECTIONS true')
+        w.close()
+
+
+def test_a_server_down_at_first_use_does_not_disable_the_writer(
+    pg_dsn, audit_dsn, monkeypatch
+):
+    from agent.database import audit_writer
+
+    monkeypatch.setattr(audit_writer, "_RECONNECT_BASE_S", 0.05)
+    monkeypatch.setattr(audit_writer, "_RECONNECT_MAX_S", 0.2)
+    dbname = audit_dsn.rsplit("/", 1)[1].split("?")[0]
+    _admin(pg_dsn, f'ALTER DATABASE "{dbname}" ALLOW_CONNECTIONS false')
+    w = SyncAuditWriter(audit_dsn)
+    w._backoff = 0.05
+    job = str(uuid4())
+    try:
+        placeholder = w.insert_llm_request(
+            {
+                "job_id": job,
+                "model": "m",
+                "timestamp": datetime.now(timezone.utc),
+                "request": {"messages": []},
+                "response": {},
+            }
+        )
+        assert placeholder is not None and placeholder < 0
+        _admin(pg_dsn, f'ALTER DATABASE "{dbname}" ALLOW_CONNECTIONS true')
+        assert w.flush(10.0) is True
+        rows = _fetch(
+            audit_dsn, "SELECT id FROM llm_requests WHERE job_id=$1::uuid", job
+        )
+        assert len(rows) == 1
+    finally:
+        _admin(pg_dsn, f'ALTER DATABASE "{dbname}" ALLOW_CONNECTIONS true')
+        w.close()

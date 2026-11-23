@@ -55,6 +55,49 @@ automatically gets the matching access:
 - Repository and credential-file connectors prepare the workspace and
   credentials the agent needs.
 
+The workspace README lists every attached connector with a **Description**
+line: the note the project gives it on its **Connectors** tab, or else the
+connector's own description. Write there what an agent should know before it
+uses the connector, such as which tables matter or what must not change.
+
+## MCP servers: the token and Test Connection
+
+An MCP server's credential goes in **Bearer Token** (the token alone; SRW
+sends it as `Authorization: Bearer …`) or as **Custom Headers**. **Test
+Connection** tries the URL and credential as they are typed, before
+**Update**; a blank token tests the saved one. When Test fails with **HTTP
+401: the server asks for a credential**, none was sent; **…refused the
+credential** means the server rejected the one sent.
+
+## MCP servers: questions and files
+
+An MCP server can ask a question while one of its tools runs, such as "Spend
+6 Buzz to run imageGen?". The MCP connector's setting **When the server asks a
+question mid-call** decides what such a question gets: **Decline**, or
+**Accept yes/no confirmations**. **Follow the installation default** uses the
+**MCP server questions default** an administrator sets under **Admin →
+Users**; without one, the question is declined.
+
+- A job and an **Autonomous** session apply the setting; nobody is asked.
+- A **Read-only** or **Auto-accept** session shows the question as a card when
+  the setting would decline it, with **Accept**, **Decline** and **Always
+  accept in this session**. The last accepts this question and every later
+  yes/no question from that server in the session.
+- A question that needs typed input or a link to open always comes to the user
+  as a card in a Read-only or Auto-accept session, and is declined in a job or
+  an Autonomous session.
+- **Stop** while a card waits closes it unanswered: the server is told the
+  question was cancelled, and its tool returns before the turn stops.
+- When SRW answers a question on its own, the tool result says what it
+  answered and which setting decided, so the agent can tell the user what to
+  change.
+
+A server can also offer files, such as a picture one of its tools generated
+and links to. The agent reads one with `read_mcp_resource` (a model that takes
+images sees the picture) or saves it into the workspace with
+`save_mcp_resource`. The two tools are there while an attached remote MCP
+server offers files; a managed (stdio) MCP server does not pass them on yet.
+
 ## Read-only vs. read-write
 
 Managed database and WebDAV attachments can be marked **read-only**. Read-only

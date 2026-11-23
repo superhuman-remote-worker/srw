@@ -311,3 +311,30 @@ async def test_retries_are_bounded_and_then_surface(monkeypatch):
 
     assert attempts["n"] == 3, "retry budget should be _SESSION_LLM_MAX_ATTEMPTS"
     assert on_error.called, "exhausted retries must still surface to the user"
+
+
+@pytest.mark.asyncio
+async def test_changed_pinned_certificate_is_not_retried_and_says_why(monkeypatch):
+    """The session shows the pin sentence whole after exactly one attempt."""
+    from openai import APIConnectionError
+
+    from shared.tls_pinning import CertificateChangedError
+
+    monkeypatch.setattr("agent.persistent_graph._SESSION_LLM_RETRY_BASE_DELAY", 0.0)
+    request = httpx.Request("POST", "https://llm.example/v1/chat/completions")
+    pin_error = CertificateChangedError(
+        "llm.example", 443, "AA:BB:CC", "DD:EE:FF", request=request
+    )
+    sdk_error = APIConnectionError(request=request)
+    sdk_error.__cause__ = pin_error
+
+    on_error = AsyncMock()
+    llm, attempts = _flaky_llm([sdk_error], AIMessage(content="unreachable"))
+
+    await _run_one_turn(
+        llm,
+        _make_callbacks(get_user_input=_single_turn_input(), on_error=on_error),
+    )
+
+    assert attempts["n"] == 1, "a pin failure must not be retried"
+    assert on_error.call_args.args[0] == str(pin_error)

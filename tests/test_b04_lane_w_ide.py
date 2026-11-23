@@ -330,6 +330,97 @@ class TestIdeProxyHttpAdmission:
 
 
 # =============================================================================
+# code-server's port proxy is never reached
+# =============================================================================
+
+LEASE = "11111111-1111-4111-8111-111111111111"
+
+PORT_PROXY_PATHS = [
+    "proxy/8000/",
+    "absproxy/8000/",
+    "proxy/8000/api/health",
+    "PROXY/8000/",
+    "AbsProxy/3000/index.html",
+    "proxy",
+    "pro%78y/8000/",
+    "%2570roxy/8000/",
+    f"_vm/{LEASE}/proxy/8000/",
+    f"_vm/{LEASE}/absproxy/8000/",
+]
+
+NOT_PORT_PROXY_PATHS = [
+    "workspace",
+    "",
+    "proxyfoo/8000/",
+    "static/proxy/8000/",
+    "out/vs/proxy.js",
+    f"_vm/{LEASE}/",
+    f"_vm/{LEASE}/stable-abc/static/out/vs/code/browser/workbench/workbench.html",
+]
+
+
+class TestCodeServerPortProxyIsNeverReached:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", PORT_PROXY_PATHS)
+    async def test_http_refuses_before_authentication_and_upstream(self, proxied, path):
+        response = await call(proxied, "GET", f"/api/ide/{JOB}/proxy/{path}")
+
+        assert response.status_code == 404
+        assert proxied.events == []
+        assert proxied.captured == {}
+        proxied.holder.ide_proxy.resolve_target.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_http_refuses_without_a_session_too(self, proxied):
+        response = await call(
+            proxied, "GET", f"/api/ide/{JOB}/proxy/proxy/8000/", headers={}
+        )
+
+        assert response.status_code == 404
+        assert proxied.events == []
+
+    @pytest.mark.asyncio
+    async def test_ordinary_code_server_paths_still_reach_the_upstream(self, proxied):
+        response = await call(
+            proxied, "GET", f"/api/ide/{JOB}/proxy/static/proxy/8000/"
+        )
+
+        assert response.status_code == 207
+        assert proxied.captured["url"].endswith("/static/proxy/8000/")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", PORT_PROXY_PATHS)
+    async def test_websocket_closes_4404_before_authentication(self, path):
+        ws = fake_ws()
+        dependencies = ws_dependencies()
+
+        await ide_routes.ide_proxy_ws(ws, JOB, path, dependencies=dependencies)
+
+        ws.close.assert_awaited_once_with(code=4404, reason="Not found")
+        ws.accept.assert_not_awaited()
+        dependencies.resolve_ws_user.assert_not_awaited()
+        dependencies.ide_proxy.resolve_target.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "path",
+        PORT_PROXY_PATHS
+        + [
+            "a/../proxy/8000/",
+            "./absproxy/8000",
+            "//proxy/8000/",
+            "x/%2e%2e/proxy/8000/",
+            f"_vm/{LEASE}/./proxy/8000/",
+        ],
+    )
+    def test_the_check_sees_what_code_server_would_route(self, path):
+        assert ide_routes._is_code_server_port_proxy(path)
+
+    @pytest.mark.parametrize("path", NOT_PORT_PROXY_PATHS)
+    def test_the_check_leaves_other_paths_alone(self, path):
+        assert not ide_routes._is_code_server_port_proxy(path)
+
+
+# =============================================================================
 # HTTP proxy — transport boundary
 # =============================================================================
 

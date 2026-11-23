@@ -50,6 +50,7 @@ from orchestrator.services.verification_ledger import (
     validate_dispositions,
     validate_verdict_call,
 )
+from shared.job_phases import PHASES_KEY
 from shared.run_queue import unpark_unit
 from shared.pinned_job_delivery import stamp_pinned_resume_input_ids
 from shared.worker_queue import enqueue_worker_batch_wake, reset_worker_batch_attempts
@@ -614,10 +615,16 @@ def verification_gate_decision(
 
 
 def critic_config_override(parent_llm: dict[str, Any] | None) -> dict[str, Any]:
-    """Build the constrained configuration stamped on verification critics."""
+    """Build the constrained configuration stamped on verification critics.
+
+    A critic always runs the phased procedure (``phases: true``): its tool
+    list is the phase tools and it ends with a verdict, not ``job_complete``,
+    so the default (no phases) or a project default must not reach it.
+    """
 
     override: dict[str, Any] = {
         "autonomy": "full",
+        PHASES_KEY: True,
         "tools": {
             "evaluation": ["approve_job_verdict", "return_job_with_feedback"],
             "job_inspection": True,
@@ -650,9 +657,10 @@ async def setup_verification_critic_workspace(
     from_branch = target_job.get("branch_name") or "main"
     branch_name = f"subjob/{short_id}/{effective_config}"
     try:
-        parent_authority = await effects.prepare_job_repository_authority(
-            dependencies.store, effects.forge, target_job
-        )
+        # The effect arrives with the store and the forge bound
+        # (application/completion.py); passing them again raised a TypeError
+        # and the parent never settled after the critic's verdict.
+        parent_authority = await effects.prepare_job_repository_authority(target_job)
         if parent_authority is None:
             raise RuntimeError("Target repository authority is unavailable")
         parent_repo_name = str(parent_authority["repo_name"])

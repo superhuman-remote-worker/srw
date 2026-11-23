@@ -337,9 +337,12 @@ guarantees it.
   linked. A connector someone owns is theirs and stays, whatever credential
   it holds.
 - **An explicit empty connector list means no connectors.** No folder
-  mounts and no connector binds. The project's knowledge base stays
-  reachable as project memory, which follows project membership, not the
-  connector list.
+  mounts, no connector binds and no knowledge base: the agent reads and
+  writes a project's knowledge base only when that knowledge base's
+  connector is attached to the Session or Job. Work that could never choose
+  the connector keeps the knowledge base (a project without one, or work
+  older than its project's connector); see
+  [What a Session or Job gets by default](cloud-folders.md#what-a-session-or-job-gets-by-default).
 - **Nothing takes a failed folder's place.** A folder that can't be bound
   is shown left out, with the reason, and the others mount anyway; SRW
   mounts no other folder in its stead.
@@ -354,6 +357,13 @@ limit impact when individual assumptions fail:
   service readiness. Individual operations still authorize at execution time.
 - **Human gates** can require approval for tool calls, privileged commands,
   workspace upgrades, job completion, or file-effect application.
+- **An MCP server's questions** are declined unless its connector, or the
+  administrator's default, accepts them, and that setting answers only yes/no
+  confirmations. Typed input and links are answered only by a person in a
+  Read-only or Auto-accept session; a job declines them. The card tells the
+  user never to enter passwords or keys, a link opens only on click in a new
+  tab that cannot reach SRW's page, and the model learns only that the user
+  answered, not what they typed.
 - **NetworkPolicy tiers** constrain workspace egress and in-cluster reach. They
   work only when the cluster CNI or paired controller actually enforces
   Kubernetes NetworkPolicy.

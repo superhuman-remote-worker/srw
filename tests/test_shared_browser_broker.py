@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from copy import deepcopy
 import json
 import logging
 import threading
@@ -118,12 +119,18 @@ class TestWorkspaceResolution:
 
 
 class TestExecStreamInfo:
-    def test_vm_runtime_is_contained_before_ssh(self, monkeypatch):
+    def test_unauthenticated_vm_runtime_is_contained_before_ssh(self, monkeypatch):
         async def forbidden(**kwargs):
             raise AssertionError(kwargs)
 
+        async def no_attestation(target):
+            raise AssertionError(target)
+
         monkeypatch.setattr(broker.PINNED_SSH_TRANSPORT_POOL, "run_command", forbidden)
+        monkeypatch.setattr(broker, "attest_vm_workspace_target", no_attestation)
         thread = _bound_thread()
+        # A ready VM wins over the bound container, and without its
+        # controller-authenticated identity it resolves to nothing.
         thread["metadata"]["vm"] = {
             "status": "ready",
             "ssh_host": "192.0.2.8",
@@ -138,8 +145,8 @@ class TestExecStreamInfo:
                 )
             )
 
-        assert error.value.status == 503
-        assert "continuous runtime attestation" in error.value.detail
+        assert error.value.status == 409
+        assert error.value.detail == "browser startup transport is unavailable"
 
     def test_uses_pinned_pool_and_parses_last_stdout_line(self, monkeypatch):
         captured = {}
@@ -1132,3 +1139,523 @@ class TestRelayHappyPath:
         )
         assert any(frame[4] == broker.T_CONTROL for frame in written[1:])
         assert broker._ACTIVE_VIEWERS == {}
+
+
+# ---------------------------------------------------------------------------
+# Same-cluster VM Sessions (WP7)
+# ---------------------------------------------------------------------------
+
+from tests._canvas_vm_fixtures import (  # noqa: E402
+    VM_THREAD_ID,
+    restored_vm_context,
+    vm_context,
+    vm_thread,
+)
+
+
+def _vm_stream_info_ok(captured: dict):
+    async def run_command(**kwargs):
+        captured.setdefault("calls", []).append(("command", kwargs["target"]))
+        captured.update(kwargs)
+        return PinnedSSHCommandResult(
+            exit_status=0,
+            stdout=b'{"generation": "g1", "token": "t", "port": 38801, "baton": "agent"}\n',
+            stderr=b"",
+        )
+
+    return run_command
+
+
+class TestVMExecStreamInfo:
+    def _install(self, monkeypatch, verdicts):
+        monkeypatch.setenv("VM_MODE", "same-cluster")
+        captured: dict = {"calls": []}
+        monkeypatch.setattr(
+            broker.PINNED_SSH_TRANSPORT_POOL,
+            "run_command",
+            _vm_stream_info_ok(captured),
+        )
+        monkeypatch.setattr(broker, "resolve_ssh_key_path", lambda: "/tmp/key")
+        monkeypatch.setattr(broker, "orchestrator_can_reach", lambda host: True)
+        answers = list(verdicts)
+
+        async def attest(target):
+            captured["calls"].append(("attest", target))
+            return answers.pop(0)
+
+        monkeypatch.setattr(broker, "attest_vm_workspace_target", attest)
+        return captured
+
+    def _run(self, thread):
+        async def current():
+            return thread
+
+        return asyncio.run(
+            broker.exec_stream_info(
+                thread, initial_baton="agent", generation_resolver=current
+            )
+        )
+
+    def test_vm_start_is_bracketed_by_controller_proofs(self, monkeypatch):
+        captured = self._install(monkeypatch, ["current", "current"])
+        thread = vm_thread()
+
+        info = self._run(thread)
+
+        assert info["generation"] == "g1"
+        kinds = [kind for kind, _ in captured["calls"]]
+        assert kinds == ["attest", "command", "attest"]
+        target = captured["target"]
+        assert target.host == "10.42.1.23"
+        assert target.port == 22
+        assert target.vm_runtime is not None
+        assert all(seen == target for _, seen in captured["calls"])
+
+    def test_vm_replaced_before_start_runs_nothing(self, monkeypatch):
+        captured = self._install(monkeypatch, ["changed"])
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            self._run(vm_thread())
+
+        assert error.value.status == 409
+        assert [kind for kind, _ in captured["calls"]] == ["attest"]
+
+    def test_vm_replaced_during_start_discards_the_identity(self, monkeypatch):
+        self._install(monkeypatch, ["current", "changed"])
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            self._run(vm_thread())
+
+        assert error.value.status == 409
+        assert error.value.detail == "workspace changed while the browser was starting"
+
+    def test_inconclusive_vm_proof_is_transient(self, monkeypatch):
+        captured = self._install(monkeypatch, ["unknown"])
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            self._run(vm_thread())
+
+        assert error.value.status == 503
+        assert [kind for kind, _ in captured["calls"]] == ["attest"]
+
+    def test_tailnet_vm_is_refused_before_proof_or_ssh(self, monkeypatch):
+        captured = self._install(monkeypatch, [])
+        monkeypatch.setenv("VM_MODE", "external")
+
+        with pytest.raises(broker.BrowserStreamUnavailable) as error:
+            self._run(vm_thread(vm_context(ssh_host="100.64.9.9")))
+
+        assert (error.value.status, error.value.detail) == (
+            503,
+            "workspace route is unavailable",
+        )
+        assert captured["calls"] == []
+
+
+class _VMRelayDB:
+    def __init__(self, thread: dict):
+        self.thread = thread
+        self.fail_reads = False
+
+    async def get_thread(self, thread_id):
+        assert thread_id == str(self.thread["id"])
+        if self.fail_reads:
+            raise OSError("database briefly unavailable")
+        return deepcopy(self.thread)
+
+    async def merge_thread_workspace_context(self, thread_id, updates):
+        del thread_id, updates
+        return True
+
+
+class _BlockingWebSocket(_FakeWebSocket):
+    """A viewer that stays connected until the test ends the relay."""
+
+    def __init__(self):
+        super().__init__()
+        self.sent: list[bytes] = []
+        self._gone = asyncio.Event()
+
+    async def receive(self):
+        await self._gone.wait()
+        return {"type": "websocket.disconnect"}
+
+    async def send_bytes(self, data):
+        self.sent.append(bytes(data))
+
+
+class _ControlledSSHReader:
+    def __init__(self):
+        self.eof = asyncio.Event()
+
+    async def readexactly(self, size):
+        await self.eof.wait()
+        raise asyncio.IncompleteReadError(b"", size)
+
+
+class _VMRelay:
+    """Direct relay harness with a mutable row and scripted VM proofs."""
+
+    def __init__(self, monkeypatch, thread: dict, *, generation: str = "g1"):
+        monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
+        monkeypatch.setenv("VM_MODE", "same-cluster")
+        monkeypatch.setattr(broker, "STREAM_WORKSPACE_RECHECK_S", 0.01)
+        _patch_ready_transport(monkeypatch)
+        self.db = _VMRelayDB(thread)
+        self.generation = generation
+        self.verdict = "current"
+        self.attested: list = []
+        self.opened: list = []
+        self.reader = _ControlledSSHReader()
+        self.writer = _RecordingSSHWriter()
+
+        async def fake_user(ws, database):
+            del ws, database
+            return {"id": "user-1", "is_approved": True}
+
+        async def fake_info(thread, **kwargs):
+            del thread, kwargs
+            return {"generation": self.generation, "token": "tok", "port": 38801}
+
+        async def fake_record(database, thread_id):
+            del database, thread_id
+            return SimpleNamespace(
+                source=SimpleNamespace(browser_generation=self.generation)
+            )
+
+        async def attest(target):
+            self.attested.append(target)
+            return self.verdict
+
+        @asynccontextmanager
+        async def fake_open(**kwargs):
+            self.opened.append(kwargs["target"])
+            yield self.reader, self.writer
+
+        monkeypatch.setattr(broker, "resolve_ws_user", fake_user)
+        monkeypatch.setattr(broker, "exec_stream_info", fake_info)
+        monkeypatch.setattr(broker, "_get_canvas_record", fake_record)
+        monkeypatch.setattr(broker, "attest_vm_workspace_target", attest)
+        monkeypatch.setattr(broker, "_open_loopback", fake_open)
+
+    async def connect(self) -> tuple[_BlockingWebSocket, asyncio.Task]:
+        ws = _BlockingWebSocket()
+        task = asyncio.create_task(
+            broker.relay_browser_stream(ws, str(self.db.thread["id"]), db=self.db)
+        )
+        for _ in range(200):
+            if self.writer.frames or task.done():
+                break
+            await asyncio.sleep(0.005)
+        return ws, task
+
+
+async def _finish(task: asyncio.Task, timeout: float = 2.0) -> None:
+    await asyncio.wait_for(task, timeout)
+
+
+class TestVMRelayAdmission:
+    def test_authenticated_vm_stream_is_admitted_on_a_fresh_proof(self, monkeypatch):
+        relay = _VMRelay(monkeypatch, vm_thread(user_id="user-1"))
+
+        async def run():
+            ws, task = await relay.connect()
+            assert ws.accepted is True
+            assert relay.writer.frames[0][4] == broker.T_HELLO
+            assert relay.opened[0].vm_runtime is not None
+            assert relay.attested and relay.attested[0] == relay.opened[0]
+            ws._gone.set()
+            await _finish(task)
+            assert ws.closes == [(1000, None)]
+
+        asyncio.run(run())
+        assert broker._ACTIVE_VIEWERS == {}
+
+    @pytest.mark.parametrize(
+        ("verdict", "close"),
+        [
+            ("changed", (4409, "Browser generation ended")),
+            ("unknown", (4502, "Browser unreachable")),
+        ],
+    )
+    def test_unproven_vm_is_not_accepted(self, monkeypatch, verdict, close):
+        relay = _VMRelay(monkeypatch, vm_thread(user_id="user-1"))
+        relay.verdict = verdict
+
+        async def run():
+            ws, task = await relay.connect()
+            await _finish(task)
+            assert ws.closes == [close]
+            assert relay.opened == []
+
+        asyncio.run(run())
+        assert broker._ACTIVE_VIEWERS == {}
+
+    def test_tailnet_vm_stream_is_refused_before_browser_start(self, monkeypatch):
+        relay = _VMRelay(
+            monkeypatch, vm_thread(vm_context(ssh_host="100.64.9.9"), user_id="user-1")
+        )
+        monkeypatch.setenv("VM_MODE", "external")
+
+        async def forbidden(*args, **kwargs):
+            raise AssertionError((args, kwargs))
+
+        monkeypatch.setattr(broker, "exec_stream_info", forbidden)
+
+        async def run():
+            ws, task = await relay.connect()
+            await _finish(task)
+            assert ws.closes == [(4503, "Workspace SSH unavailable")]
+
+        asyncio.run(run())
+
+
+class TestVMRelayLifecycle:
+    def test_suspension_ends_the_stream_with_4409(self, monkeypatch):
+        relay = _VMRelay(monkeypatch, vm_thread(user_id="user-1"))
+
+        async def run():
+            ws, task = await relay.connect()
+            assert ws.accepted is True
+            proofs_before = len(relay.attested)
+            # Suspension marks the row before it snapshots and deletes the VM.
+            relay.db.thread["metadata"]["vm"]["status"] = "suspending"
+            await _finish(task)
+            assert ws.closes == [(4409, "Browser generation ended")]
+            # The row answered; no controller call was needed for that.
+            assert len(relay.attested) == proofs_before
+
+        asyncio.run(run())
+        assert broker._ACTIVE_VIEWERS == {}
+
+    def test_launcher_replaced_behind_an_unchanged_row_ends_with_4409(
+        self, monkeypatch
+    ):
+        relay = _VMRelay(monkeypatch, vm_thread(user_id="user-1"))
+
+        async def run():
+            ws, task = await relay.connect()
+            assert ws.accepted is True
+            relay.verdict = "changed"
+            await _finish(task)
+            assert ws.closes == [(4409, "Browser generation ended")]
+
+        asyncio.run(run())
+
+    def test_inconclusive_recheck_hands_the_viewer_a_reconnect(self, monkeypatch):
+        relay = _VMRelay(monkeypatch, vm_thread(user_id="user-1"))
+
+        async def run():
+            ws, task = await relay.connect()
+            relay.verdict = "unknown"
+            await _finish(task)
+            assert ws.closes == [(4502, "stream ended")]
+
+        asyncio.run(run())
+
+    def test_vm_channel_lost_with_the_vm_gone_is_an_ended_browser(self, monkeypatch):
+        relay = _VMRelay(monkeypatch, vm_thread(user_id="user-1"))
+        monkeypatch.setattr(broker, "STREAM_WORKSPACE_RECHECK_S", 3600)
+
+        async def run():
+            ws, task = await relay.connect()
+            relay.db.thread["metadata"]["vm"] = restored_vm_context(status="restoring")
+            relay.reader.eof.set()
+            await _finish(task)
+            assert ws.closes == [(4409, "Browser generation ended")]
+
+        asyncio.run(run())
+
+    def test_vm_channel_lost_with_the_vm_current_is_transient(self, monkeypatch):
+        relay = _VMRelay(monkeypatch, vm_thread(user_id="user-1"))
+        monkeypatch.setattr(broker, "STREAM_WORKSPACE_RECHECK_S", 3600)
+
+        async def run():
+            ws, task = await relay.connect()
+            relay.reader.eof.set()
+            await _finish(task)
+            assert ws.closes == [(4502, "stream ended")]
+
+        asyncio.run(run())
+
+    def test_a_viewer_reopens_after_restore(self, monkeypatch):
+        relay = _VMRelay(monkeypatch, vm_thread(user_id="user-1"))
+
+        async def run():
+            ws, task = await relay.connect()
+            relay.db.thread["metadata"]["vm"]["status"] = "suspending"
+            await _finish(task)
+            assert ws.closes == [(4409, "Browser generation ended")]
+
+            # Restored onto the kept rootdisk; Restart browser staged a new
+            # browser generation on the new runtime.
+            relay.db.thread["metadata"]["vm"] = restored_vm_context()
+            relay.generation = "g2"
+            relay.writer.frames.clear()
+            reopened, task = await relay.connect()
+            assert reopened.accepted is True
+            assert relay.writer.frames[0][4] == broker.T_HELLO
+            assert relay.opened[-1].host == "10.42.7.9"
+            assert relay.opened[-1].generation == relay.opened[0].generation
+            reopened._gone.set()
+            await _finish(task)
+            assert reopened.closes == [(1000, None)]
+
+        asyncio.run(run())
+        assert broker._ACTIVE_VIEWERS == {}
+
+
+class TestContainerRelayLifecycle:
+    def _relay(self, monkeypatch):
+        relay = _VMRelay(monkeypatch, _bound_thread())
+        relay.db.thread["id"] = VM_THREAD_ID
+        relay.db.thread["user_id"] = "user-1"
+
+        async def forbidden(target):
+            raise AssertionError(target)
+
+        monkeypatch.setattr(broker, "attest_vm_workspace_target", forbidden)
+        return relay
+
+    def test_a_vm_taking_over_ends_the_container_stream_with_4409(self, monkeypatch):
+        relay = self._relay(monkeypatch)
+
+        async def run():
+            ws, task = await relay.connect()
+            assert ws.accepted is True
+            assert relay.opened[0].vm_runtime is None
+            relay.db.thread["metadata"]["vm"] = vm_context()
+            await _finish(task)
+            assert ws.closes == [(4409, "Browser generation ended")]
+
+        asyncio.run(run())
+
+    def test_unchanged_container_stream_stays_open_through_rechecks(self, monkeypatch):
+        relay = self._relay(monkeypatch)
+
+        async def run():
+            ws, task = await relay.connect()
+            await asyncio.sleep(0.08)
+            relay.db.fail_reads = True  # an unreadable row never ends it
+            await asyncio.sleep(0.08)
+            assert not task.done()
+            assert ws.closes == []
+            relay.db.fail_reads = False
+            ws._gone.set()
+            await _finish(task)
+            assert ws.closes == [(1000, None)]
+
+        asyncio.run(run())
+
+    def test_container_channel_loss_keeps_its_transient_close(self, monkeypatch):
+        relay = self._relay(monkeypatch)
+        monkeypatch.setattr(broker, "STREAM_WORKSPACE_RECHECK_S", 3600)
+
+        async def run():
+            ws, task = await relay.connect()
+            relay.db.thread["metadata"]["workspace_container"]["status"] = "deleted"
+            relay.reader.eof.set()
+            await _finish(task)
+            assert ws.closes == [(4502, "stream ended")]
+
+        asyncio.run(run())
+
+
+class _FakeViewerAccess:
+    instances: list["_FakeViewerAccess"] = []
+
+    def __init__(self, db, thread_id, user_id):
+        self.args = (db, thread_id, user_id)
+        self.events: list[str] = []
+        type(self).instances.append(self)
+
+    async def acquire(self):
+        self.events.append("acquire")
+        return True
+
+    async def renew(self):
+        self.events.append("renew")
+        return True
+
+    async def close(self):
+        self.events.append("close")
+
+
+class TestVMViewerKeepsTheVMAwake:
+    def _relay(self, monkeypatch, thread, *, idle_release: bool):
+        relay = _VMRelay(monkeypatch, thread)
+        _FakeViewerAccess.instances = []
+        monkeypatch.setattr(broker, "VMViewerAccess", _FakeViewerAccess)
+        monkeypatch.setattr(broker, "VM_VIEWER_ACCESS_RENEW_S", 0.01)
+        monkeypatch.setattr(broker, "STREAM_WORKSPACE_RECHECK_S", 3600)
+        if idle_release:
+            monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+        else:
+            monkeypatch.delenv("WORKSPACE_IDLE_RELEASE_ENABLED", raising=False)
+        return relay
+
+    def test_an_attached_viewer_holds_and_renews_a_vm_access_lease(self, monkeypatch):
+        relay = self._relay(monkeypatch, vm_thread(user_id="user-1"), idle_release=True)
+
+        async def run():
+            ws, task = await relay.connect()
+            assert ws.accepted is True
+            await asyncio.sleep(0.05)
+            ws._gone.set()
+            await _finish(task)
+
+        asyncio.run(run())
+
+        (access,) = _FakeViewerAccess.instances
+        assert access.args == (relay.db, VM_THREAD_ID, "user-1")
+        assert access.events[0] == "acquire"
+        assert "renew" in access.events
+        assert access.events[-1] == "close"
+
+    def test_the_lease_is_closed_when_the_vm_goes_away(self, monkeypatch):
+        relay = self._relay(monkeypatch, vm_thread(user_id="user-1"), idle_release=True)
+        monkeypatch.setattr(broker, "STREAM_WORKSPACE_RECHECK_S", 0.01)
+
+        async def run():
+            ws, task = await relay.connect()
+            relay.db.thread["metadata"]["vm"]["status"] = "suspending"
+            await _finish(task)
+            assert ws.closes == [(4409, "Browser generation ended")]
+
+        asyncio.run(run())
+
+        assert _FakeViewerAccess.instances[0].events[-1] == "close"
+
+    def test_no_lease_without_idle_release(self, monkeypatch):
+        relay = self._relay(
+            monkeypatch, vm_thread(user_id="user-1"), idle_release=False
+        )
+
+        async def run():
+            ws, task = await relay.connect()
+            ws._gone.set()
+            await _finish(task)
+
+        asyncio.run(run())
+
+        assert _FakeViewerAccess.instances == []
+
+    def test_a_container_viewer_takes_no_vm_lease(self, monkeypatch):
+        thread = _bound_thread()
+        thread["id"] = VM_THREAD_ID
+        thread["user_id"] = "user-1"
+        relay = self._relay(monkeypatch, thread, idle_release=True)
+
+        async def forbidden(target):
+            raise AssertionError(target)
+
+        monkeypatch.setattr(broker, "attest_vm_workspace_target", forbidden)
+
+        async def run():
+            ws, task = await relay.connect()
+            ws._gone.set()
+            await _finish(task)
+
+        asyncio.run(run())
+
+        assert _FakeViewerAccess.instances == []

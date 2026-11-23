@@ -43,6 +43,7 @@ from orchestrator.services.config_overrides import (
 )
 from orchestrator.services.default_experts import ExpertSelectionError
 from orchestrator.services.session_tool_policy import with_validated_tool_overrides
+from shared.job_phases import PHASES_KEY, normalize_phases
 from shared.runtime.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
@@ -118,12 +119,13 @@ class AutomationJobShape(BaseModel):
         return shape
 
 
+# Live trigger design: knowledge-base/knowledge/features/live_session_jobs.md §4.4.
 class AutomationCreate(BaseModel):
     """Request body for ``POST /api/automations``.
 
     ``trigger_type`` is ``cron`` (a schedule; ``cron_expr`` required) or
     ``live`` (an incoming live session on the ``primary_connector``, an
-    alias in ``job_shape.execution.connectors``; live_session_jobs §4.4).
+    alias in ``job_shape.execution.connectors``).
     """
 
     name: str = Field(..., min_length=1, max_length=200)
@@ -212,6 +214,32 @@ async def _resolve_automation_or_404(
         )
         return row
     raise HTTPException(status_code=404, detail="Automation not found")
+
+
+def _check_phases(override: dict[str, Any] | None, *, live: bool) -> None:
+    """Check whether an automation's jobs plan in phases (``phases`` in its
+    ``config_override``): true or false, and never false on a live automation,
+    whose jobs start inside a live session. The value is stored normalized, so
+    a fire never meets a value admission would refuse; a null value is dropped,
+    so the automation's jobs follow their expert."""
+    if not override or PHASES_KEY not in override:
+        return
+    if override[PHASES_KEY] in (None, ""):
+        # Null means "what the expert says". Stored, it would delete the
+        # expert's own value when the job's configuration is merged.
+        del override[PHASES_KEY]
+        return
+    try:
+        phases = normalize_phases(override[PHASES_KEY])
+    except ValueError as exc:
+        raise HTTPException(422, f"config_override.{exc}") from None
+    if live and not phases:
+        raise HTTPException(
+            422,
+            "A live automation starts its jobs inside a live session, and such "
+            "a job always plans in phases. Remove phases or set it to true.",
+        )
+    override[PHASES_KEY] = phases
 
 
 LIVE_TAKEN = "live_connector_taken"
@@ -337,6 +365,7 @@ async def create_automation(
     # otherwise pair it with the deployment's stored key at each dispatch.
     refuse_caller_transport_keys(body.config_override)
     refuse_execution_owned_workspace_keys(body.config_override)
+    _check_phases(body.config_override, live=live)
     validated_override = with_validated_tool_overrides(body.config_override)
 
     if body.project_id:
@@ -518,6 +547,7 @@ async def update_automation(
     if "config_override" in fields:
         refuse_caller_transport_keys(fields["config_override"])
         refuse_execution_owned_workspace_keys(fields["config_override"])
+        _check_phases(fields["config_override"], live=live)
         fields["config_override"] = with_validated_tool_overrides(
             fields["config_override"]
         )

@@ -115,4 +115,35 @@ describe('AdminCapacityComponent', () => {
     expect(host.querySelector('.load-failed')).not.toBeNull();
     expect(host.querySelector('[data-testid="capacity-kpis"]')).toBeNull();
   });
+
+  it('shows the stalled banner only when chat_pool_stalled', async () => {
+    const stalled = {
+      ...capacity,
+      chat_pool_stalled: true,
+      stall_threshold_s: 300,
+      queued: { session_turn: 3, worker_batch: 0, total: 3 },
+      oldest_queued_age_s: 600,
+      oldest_session_turn_age_s: 600,
+    };
+    api.getAdminCapacity.mockReturnValueOnce(of(stalled as any));
+    let fixture = TestBed.createComponent(AdminCapacityComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    fixture.detectChanges();
+    const banner = (fixture.nativeElement as HTMLElement).querySelector('[data-testid="capacity-stalled"]');
+    expect(banner).not.toBeNull();
+    expect(banner!.getAttribute('role')).toBe('alert');
+    expect(banner!.textContent).toContain('admin.capacity.stalled');
+
+    api.getAdminCapacity.mockReturnValueOnce(
+      of({ ...stalled, chat_pool_stalled: false } as any),
+    );
+    fixture = TestBed.createComponent(AdminCapacityComponent);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    fixture.detectChanges();
+    expect(
+      (fixture.nativeElement as HTMLElement).querySelector('[data-testid="capacity-stalled"]'),
+    ).toBeNull();
+  });
 });

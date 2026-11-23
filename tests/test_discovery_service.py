@@ -38,7 +38,8 @@ from orchestrator.services import discovery  # noqa: E402
         ("gpt-4-vision-preview", "chat"),
         # Vision-only / image-input models that aren't a multimodal-chat
         # family stay primary 'vision'.
-        ("dall-e-3-image", "vision"),
+        # An image generator is never a vision row (image_generation, 0571).
+        ("dall-e-3-image", "image_generation"),
         ("gpt-4o", "chat"),
         ("claude-opus-4-7", "chat"),
         ("gemini-2.5-pro", "chat"),
@@ -65,7 +66,7 @@ def test_capability_from_model_id_heuristic(model_id: str, expected: str) -> Non
         ("text-embedding-3-large", ["embedding"]),
         ("whisper-large-v3", ["whisper"]),
         ("tts-1-hd", ["tts"]),
-        ("dall-e-3-image", ["vision"]),
+        ("dall-e-3-image", ["image_generation"]),
     ],
 )
 def test_capabilities_from_model_id_array(model_id: str, expected: list[str]) -> None:

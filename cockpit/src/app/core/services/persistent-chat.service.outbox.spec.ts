@@ -484,6 +484,40 @@ describe('PersistentChatService — Phase 3 outbox', () => {
             );
         });
 
+        // dictation_composer_redesign.md D1: a dictation recording uploads with
+        // the message and is named to the agent, but is never a chip.
+        it('uploads a dictation recording unseen and tells the agent where it is', async () => {
+            const ctx = await readySession();
+            const gate = new Subject<ThreadUploadEvent>();
+            ctx.mockApi.uploadOneToThread = vi.fn((_t: string, file: File) =>
+                file.name === 'voice.webm' ? gate : of(done(uploaded('a.pdf'))),
+            );
+
+            ctx.service.addAttachments([
+                filePreview('a.pdf'),
+                {...filePreview('voice.webm'), name: 'Voice message (0:03)', dictation: true},
+            ]);
+            void ctx.service.sendMessage('plan my week');
+            await flushTick();
+
+            const bubble = () =>
+                ctx.service.turns().find((t) => isUserTurn(t) && t.content === 'plan my week') as UserTurn;
+            expect(bubble().attachments?.find((a) => a.dictation)?.name).toBe('Voice message (0:03)');
+
+            gate.next(done(uploaded('voice-message-1.webm')));
+            gate.complete();
+            await flushTick();
+
+            expect(inputBody(ctx).content).toBe(
+                'plan my week\n\n' +
+                    '[Transcribed from a voice recording; the original audio is in uploads/: voice-message-1.webm]\n\n' +
+                    '[Attached files in uploads/: a.pdf]',
+            );
+            // The resolved entry keeps the flag, so the bubble never grows a chip for it.
+            const resolved = ctx.service.outbox()[0]?.attachments ?? bubble().attachments ?? [];
+            expect(resolved.find((a) => a.name === 'voice-message-1.webm')?.dictation).toBe(true);
+        });
+
         it('writes upload progress onto the queued file, throttled to ~4 writes a second', async () => {
             // Users attach 30-90MB PDFs; without this the bubble can only show
             // an opaque indeterminate label for the whole wait. The throttle is

@@ -3,6 +3,7 @@ import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
 import {JobSummary} from '../../core/models/audit.model';
+import {jobDisplayName} from '../../core/util/job-name';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {JobReviewComponent} from './job-review.component';
 import {AppIconComponent} from '../../ui/icon';
@@ -71,7 +72,7 @@ function relativeTime(iso: string | null | undefined, nowLabel: string): string 
                 [class.selected]="currentJobId() === job.id"
                 (click)="selectJob(job.id)"
               >
-                <span class="item-desc">{{ job.description || job.id.slice(0, 8) }}</span>
+                <span class="item-desc">{{ jobName(job) || job.id.slice(0, 8) }}</span>
                 <span class="item-meta">
                   <span class="item-badge">{{ 'jobReviewPage.pendingBadge' | transloco }}</span>
                   <span class="item-time">{{ formatRelative(job.created_at) }}</span>
@@ -258,6 +259,7 @@ export class JobReviewPageComponent implements OnInit {
   private readonly transloco = inject(TranslocoService);
 
   readonly pendingJobs = signal<JobSummary[]>([]);
+  readonly jobName = jobDisplayName;
   readonly isLoading = signal<boolean>(false);
   readonly currentJobId = this.data.currentJobId;
   private readonly review = viewChild(JobReviewComponent);

@@ -118,6 +118,15 @@ _FOLDER_KIND_FOR_ACCESS = {"read_only": "reader", "read_write": "writer"}
 #: to the operator.
 _FOLDER_PRINCIPAL_QUOTA = "0 B"
 
+#: user_oidc's settings, read as app config through the provisioning API,
+#: and its admin API that finds or creates the account a provider's login
+#: signs into (``OcsApiController::createUser``).
+_USER_OIDC_CONFIG_PATH = (
+    "/ocs/v2.php/apps/provisioning_api/api/v1/config/apps/user_oidc"
+)
+_USER_OIDC_CREATE_USER_PATH = "/ocs/v2.php/apps/user_oidc/api/v1/user"
+_USER_OIDC_MAPPING_UID_RE = re.compile(r"provider-(\d+)-mappingUid\Z")
+
 #: The shared clients' (the admin's and agent-service's) timeouts and pool.
 _CLIENT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=10.0)
 _CLIENT_LIMITS = httpx.Limits(max_connections=20, max_keepalive_connections=10)
@@ -354,6 +363,9 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         self._init_agent_secret()
         self._attestation_backend_instance_id: Optional[str] = None
         self._installation_proof_sha256: Optional[str] = None
+        # The user_oidc provider ``ensure_user`` creates accounts for, once
+        # found (``_account_provider_id``).
+        self._account_provider_id_found: Optional[int] = None
         share_events, share_window = share_rate_bucket()
         self._share_bucket = LeakyBucket(
             max_events=share_events,
@@ -1193,6 +1205,7 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
             raise self._map_http_error(e) from e
         return None
 
+    @instrument_backend_op("ensure_user")
     async def ensure_user(
         self,
         *,
@@ -1202,13 +1215,156 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
         display_name: Optional[str],
         preferred_username: Optional[str] = None,
     ) -> Optional[UserId]:
-        """Nextcloud's user_oidc app provisions on first login; no admin API.
+        """Find the user's Nextcloud account, or create the one their first
+        SSO login would create.
 
-        We don't forge a local account from the service side because
-        Nextcloud's OIDC-linked accounts only materialise via the login
-        flow. Callers fall back to ``resolve_user_identity`` at share time.
+        The search (``resolve_user_identity``) comes first. With nobody
+        found, user_oidc's admin API (``POST
+        /ocs/v2.php/apps/user_oidc/api/v1/user``) creates the account the way
+        a login does (``UserMapper::getOrCreate``): its uid derives from the
+        provider and the claim the provider's uid mapping names, which the
+        chart sets to ``preferred_username``. The user's first login then
+        signs into this account, and SRW can put them into their project
+        groups before that.
+
+        Creating also copies Nextcloud's skeleton files into the home, over
+        any copies already there. So an account that exists under the login's
+        uid but that the search missed (it has no email yet) is returned as it
+        is, never created again.
+
+        Returns ``None``, with a warning, when SRW cannot tell which account
+        the login would use: it has no ``preferred_username`` for the user (a
+        row from before it was recorded; their next SRW sign-in records it),
+        or no single user_oidc provider is registered the way the chart
+        registers Keycloak. A refused request raises.
         """
-        return await self.resolve_user_identity(email, display_name)
+        found = await self.resolve_user_identity(email, display_name)
+        if found:
+            return found
+        if not preferred_username:
+            logger.warning(
+                "Nextcloud: SSO user %s has no account and none was created: "
+                "SRW has no preferred_username for them yet (their next SRW "
+                "sign-in records it)",
+                sub,
+            )
+            return None
+        provider_id = await self._account_provider_id()
+        if provider_id is None:
+            return None
+        login_uid = hashlib.sha256(
+            f"{provider_id}_0_{preferred_username}".encode()
+        ).hexdigest()
+        form = {"providerId": str(provider_id), "userId": preferred_username}
+        if display_name:
+            form["displayName"] = display_name
+        if email:
+            form["email"] = email
+        try:
+            resp = await self._client.get(
+                f"/ocs/v2.php/cloud/users/{login_uid}", params={"format": "json"}
+            )
+            if resp.status_code != 404:
+                resp.raise_for_status()
+                self._assert_not_html(resp)
+                return UserId(login_uid)
+            resp = await self._client.post(
+                _USER_OIDC_CREATE_USER_PATH, params={"format": "json"}, data=form
+            )
+            resp.raise_for_status()
+            self._assert_not_html(resp)
+            created = str(resp.json()["ocs"]["data"]["user_id"])
+        except CloudBackendError:
+            raise
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        except (KeyError, TypeError, ValueError) as e:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                f"user_oidc's create-user answer has no user_id: {e}",
+                backend=self.backend_id,
+            ) from e
+        if created != login_uid:
+            logger.warning(
+                "Nextcloud: user_oidc created account %s for SSO user %s, not "
+                "%s as SRW derived it; an existing account it misses could "
+                "get the skeleton files again",
+                created,
+                sub,
+                login_uid,
+            )
+        logger.info(
+            "Nextcloud: created account %s for SSO user %s ahead of their first login",
+            created,
+            sub,
+        )
+        return UserId(created)
+
+    async def _account_provider_id(self) -> Optional[int]:
+        """The id of the user_oidc provider ``ensure_user`` creates accounts for.
+
+        It is the one provider that takes the uid from ``preferred_username``
+        and hashes it (unique uids), as the chart registers Keycloak. Its id is
+        read from user_oidc's settings rather than assumed, and remembered
+        once found. ``None``, with a warning, for any other setup: SRW could
+        not tell which account a login there signs into.
+        """
+        if self._account_provider_id_found is not None:
+            return self._account_provider_id_found
+        keys = await self._user_oidc_config()
+        keys = [str(key) for key in keys] if isinstance(keys, list) else []
+        providers = [
+            int(match.group(1))
+            for key in keys
+            if (match := _USER_OIDC_MAPPING_UID_RE.match(key))
+        ]
+        providers = [
+            provider_id
+            for provider_id in providers
+            if await self._user_oidc_config(f"provider-{provider_id}-mappingUid")
+            == "preferred_username"
+        ]
+        if len(providers) != 1:
+            logger.warning(
+                "Nextcloud: SRW creates no accounts ahead of a first login: "
+                "%d user_oidc providers take the uid from preferred_username, "
+                "not exactly one",
+                len(providers),
+            )
+            return None
+        provider_id = providers[0]
+        unique_uid = f"provider-{provider_id}-uniqueUid"
+        # user_oidc reads an unset uniqueUid as on.
+        if unique_uid in keys and await self._user_oidc_config(unique_uid) != "1":
+            logger.warning(
+                "Nextcloud: SRW creates no accounts ahead of a first login: "
+                "user_oidc provider %d does not hash its uids (the chart "
+                "registers Keycloak with unique-uid=1)",
+                provider_id,
+            )
+            return None
+        self._account_provider_id_found = provider_id
+        return provider_id
+
+    async def _user_oidc_config(self, key: str = "") -> Any:
+        """One user_oidc setting, or with no ``key`` the list of their keys."""
+        self._ensure_ready()
+        path = f"{_USER_OIDC_CONFIG_PATH}/{key}" if key else _USER_OIDC_CONFIG_PATH
+        try:
+            resp = await self._client.get(path, params={"format": "json"})
+            resp.raise_for_status()
+            self._assert_not_html(resp)
+            return resp.json()["ocs"]["data"]["data"]
+        except CloudBackendError:
+            raise
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        except (KeyError, TypeError, ValueError) as e:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                f"user_oidc setting {key or '(list)'} unreadable: {e}",
+                backend=self.backend_id,
+            ) from e
 
     def get_default_home_browser_url(self) -> Optional[str]:
         """Generic Nextcloud Files app URL (user-agnostic)."""

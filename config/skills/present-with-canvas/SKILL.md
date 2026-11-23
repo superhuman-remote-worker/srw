@@ -60,6 +60,16 @@ from their site.
 Use only source types and fields present in the current `set_canvas` schema;
 never guess app, port, browser, or routing fields that are not advertised.
 
+## Show a Running Web App
+
+The user cannot open an address on your workspace's loopback. When they should
+try an app you run, and the `set_canvas` schema offers the `browser` source:
+keep each server in its own named background shell tab, bound to `127.0.0.1`;
+open the app with your browser tools and check the main flow yourself; then
+call `set_canvas(source_type="browser", browser_id="current")` and tell the
+user what to try. They choose **Take control** in the Canvas to drive it. On a
+later turn, check the server tabs are still running before you rely on them.
+
 ## Refresh Without Losing User Work
 
 Treat the workspace file as shared state. Before overwriting a file already on

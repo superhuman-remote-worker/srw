@@ -20,6 +20,7 @@ import { AppButtonComponent } from '../../ui/button';
 import { AppIconComponent } from '../../ui/icon';
 import { AppIconButtonComponent } from '../../ui/icon-button';
 import { AppSpinnerComponent } from '../../ui/spinner';
+import { AppTooltipDirective } from '../../ui/tooltip';
 import {
   BrowserMouseButton,
   BrowserPoint,
@@ -30,11 +31,75 @@ import {
   browserWheelDeltas,
   mapBrowserPoint,
 } from './canvas-browser-input';
-import { BROWSER_MAX_INSERT_TEXT_CHARS } from './canvas-browser-protocol';
+import { BROWSER_MAX_INSERT_TEXT_CHARS, normalizeBrowserAddress } from './canvas-browser-protocol';
 import {
+  BrowserViewportSize,
   CanvasBrowserConnectionStatus,
   CanvasBrowserController,
 } from './canvas-browser.controller';
+
+/** Fit follows the pane; the others are fixed CSS-pixel page sizes. */
+export type BrowserViewportMode = 'fit' | 'phone' | 'tablet' | 'desktop';
+
+/**
+ * Common device sizes that fit the workspace screen (1920x1200) with the
+ * browser's own toolbar. Size only: the page gets no phone user agent or
+ * touch events.
+ */
+export const BROWSER_VIEWPORT_PRESETS: Readonly<
+  Record<Exclude<BrowserViewportMode, 'fit'>, BrowserViewportSize>
+> = Object.freeze({
+  phone: Object.freeze({width: 390, height: 844}),
+  tablet: Object.freeze({width: 768, height: 1024}),
+  desktop: Object.freeze({width: 1440, height: 900}),
+});
+
+const BROWSER_VIEWPORT_MODES: readonly {
+  readonly id: BrowserViewportMode;
+  readonly icon: string;
+  readonly size: BrowserViewportSize | null;
+}[] = [
+  {id: 'fit', icon: 'fit_screen', size: null},
+  {id: 'phone', icon: 'smartphone', size: BROWSER_VIEWPORT_PRESETS.phone},
+  {id: 'tablet', icon: 'tablet', size: BROWSER_VIEWPORT_PRESETS.tablet},
+  {id: 'desktop', icon: 'desktop_windows', size: BROWSER_VIEWPORT_PRESETS.desktop},
+];
+
+/** Quiet time after the last pane resize before the page is resized. */
+export const BROWSER_VIEWPORT_DEBOUNCE_MS = 250;
+const FALLBACK_FRAME: BrowserViewportSize = {width: 1280, height: 720};
+
+export interface BrowserDisplayBox extends BrowserViewportSize {
+  readonly left: number;
+  readonly top: number;
+}
+
+/**
+ * Where the page goes on the stage: one CSS pixel per page pixel, scaled down
+ * (never up) when it is larger than the stage, centred on whole pixels when
+ * smaller. Without a measured stage it is drawn 1:1 at the origin.
+ */
+export function fitBrowserFrame(
+  frame: BrowserViewportSize,
+  stage: BrowserViewportSize | null,
+): BrowserDisplayBox {
+  if (!stage || stage.width <= 0 || stage.height <= 0) {
+    return {width: frame.width, height: frame.height, left: 0, top: 0};
+  }
+  const scale = Math.min(1, stage.width / frame.width, stage.height / frame.height);
+  const width = frame.width * scale;
+  const height = frame.height * scale;
+  return {
+    width,
+    height,
+    left: Math.max(0, Math.floor((stage.width - width) / 2)),
+    top: Math.max(0, Math.floor((stage.height - height) / 2)),
+  };
+}
+
+function sameSize(a: BrowserViewportSize | null, b: BrowserViewportSize | null): boolean {
+  return a === b || (!!a && !!b && a.width === b.width && a.height === b.height);
+}
 
 const BROWSER_STATUS_KEYS: Record<CanvasBrowserConnectionStatus, string> = {
   idle: 'canvas.browser.status.connecting',
@@ -99,43 +164,59 @@ interface PressedBrowserKey {
     AppIconComponent,
     AppIconButtonComponent,
     AppSpinnerComponent,
+    AppTooltipDirective,
     TranslocoPipe,
   ],
   template: `
     <section class="browser-renderer" [attr.data-connection-status]="browser.connectionStatus()">
       <header class="browser-toolbar" role="toolbar"
               [attr.aria-label]="'canvas.browser.toolbar.label' | transloco">
-        <div class="browser-page">
-          <strong class="browser-title">
-            {{ browser.pageState()?.title || ('canvas.browser.untitled' | transloco) }}
-          </strong>
-          <form class="browser-navigation" (submit)="navigate($event)">
-            <app-icon-button size="sm"
-                             [ariaLabel]="'canvas.browser.toolbar.back' | transloco"
-                             [tooltip]="'canvas.browser.toolbar.back' | transloco"
-                             [disabled]="!canDrive()"
-                             (clicked)="goBack()">
-              <app-icon size="sm">arrow_back</app-icon>
-            </app-icon-button>
-            <app-icon-button size="sm"
-                             [ariaLabel]="'canvas.browser.toolbar.reload' | transloco"
-                             [tooltip]="'canvas.browser.toolbar.reload' | transloco"
-                             [disabled]="!canDrive()"
-                             (clicked)="reload()">
-              <app-icon size="sm">refresh</app-icon>
-            </app-icon-button>
-            <label class="browser-url-label">
-              <span>{{ 'canvas.browser.toolbar.address' | transloco }}</span>
-              <input type="text" inputmode="url" autocomplete="off" spellcheck="false"
-                     maxlength="8192" [value]="urlValue()"
-                     [placeholder]="'canvas.browser.noUrl' | transloco"
-                     [disabled]="!canDrive()"
-                     (focus)="urlEditing.set(true)"
-                     (blur)="urlEditing.set(false)"
-                     (input)="onUrlInput($event)" />
-            </label>
-          </form>
-        </div>
+        <strong class="browser-title" [attr.title]="browser.pageState()?.title || null">
+          {{ browser.pageState()?.title || ('canvas.browser.untitled' | transloco) }}
+        </strong>
+        <form class="browser-navigation" (submit)="navigate($event)">
+          <app-icon-button size="sm"
+                           [ariaLabel]="'canvas.browser.toolbar.back' | transloco"
+                           [tooltip]="'canvas.browser.toolbar.back' | transloco"
+                           [disabled]="!canDrive()"
+                           (clicked)="goBack()">
+            <app-icon size="sm">arrow_back</app-icon>
+          </app-icon-button>
+          <app-icon-button size="sm"
+                           [ariaLabel]="'canvas.browser.toolbar.reload' | transloco"
+                           [tooltip]="'canvas.browser.toolbar.reload' | transloco"
+                           [disabled]="!canDrive()"
+                           (clicked)="reload()">
+            <app-icon size="sm">refresh</app-icon>
+          </app-icon-button>
+          <label class="browser-url-label">
+            <span>{{ 'canvas.browser.toolbar.address' | transloco }}</span>
+            <input type="text" inputmode="url" autocomplete="off" spellcheck="false"
+                   maxlength="8192" [value]="urlValue()"
+                   [placeholder]="'canvas.browser.noUrl' | transloco"
+                   [attr.title]="urlValue() || null"
+                   [disabled]="!canDrive()"
+                   (focus)="urlEditing.set(true)"
+                   (blur)="urlEditing.set(false)"
+                   (input)="onUrlInput($event)" />
+          </label>
+          @if (browser.viewportControl()) {
+            <div class="browser-size" role="group"
+                 [attr.aria-label]="'canvas.browser.size.label' | transloco">
+              @for (mode of viewportModes; track mode.id) {
+                <button type="button" class="browser-size-option"
+                        [attr.data-mode]="mode.id"
+                        [attr.aria-pressed]="viewportMode() === mode.id"
+                        [attr.aria-label]="('canvas.browser.size.' + mode.id) | transloco: (mode.size ?? {})"
+                        [appTooltip]="('canvas.browser.size.' + mode.id) | transloco: (mode.size ?? {})"
+                        [disabled]="!canDrive()"
+                        (click)="setViewportMode(mode.id)">
+                  <app-icon size="sm">{{ mode.icon }}</app-icon>
+                </button>
+              }
+            </div>
+          }
+        </form>
         <div class="browser-indicators">
           @if (browser.pageState()?.loading) {
             <span class="browser-loading">
@@ -143,9 +224,11 @@ interface PressedBrowserKey {
               {{ 'canvas.browser.loading' | transloco }}
             </span>
           }
-          <span class="browser-connection">
-            {{ connectionStatusKey() | transloco }}
-          </span>
+          @if (browser.connectionStatus() !== 'ready') {
+            <span class="browser-connection">
+              {{ connectionStatusKey() | transloco }}
+            </span>
+          }
           @if (batonKey(); as key) {
             <span class="browser-baton" role="status" aria-live="polite"
                   [attr.data-baton]="browser.pageState()?.baton">
@@ -175,12 +258,15 @@ interface PressedBrowserKey {
         </div>
       }
 
-      <div class="browser-stage">
+      <div class="browser-stage" #stage>
         <canvas
           #surface
           class="browser-surface"
           tabindex="0"
-          [style.aspect-ratio]="aspectRatio()"
+          [style.width.px]="displayBox().width"
+          [style.height.px]="displayBox().height"
+          [style.left.px]="displayBox().left"
+          [style.top.px]="displayBox().top"
           [attr.aria-label]="'canvas.browser.surfaceLabel' | transloco"
           (pointermove)="onPointerMove($event)"
           (pointerdown)="onPointerDown($event)"
@@ -262,15 +348,39 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
   private readonly pressedKeys = new Map<string, PressedBrowserKey>();
   @ViewChild('surface', { static: true })
   private surface!: ElementRef<HTMLCanvasElement>;
+  @ViewChild('stage', { static: true })
+  private stage!: ElementRef<HTMLElement>;
+  private resizeObserver: ResizeObserver | null = null;
+  private stageSettleTimer: ReturnType<typeof setTimeout> | null = null;
 
   readonly urlValue = signal('');
   readonly urlEditing = signal(false);
   composing = false;
 
-  readonly aspectRatio = computed(() => {
-    const viewport = this.browser.pageState()?.viewport;
-    return viewport ? `${viewport.width} / ${viewport.height}` : '16 / 9';
-  });
+  readonly viewportModes = BROWSER_VIEWPORT_MODES;
+  /** Per pane: Fit follows the pane; a preset asks for a fixed page size. */
+  readonly viewportMode = signal<BrowserViewportMode>('fit');
+  /** The stage's CSS size, live; null until measured. */
+  readonly stageSize = signal<BrowserViewportSize | null>(null, {equal: sameSize});
+  /** The stage's size once it has been still for the debounce window. */
+  readonly settledStageSize = signal<BrowserViewportSize | null>(null, {equal: sameSize});
+
+  /** CSS size of the page in the current frame: what input maps onto. */
+  readonly frameViewport = computed<BrowserViewportSize | null>(() =>
+    this.browser.frameSize() ?? this.browser.pageState()?.viewport ?? null,
+  );
+  readonly displayBox = computed(() =>
+    fitBrowserFrame(this.frameViewport() ?? FALLBACK_FRAME, this.stageSize()),
+  );
+  /** The page size this viewer wants: the pane in Fit, else the preset. */
+  readonly requestedViewport = computed<BrowserViewportSize | null>(() => {
+    const mode = this.viewportMode();
+    if (mode !== 'fit') return BROWSER_VIEWPORT_PRESETS[mode];
+    const stage = this.settledStageSize();
+    if (!stage) return null;
+    const size = {width: Math.floor(stage.width), height: Math.floor(stage.height)};
+    return size.width >= 1 && size.height >= 1 ? size : null;
+  }, {equal: sameSize});
   readonly connectionStatusKey = computed(() =>
     canvasBrowserStatusKey(this.browser.connectionStatus(), this.browser.errorCode()),
   );
@@ -348,6 +458,17 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', this.visibilityListener);
     }
+    // The picture follows the pane: whenever this viewer can drive, the
+    // daemon advertises the capability, or the wanted size changes, ask for
+    // it. Deliberately not driven by STATE updates, so two viewers of one
+    // browser never echo each other's sizes; the last one to resize wins.
+    effect(() => {
+      const size = this.requestedViewport();
+      const canDrive = this.canDrive();
+      const supported = this.browser.viewportControl();
+      if (!size || !canDrive || !supported) return;
+      untracked(() => this.browser.requestViewport(size.width, size.height));
+    });
   }
 
   ngAfterViewInit(): void {
@@ -355,9 +476,40 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
       () => paintBrowserBitmap(this.surface.nativeElement, this.browser.frame()),
       { injector: this.injector },
     );
+    if (typeof ResizeObserver === 'function') {
+      this.resizeObserver = new ResizeObserver((entries) => {
+        const box = entries[entries.length - 1]?.contentRect;
+        if (box) this.onStageResize(box.width, box.height);
+      });
+      this.resizeObserver.observe(this.stage.nativeElement);
+    }
+  }
+
+  setViewportMode(mode: BrowserViewportMode): void {
+    if (this.canDrive()) this.viewportMode.set(mode);
+  }
+
+  /** Draw at once; resize the remote page only once the pane holds still. */
+  onStageResize(width: number, height: number): void {
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return;
+    const size = {width: Math.max(0, width), height: Math.max(0, height)};
+    this.stageSize.set(size);
+    if (this.settledStageSize() === null) {
+      this.settledStageSize.set(size);
+      return;
+    }
+    if (this.stageSettleTimer !== null) clearTimeout(this.stageSettleTimer);
+    this.stageSettleTimer = setTimeout(() => {
+      this.stageSettleTimer = null;
+      this.settledStageSize.set(this.stageSize());
+    }, BROWSER_VIEWPORT_DEBOUNCE_MS);
   }
 
   ngOnDestroy(): void {
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
+    if (this.stageSettleTimer !== null) clearTimeout(this.stageSettleTimer);
+    this.stageSettleTimer = null;
     this.releaseHeldInput();
     this.cancelPointerFrame();
     if (typeof document !== 'undefined') {
@@ -374,7 +526,7 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
 
   navigate(event: Event): void {
     event.preventDefault();
-    const url = this.urlValue().trim();
+    const url = normalizeBrowserAddress(this.urlValue());
     if (!this.canDrive() || !url) return;
     this.browser.sendControl({op: 'navigate', url});
   }
@@ -497,7 +649,7 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
 
   onWheel(event: WheelEvent): void {
     if (!this.canDrive() || !this.surfaceFocused()) return;
-    const viewport = this.browser.pageState()?.viewport;
+    const viewport = this.frameViewport();
     const bounds = this.surface.nativeElement.getBoundingClientRect();
     const point = viewport
       ? mapBrowserPoint(event.clientX, event.clientY, bounds, viewport)
@@ -651,7 +803,7 @@ export class CanvasBrowserRendererComponent implements AfterViewInit, OnDestroy 
   }
 
   private mapPoint(clientX: number, clientY: number): BrowserPoint | null {
-    const viewport = this.browser.pageState()?.viewport;
+    const viewport = this.frameViewport();
     return viewport
       ? mapBrowserPoint(
           clientX,

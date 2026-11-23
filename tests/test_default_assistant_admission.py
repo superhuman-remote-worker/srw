@@ -61,25 +61,81 @@ async def test_seeded_default_passes_session_create_grants(
         ),
     )
 
+    # Since 2026-11-11 (seed 4) the assistant carries the shell tools; on the
+    # virtual tier the session's backend filter strips them at runtime.
+    assert fragment["tools"]["shell"] == ["run_command", "cancel_command", "shell_read"]
     roster = fragment["subagents"]["roster"]
     assert set(roster) == {"explorer", "reader", "implementer"}
     assert all(entry["tools"]["workspace"] for entry in roster.values())
-    assert roster["implementer"]["tools"]["shell"] == []
+    # Seed 3's `shell: []` pin is lifted: the implementer keeps its library shell.
+    assert roster["implementer"]["tools"]["shell"]
     assert "write_file" in roster["implementer"]["tools"]["workspace"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["parent", "child"])
-async def test_explicit_shell_request_still_fails_session_admission(
-    default_grants_user, surface
+async def test_seeded_default_is_refused_where_shell_is_restricted(
+    default_grants_user,
 ):
+    """The assistant carries the shell tools since seed 4, so an install that
+    restricts shell_tools refuses a Session on the unmodified default (as for
+    any expert with a shell); its administrator gives users a copy without
+    the shell group as their default."""
+    default_grants_user.list_grants_for_scopes.return_value = {
+        "user": [],
+        "project": [],
+        "global": [{"key": "shell_tools", "value_json": False}],
+    }
+
+    with pytest.raises(HTTPException) as exc:
+        await grant_enforcement_module.enforce_session_create_grants(
+            _resolved_assistant({"workspace": {"backend": "virtual"}}),
+            user_id=USER_ID,
+            project_ids=[],
+            dependencies=preparation_composition.grant_enforcement_dependencies(
+                main.app.state.resources
+            ),
+        )
+
+    assert exc.value.status_code == 422
+    assert "shell_tools" in exc.value.detail
+
+
+def _shell_override(surface):
     tools = {"shell": ["run_command"]}
-    override = (
+    return (
         {"tools": tools}
         if surface == "parent"
         else {"subagents": {"roster": {"implementer": {"tools": tools}}}}
     )
-    fragment = _resolved_assistant(override)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["parent", "child"])
+async def test_explicit_shell_request_passes_for_default_grants(
+    default_grants_user, surface
+):
+    """shell_tools is granted by default (2026-11-11)."""
+    await grant_enforcement_module.enforce_session_create_grants(
+        _resolved_assistant(_shell_override(surface)),
+        user_id=USER_ID,
+        project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            main.app.state.resources
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["parent", "child"])
+async def test_explicit_shell_request_fails_where_shell_is_restricted(
+    default_grants_user, surface
+):
+    default_grants_user.list_grants_for_scopes.return_value = {
+        "user": [],
+        "project": [],
+        "global": [{"key": "shell_tools", "value_json": False}],
+    }
+    fragment = _resolved_assistant(_shell_override(surface))
 
     with pytest.raises(HTTPException) as exc:
         await grant_enforcement_module.enforce_session_create_grants(

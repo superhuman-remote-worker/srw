@@ -59,6 +59,7 @@ spec:
             - get_annotations
             - search_library
           memory: []
+          image_generation: []
           knowledge:
             - kb_read
             - kb_list

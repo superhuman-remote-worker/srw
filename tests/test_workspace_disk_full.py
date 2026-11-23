@@ -373,16 +373,23 @@ class TestWireContract:
             ),
             "none": workspace_disk_full_action(report),
         }
+        running = (
+            "The workspace is still up and nothing was removed; its processes and "
+            "/tmp last until it is released."
+        )
         for action in actions.values():
             assert "transport" not in action
+            assert "checkpoints" not in action
             assert "(9.3 GiB of 9.8 GiB used, 0 B free)" in action
+            # The worker measured the disk through a live transport.
+            assert action.endswith(running)
         assert actions["resumed"].endswith(
-            "grew the volume to 20 GiB; "
-            "workspace and checkpoints retained; "
-            "the job resumes"
+            "grew the volume to 20 GiB; the job resumes. " + running
         )
         assert "explicit Resume required" in actions["grown_held"]
         assert "has not finished yet" in actions["pending"]
         assert "already grown once, to 20 GiB" in actions["used"]
         assert "growing the volume failed: HTTP 403" in actions["refused"]
-        assert actions["none"].endswith("free space or grow the volume, then Resume")
+        # The action comes before the detail, so a list's 180-character cut keeps it.
+        for key in ("none", "used", "refused"):
+            assert "free space or grow the volume, then Resume" in actions[key][:180]

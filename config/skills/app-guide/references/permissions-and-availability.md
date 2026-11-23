@@ -52,6 +52,11 @@ Read-only asks rather than refuses: approve a change and it runs. It is not the
 same as a connector's read-only access level, which binds no write tools at
 all. A delegated subagent runs unattended once its delegation is approved.
 
+A question an MCP server asks during a tool call, such as a cost
+confirmation, follows its connector's own setting. Read-only and Auto-accept
+show it to the user when that setting would decline it; Autonomous applies the
+setting. The `datasources` topic has the details.
+
 New session experts default to Read-only unless an account, expert, or
 per-session setting overrides it. Change the current session from its header
 **Settings** panel; change the account fallback under
@@ -62,9 +67,8 @@ or bypass authorization. Autonomous means “do not ask for each tool,” not
 “ignore access controls.” Every real operation still enforces its own user,
 project, connector, deployment, and safety checks. A user's
 `permission_mode` grant is a ceiling; modes above it are unavailable even if
-an expert requests them. The built-in non-admin ceiling allows Auto-accept;
-Autonomous needs an explicit grant unless an administrator narrows or widens
-the applicable policy.
+an expert requests them. The built-in ceiling allows Autonomous; an
+administrator can narrow it to Auto-accept or Read-only.
 
 ## Capability grants are restrict-only ceilings
 
@@ -75,10 +79,18 @@ project or none.
 Admins bypass this grant policy, but not deployment kill switches, missing
 services, ownership checks, or other operation-specific authorization.
 
-The current grant catalog covers:
+Grants that only let the user's own agent get work done in its own workspace
+are on by default: `personal_default_experts`, `vm_workspace`, `shell_tools`,
+`delegation`, `catalog_authoring`, `datasource_tools` and `browser`, with the
+`permission_mode` ceiling at Autonomous, the `autonomy_ceiling` at Full and
+every model selectable. The others
+are off by default. An administrator turns a default off with a global, project
+or user grant set to off. The current grant catalog covers:
 
 - `personal_default_experts` — set or fork personal default experts;
-- `vm_workspace` — select or upgrade to a VM workspace (VM templates need it);
+- `vm_workspace` — select or upgrade to a VM workspace (VM templates need it).
+  The installation must also support VMs, and an administrator can switch VM
+  workspaces off for everyone;
 - `shell_tools` — load shell tools;
 - `delegation` — enable subagent delegation;
 - `public_datasources` — publish a connector to all users;
@@ -87,8 +99,8 @@ The current grant catalog covers:
 - `browser` — load the agent's direct browser tools;
 - `catalog_authoring` — let the agent create and update the user's own experts,
   skills, and automations. The writes are owner-scoped by the same endpoints the
-  UI uses, and a new automation is created switched off; the grant exists because
-  an enabled automation goes on to spawn jobs;
+  UI uses, so bundled and global entries stay read-only, and a new automation is
+  created switched off;
 - `unattended_operations` — start a project self-improvement loop and commission
   a project officer (centurion). These are the two surfaces that spawn jobs with
   no human clicking anything, so the grant bounds unattended token spend as much
@@ -98,15 +110,16 @@ The current grant catalog covers:
   rejected. Reading a loop's state, pausing it, and stopping it stay available —
   nobody is locked out of halting work that is already running;
 - `custom_harness_images` — run an admin-approved custom harness image
-  (`manifestHosting.approvedImages`) as a generic manifest Job. Denied by
-  default; admins bypass it;
+  (`manifestHosting.approvedImages`) as a generic manifest Job. Admins bypass
+  it;
 - `complete_unmerged_pr` — approve or auto-complete a job whose delivered pull
   request has not been merged. Without it, a job that opened a pull request stays
   in review until that pull request lands: approval is refused, and a job that
   would complete itself is routed to review instead. Merging the pull request is
   the normal way past this, not the grant;
 - `model_selection` — restrict the selectable model set;
-- `autonomy_ceiling` — cap worker-job autonomy; and
+- `autonomy_ceiling` — cap worker-job autonomy. A Job still starts at Review
+  unless the user or the expert picks more; and
 - `permission_mode` — cap persistent-session permission mode.
 
 An unavailable choice may be greyed out with **Requires a capability grant**.
@@ -132,7 +145,7 @@ default is Container for jobs and Virtual for sessions; an operator can change i
 | **Virtual** | Fast file tools without starting a workspace container; the files are kept in SRW's own storage between turns and resumes; file Canvas can work when the backing store is materializable by the orchestrator | No shell, direct browser, git, repository checkout, live application, or shared browser. Its own files are not in your cloud storage; the agent hands you one as a link in chat. Attached Nextcloud folders (a project folder at Read-only or Read-write, My cloud, the session outbox) are reached at `cloud/<name>` with file tools; a Protected folder, or a cloud without the Virtual delivery yet, needs a Container. A process-local development store cannot be presented on Canvas. |
 | **Container** (`sandbox` internally) | Isolated files plus shell, git, repository checkout, and direct browser support; the current Protected Cloud session path also requires this tier | Slower cold start. Individual tools still depend on the expert, tool selection, grants, and service configuration. This is the proven live-app/shared-browser path. |
 | **None** | Chat with no workspace | No workspace file, shell, direct browser, git, or repository tools. Web research, databases, and knowledge may still work when independently configured and attached. |
-| **VM** | A full per-session virtual machine for work that needs VM isolation or sudo/root access | Per-session opt-in only; never a saved default. Requires the `vm_workspace` grant, operator enablement, and an available VM provisioner. Current file Canvas and shared-browser VM support are not promised. |
+| **VM** | A full per-session virtual machine for work that needs VM isolation or sudo/root access | Per-session opt-in only; never a saved default. Requires the `vm_workspace` grant, operator enablement, and an available VM provisioner. On a VM running on the same cluster as SRW, the Canvas and the shared browser work as on a Container (saving Canvas files needs the server's VM remote operations; otherwise they are view-only); over a tailnet they do not. |
 
 A running session's **Session settings** panel (in the chat header's **More
 actions** (⋮) menu, or behind the model or permission-mode badge) shows

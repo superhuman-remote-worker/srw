@@ -82,7 +82,7 @@ def catalogue_wire(monkeypatch):
         clear_project_default_expert=AsyncMock(return_value=True),
         set_project_default_expert=AsyncMock(),
     )
-    settings = SimpleNamespace(experts_enabled=True, skills_enabled=True)
+    settings = SimpleNamespace(experts_enabled=True)
     state = ExpertCatalogState(experts=[], library=[], skills=[])
     catalog = ExpertCatalogService(
         ExpertCatalogDependencies(
@@ -91,7 +91,6 @@ def catalogue_wire(monkeypatch):
             get_config_dir=catalogue_composition.get_config_dir,
             load_settings_matrix=main.app.state.catalogue_resources.load_settings_matrix,
             experts_enabled=lambda: settings.experts_enabled,
-            skills_enabled=lambda: settings.skills_enabled,
             account_defaults_layer=AsyncMock(return_value={}),
             visible_project_ids=AsyncMock(return_value=[]),
             with_validated_tool_overrides=session_tool_policy_module.with_validated_tool_overrides,
@@ -163,7 +162,6 @@ def expert_row(**extra):
             {"name": "quiet", "display_name": "Quiet", "expert_type": "worker"},
             "experts_enabled",
         ),
-        ("/api/skills", {"files": {"SKILL.md": SKILL_TEXT}}, "skills_enabled"),
     ],
 )
 def test_disabled_authoring_precedes_identity(

@@ -57,6 +57,12 @@ export interface FilePreview {
   uploadStatus: UploadStatus;
   /** Error message if upload failed */
   error?: string;
+  /**
+   * A dictation recording whose transcript is in the composer text. It
+   * uploads to `uploads/` with the message and the agent is told where it is,
+   * but it is never shown as a chip (dictation_composer_redesign.md D1).
+   */
+  dictation?: boolean;
 }
 
 /**

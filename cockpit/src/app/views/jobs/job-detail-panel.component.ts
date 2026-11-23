@@ -28,6 +28,8 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
 import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
 import {subagentStatusTone} from '../../core/util/subagent-status';
+import {jobPhases, phasesValueKey} from '../../core/util/phases';
+import {jobDisplayName} from '../../core/util/job-name';
 import {workspaceCreationMessageKey, workspaceCreationMessageParams} from '../../core/util/workspace-creation';
 import {LiveSession} from '../../core/models/live-session.model';
 import {JobLiveSessionPanelComponent} from './job-live-session-panel.component';
@@ -107,6 +109,21 @@ export function jobExpertLabel(
 ): string | null {
   const name = job.expert_display_name?.trim();
   return name || job.config_name || null;
+}
+
+/**
+ * The i18n key of the "Plans in phases" value ("Yes" / "No"), or null when
+ * the job's value is unknown and the row is left out.
+ *
+ * Read from what the server returns for the job (the loaded detail, else the
+ * list row), never derived from `config_override`: a value the job got from
+ * its Expert or project is not in its own override.
+ */
+export function jobPhasesFactKey(
+  job: Pick<JobSummary, 'phases'> | null,
+  detail: Pick<Job, 'phases'> | null,
+): string | null {
+  return phasesValueKey(jobPhases(detail) ?? jobPhases(job));
 }
 
 function safeParse(value: string): Record<string, unknown> | null {
@@ -270,6 +287,21 @@ export function heldForReviewReason(
 }
 
 /**
+ * Why a Job is paused, when the server said so: a workspace hold records its
+ * cause as the row's `error_message` (e.g. the workspace ran out of memory,
+ * and what the next Resume does about it). Both lanes clear the message when
+ * a job runs again, so it is never a stale one. VM-creation and workspace
+ * recovery messages already render above.
+ */
+export function pausedReason(
+  job: Pick<JobSummary, 'status' | 'error_message' | 'vm_creation' | 'workspace_recovery'> | null,
+): string | null {
+  if (!job || job.status !== 'paused' || job.vm_creation || job.workspace_recovery) return null;
+  const reason = (job.error_message ?? '').trim();
+  return reason || null;
+}
+
+/**
  * Why a Job failed, when the server said so (e.g. its workspace image could
  * not be pulled). VM-creation messages already render above.
  */
@@ -323,6 +355,12 @@ export function failureReason(
           <span class="fact-label">{{ 'jobs.detail.expert' | transloco }}</span>
           <span class="fact-value">{{ expertLabel() || '—' }}</span>
         </div>
+        @if (phasesKey(); as key) {
+          <div class="fact" data-testid="job-phases-fact">
+            <span class="fact-label">{{ 'jobs.detail.phases' | transloco }}</span>
+            <span class="fact-value">{{ key | transloco }}</span>
+          </div>
+        }
         <div class="fact">
           <span class="fact-label">{{ 'jobs.detail.model' | transloco }}</span>
           <span class="fact-value" [class.muted]="!modelLabel()">
@@ -396,6 +434,12 @@ export function failureReason(
         <section class="recovery-detail attention held-detail">
           <strong>{{ 'jobs.failureReason' | transloco }}</strong>
           <span>{{ failed }}</span>
+        </section>
+      }
+      @if (!workspaceCreation() && pausedReason(job()); as paused) {
+        <section class="recovery-detail attention held-detail">
+          <strong>{{ 'jobs.detail.pausedReason' | transloco }}</strong>
+          <span>{{ paused }}</span>
         </section>
       }
       @if (heldForReviewReason(job()); as held) {
@@ -533,7 +577,7 @@ export function failureReason(
                   </td>
                   <td class="sub-desc">
                     <span class="sub-desc-text" [title]="sub.description">
-                      {{ sub.description }}
+                      {{ jobName(sub) }}
                     </span>
                     @if (sub.error_message) {
                       <span class="sub-error" [title]="sub.error_message">
@@ -961,6 +1005,7 @@ export function failureReason(
 })
 export class JobDetailPanelComponent {
   readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
+  readonly jobName = jobDisplayName;
   readonly workspaceCreationMessageKey = workspaceCreationMessageKey;
   readonly workspaceCreationMessageParams = workspaceCreationMessageParams;
   readonly job = input.required<JobSummary>();
@@ -1033,6 +1078,7 @@ export class JobDetailPanelComponent {
   protected readonly formatCount = formatCount;
   protected readonly heldForReviewReason = heldForReviewReason;
   protected readonly failureReason = failureReason;
+  protected readonly pausedReason = pausedReason;
   protected readonly formatUsd = formatUsd;
   protected readonly shortId = shortJobId;
   protected readonly isTerminal = isTerminalJobStatus;
@@ -1109,6 +1155,7 @@ export class JobDetailPanelComponent {
   readonly subtreeJobCount = computed(() => this.data()?.usageSubtree?.job_count ?? 0);
   readonly modelLabel = computed(() => jobModelLabel(this.data()?.detail ?? null));
   readonly expertLabel = computed(() => jobExpertLabel(this.job()));
+  readonly phasesKey = computed(() => jobPhasesFactKey(this.job(), this.data()?.detail ?? null));
 
   readonly durationLabel = computed(() =>
     formatDurationSeconds(this.data()?.progress?.elapsed_seconds),

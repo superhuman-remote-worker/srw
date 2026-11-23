@@ -11,6 +11,7 @@ import {
   browserStreamUrl,
   encodeBrowserControl,
   encodeBrowserInput,
+  normalizeBrowserAddress,
   parseBrowserServerMessage,
 } from './canvas-browser-protocol';
 
@@ -100,8 +101,19 @@ describe('shared-browser binary protocol', () => {
         title: 'Example',
         loading: false,
       },
+      viewportControl: false,
     });
     expect(parsed?.type === 'state' && 'generation' in parsed.state).toBe(false);
+  });
+
+  it('accepts the opt-in viewport capability only as a boolean outside page state', () => {
+    for (const advertised of [true, false]) {
+      const parsed = parseBrowserServerMessage(
+        serverJson(BROWSER_MESSAGE_TYPE.STATE, state({ viewport_control: advertised })),
+      );
+      expect(parsed?.type === 'state' && parsed.viewportControl).toBe(advertised);
+      expect(parsed?.type === 'state' && 'viewport_control' in parsed.state).toBe(false);
+    }
   });
 
   it.each([
@@ -116,6 +128,8 @@ describe('shared-browser binary protocol', () => {
     state({ url: 'u'.repeat(BROWSER_MAX_URL_CHARS + 1) }),
     state({ title: 't'.repeat(BROWSER_MAX_TITLE_CHARS + 1) }),
     state({ loading: 0 }),
+    state({ viewport_control: 'yes' }),
+    state({ viewport_control: null }),
     { ...state(), extra: true },
     { ...state(), viewport: { width: 1280, height: 720, scale: 1 } },
     [],
@@ -248,6 +262,33 @@ describe('shared-browser binary protocol', () => {
       body: { kind: 'insertText', params: { text: 'hunter2' } },
     });
 
+    expect(
+      decodeClient(encodeBrowserControl({ op: 'set_viewport', width: 390, height: 844 })),
+    ).toEqual({
+      type: BROWSER_MESSAGE_TYPE.CONTROL,
+      body: { op: 'set_viewport', width: 390, height: 844 },
+    });
+    expect(
+      decodeClient(
+        encodeBrowserControl({ op: 'client_features', features: ['viewport_control'] }),
+      ),
+    ).toEqual({
+      type: BROWSER_MESSAGE_TYPE.CONTROL,
+      body: { op: 'client_features', features: ['viewport_control'] },
+    });
+    for (const bad of [
+      { op: 'set_viewport', width: 390.5, height: 844 },
+      { op: 'set_viewport', width: 0, height: 844 },
+      { op: 'set_viewport', width: 8193, height: 844 },
+      { op: 'set_viewport', width: '390', height: 844 },
+      { op: 'set_viewport', width: 390 },
+      { op: 'set_viewport', width: 390, height: 844, scale: 2 },
+      { op: 'client_features', features: ['telepathy'] },
+      { op: 'client_features', features: 'viewport_control' },
+      { op: 'client_features', features: ['viewport_control', 'viewport_control'] },
+    ]) {
+      expect(() => encodeBrowserControl(bad as never)).toThrow(TypeError);
+    }
     expect(() => encodeBrowserControl({ op: 'other' } as never)).toThrow(TypeError);
     expect(() => encodeBrowserControl({ op: 'back', url: 'extra' } as never)).toThrow(TypeError);
     expect(() => encodeBrowserInput({ kind: 'other', params: {} } as never)).toThrow(TypeError);
@@ -276,6 +317,29 @@ describe('shared-browser binary protocol', () => {
         url: 'x'.repeat(BROWSER_MAX_JSON_BYTES),
       }),
     ).toThrow();
+  });
+});
+
+describe('shared-browser address bar', () => {
+  it.each([
+    ['localhost:4200', 'http://localhost:4200'],
+    ['localhost', 'http://localhost'],
+    ['LOCALHOST:3000/path?q=1', 'http://LOCALHOST:3000/path?q=1'],
+    ['127.0.0.1:8000', 'http://127.0.0.1:8000'],
+    ['127.0.0.1', 'http://127.0.0.1'],
+    ['[::1]:3000/x', 'http://[::1]:3000/x'],
+    ['0.0.0.0:5173', 'http://0.0.0.0:5173'],
+    ['app.localhost:5173/', 'http://app.localhost:5173/'],
+    ['  localhost:4200  ', 'http://localhost:4200'],
+    ['example.com', 'https://example.com'],
+    ['example.com:8080/x', 'https://example.com:8080/x'],
+    ['localhost.example.com', 'https://localhost.example.com'],
+    ['https://localhost:8443/', 'https://localhost:8443/'],
+    ['http://example.com/', 'http://example.com/'],
+    ['javascript:alert(1)', 'javascript:alert(1)'],
+    ['', ''],
+  ])('gives %j the scheme the workspace daemon would', (typed, expected) => {
+    expect(normalizeBrowserAddress(typed)).toBe(expected);
   });
 });
 

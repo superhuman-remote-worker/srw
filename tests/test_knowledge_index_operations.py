@@ -15,6 +15,7 @@ service, plus the three that a move can silently drop:
   than a partially configured service, and every caller skips instead of
   writing vectorless rows.
 """
+# ruff: noqa: F811  (the imported fixture is requested by name as a test argument)
 
 import asyncio
 import uuid
@@ -26,6 +27,7 @@ import pytest
 from orchestrator.services import knowledge_index
 from orchestrator.services.kb_reindex import kb_index_lock
 from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
+from tests.tls_pin_fixtures import tls_certs  # noqa: F401
 
 
 PROJECT_ID = "99999999-8888-7777-6666-555555555555"
@@ -330,6 +332,54 @@ async def test_build_kb_embedding_service_sends_the_rows_served_model():
     )
     assert service.catalog_model == "embed-1-eu"
     assert service.model == "embed-1"
+
+
+@pytest.mark.asyncio
+async def test_build_kb_embedding_service_carries_the_endpoint_pin(tls_certs):
+    from shared.tls_pinning import TlsPin
+
+    wire = TlsPin.from_pem(tls_certs.leaf.read_text()).wire
+
+    async def inject(env: dict) -> None:
+        env.update(
+            {
+                "KB_EMBEDDING_API_KEY": "sk-test",
+                "KB_EMBEDDING_MODEL": "embed-1",
+                "KB_EMBEDDING_BASE_URL": "https://embed.example",
+                "KB_EMBEDDING_TLS_PINNED_CERT": wire,
+            }
+        )
+
+    service = await knowledge_index.build_kb_embedding_service(
+        dependencies=_dependencies(inject=inject)
+    )
+    assert service.tls_pin == TlsPin.from_wire(wire)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["unreadable", "!!not-a-cert!!"])
+async def test_build_kb_embedding_service_never_builds_unpinned_on_a_broken_pin(bad):
+    async def inject(env: dict) -> None:
+        env.update(
+            {
+                "KB_EMBEDDING_API_KEY": "sk-test",
+                "KB_EMBEDDING_MODEL": "embed-1",
+                "KB_EMBEDDING_BASE_URL": "https://embed.example",
+                "KB_EMBEDDING_TLS_PINNED_CERT": bad,
+            }
+        )
+
+    dependencies = _dependencies(inject=inject)
+    with patch("shared.runtime.services.embedding_service.EmbeddingService") as factory:
+        assert (
+            await knowledge_index.build_kb_embedding_service(dependencies=dependencies)
+            is None
+        )
+    factory.assert_not_called()
+    dependencies.logger.error.assert_called_once()
+    assert "KB_EMBEDDING_TLS_PINNED_CERT" in str(
+        dependencies.logger.error.call_args.args
+    )
 
 
 @pytest.mark.asyncio

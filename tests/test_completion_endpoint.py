@@ -184,6 +184,37 @@ class TestGetAutonomyLevel:
         job = {"id": "x", "resolved_config": {"agent": {}}}
         assert get_autonomy_level(job) == "review"
 
+    def test_a_row_without_resolved_config_reads_the_jobs_own_override(self):
+        """Seen live (k3d, 2026-11-17): job rows carry no resolved_config, so a
+        ``full`` job read as ``review`` and a critic's approval left it in
+        pending_review."""
+        job = {
+            "id": "x",
+            "resolved_config": None,
+            "config_name": "general-worker",
+            "config_override": {"autonomy": "full"},
+        }
+        assert get_autonomy_level(job) == "full"
+
+    def test_the_override_may_arrive_as_json_text(self):
+        job = {"id": "x", "config_override": '{"autonomy": "partial"}'}
+        assert get_autonomy_level(job) == "partial"
+
+    def test_a_row_without_resolved_config_and_without_override_reads_the_files(self):
+        from shared.runtime.core.loader import load_role_base
+
+        base = load_role_base("worker").get("autonomy") or "review"
+        assert get_autonomy_level({"id": "x", "config_name": "worker_base"}) == base
+        assert get_autonomy_level({"id": "x", "config_name": "no-such-expert"}) == base
+
+    def test_a_resolved_config_wins_over_the_override(self):
+        job = {
+            "id": "x",
+            "resolved_config": {"agent": {"autonomy": "review"}},
+            "config_override": {"autonomy": "full"},
+        }
+        assert get_autonomy_level(job) == "review"
+
 
 # =============================================================================
 # Freeze data tests

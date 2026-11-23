@@ -251,14 +251,15 @@ async def _share_with_owner(
         # later re-sync shares them once the account exists. But it IS the
         # difference between "the folder opens" and "the folder 404s", so
         # say so loudly here and hand the caller a `shared: false` it can
-        # surface. Backends that cannot provision accounts themselves
-        # (Nextcloud: user_oidc materialises the account on the user's
-        # first browser login) resolve to None until the user has signed
-        # in to the cloud at least once.
+        # surface. ensure_user resolves to None when the cloud has no
+        # account and none could be created (Nextcloud: SRW has no
+        # preferred_username for the user, or user_oidc is not set up as
+        # the chart sets it); the account then appears at the user's first
+        # cloud sign-in.
         logger.warning(
             "Job outbox: no %s account for user %s (email=%r) — folder "
-            "%s created but NOT shared; the user must sign in to the cloud "
-            "once before it becomes visible to them",
+            "%s created but NOT shared; it becomes visible to them once "
+            "they have a cloud account",
             backend.backend_id,
             owner.get("id"),
             owner.get("email"),

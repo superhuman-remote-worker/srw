@@ -455,7 +455,8 @@ def fence_skills_menu(menu: list[dict]) -> str:
     # Only the managed guide is left when use_skill is not bound
     # (scope_skills_for_tools), so the note does not name a tool the agent lacks.
     loader_note = (
-        "Load ordinary skills with use_skill(skill_name). "
+        "Load ordinary skills with use_skill(skill_name), and load a matching "
+        "skill before you build the deliverable it covers. "
         "A managed product guide explicitly marked with read_product_guide uses "
         "that reader instead. "
         if ordinary

@@ -11,6 +11,7 @@ import {
 } from '../models/turn.model';
 import type {MarkedToolResultState} from '../models/tool-result-state.model';
 import {ChatAttachment} from './persistent-chat.service';
+import type {McpQuestionOutcome} from '../models/mcp-question.model';
 
 /**
  * Pure reducer for ConversationState.
@@ -84,6 +85,16 @@ export type ReducerAction =
         type: 'permission_decision';
         toolUseId: string;
         decision: 'approved' | 'denied' | 'expired';
+        timestamp: number;
+    }
+    | {
+        /** An MCP server's question to the user was settled
+         *  (`question.resolved`). Marks the tool call it belongs to; a
+         *  question never changes the call's own status. */
+        type: 'question_decision';
+        toolUseId: string;
+        server: string;
+        outcome: McpQuestionOutcome;
         timestamp: number;
     }
     | { type: 'remove_turn'; id: string }
@@ -539,6 +550,34 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
                 };
                 return {...turn, events: replaceAt(turn.events, idx, updated)};
             });
+
+        case 'question_decision': {
+            // The call is in flight while its server asks, so it is in the
+            // active turn; a replay after its turn closed finds it in an
+            // earlier one. Newest first: a tool-call id is unique, but a
+            // recovered turn can briefly hold a copy.
+            for (let i = state.turns.length - 1; i >= 0; i--) {
+                const turn = state.turns[i];
+                if (turn.kind !== 'assistant') continue;
+                const idx = turn.events.findIndex(
+                    (e) => e.kind === 'tool_call' && e.id === action.toolUseId,
+                );
+                if (idx < 0) continue;
+                const existing = turn.events[idx] as ToolCallEvent;
+                const updated: ToolCallEvent = {
+                    ...existing,
+                    question: {server: action.server, outcome: action.outcome},
+                };
+                return {
+                    ...state,
+                    turns: replaceAt(state.turns, i, {
+                        ...turn,
+                        events: replaceAt(turn.events, idx, updated),
+                    }),
+                };
+            }
+            return state;
+        }
 
         default: {
             // Exhaustiveness check.

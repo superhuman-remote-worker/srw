@@ -21,6 +21,7 @@ on:
       - "docs-site/**"
       - "helm/values.yaml"
       - "helm/values.schema.json"
+      - "scripts/install-cli.sh"
       - "cockpit/public/favicon.svg"
       - ".github/workflows/docs.yml"
   workflow_dispatch:

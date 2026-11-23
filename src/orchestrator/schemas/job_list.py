@@ -66,6 +66,12 @@ class PublicJobListItem(BaseModel):
 
     id: UUID
     description: str
+    title: str | None = Field(
+        description=(
+            "Display name a person gave the job (PATCH /api/jobs/{id}); null "
+            "when it was never named. Show the description then."
+        )
+    )
     status: str
     completion_outcome_kind: str | None
     origin: str
@@ -129,6 +135,16 @@ class PublicJobListItem(BaseModel):
     )
     cloud_review_mode: str
     exported_folder_url: str | None
+    phases: bool | None = Field(
+        description=(
+            "Whether the job plans in phases: true (the planned procedure in "
+            "phases, for long work) or false (the job works on its task "
+            "directly and ends with job_complete). Decided when the job was "
+            "created, from its own override, the project default or its "
+            "expert. Null for a job from before this setting and for one on a "
+            "custom harness."
+        )
+    )
 
 
 class PublicJobListFilters(BaseModel):

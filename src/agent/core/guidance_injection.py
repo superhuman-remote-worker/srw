@@ -11,12 +11,17 @@ injection, D21).
 from typing import Any, Dict, List
 
 
-def format_supervisor_guidance(entries: List[Dict[str, Any]]) -> str:
+def format_supervisor_guidance(
+    entries: List[Dict[str, Any]], *, phased: bool = True
+) -> str:
     """Render all pending guidance entries as one [SUPERVISOR GUIDANCE] block.
 
     Args:
         entries: Pending guidance entries from the heartbeat inbox, each
             ``{id, text, source, created_at}``.
+        phased: False for a job that does not plan phases (it is not offered
+            ``next_phase_todos``): its header does not speak of a plan,
+            todos or re-planning.
 
     Returns:
         Formatted block, or "" when there is nothing to render.
@@ -35,9 +40,16 @@ def format_supervisor_guidance(entries: List[Dict[str, Any]]) -> str:
     if not lines:
         return ""
 
-    header = (
-        "[SUPERVISOR GUIDANCE] Mid-run guidance from your supervisor. "
-        "Your current plan and todos remain in force — fold this guidance "
-        "into the work in progress instead of re-planning."
-    )
+    if phased:
+        header = (
+            "[SUPERVISOR GUIDANCE] Mid-run guidance from your supervisor. "
+            "Your current plan and todos remain in force — fold this guidance "
+            "into the work in progress instead of re-planning."
+        )
+    else:
+        header = (
+            "[SUPERVISOR GUIDANCE] Mid-run guidance from your supervisor. "
+            "Your task remains in force — fold this guidance into the work in "
+            "progress."
+        )
     return header + "\n\n" + "\n".join(lines)

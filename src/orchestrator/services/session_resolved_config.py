@@ -33,8 +33,9 @@ from orchestrator.services.stateless_workspace_gate import thread_metadata_objec
 ResolvedConfigSource = Literal["snapshot", "legacy", "unavailable"]
 
 # Where a request is sent, rather than what it does: never shown, even unset.
-_TRANSPORT_KEYS = frozenset({"base_url", "env_keys"})
-_TRANSPORT_SUFFIX = "_base_url"
+# An endpoint's pinned certificate (``tls_pinned_cert``) is part of that.
+_TRANSPORT_KEYS = frozenset({"base_url", "env_keys", "tls_pinned_cert"})
+_TRANSPORT_SUFFIX = ("_base_url", "_tls_pinned_cert")
 
 
 def _without_transport(value: Any, parent: str | None = None) -> Any:

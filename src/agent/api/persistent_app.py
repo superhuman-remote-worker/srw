@@ -126,6 +126,7 @@ from agent.api.pinned_write_fence import PROCESS_PINNED_WRITE_FENCE
 from shared import event_journal as _event_journal
 from shared.pinned_session_identity import PINNED_SESSION_READY_IDENTITY_CONTRACT
 from shared.permission_modes import (
+    AUTONOMOUS,
     DEFAULT_PERMISSION_MODE,
     effect_asks,
     is_permission_mode,
@@ -424,11 +425,15 @@ def _close_runtime_authorization() -> None:
 
 
 def _register_session_mcp_tools(manager: Any) -> None:
-    """Replace (or clear) the process-global MCP entries of the tool registry."""
+    """Replace (or clear) the process-global MCP entries of the tool registry,
+    and let the manager's servers ask this Session's user their questions."""
 
     from agent.tools.registry import register_mcp_tools
 
     register_mcp_tools(manager)
+    set_handler = getattr(manager, "set_question_handler", None)
+    if callable(set_handler):
+        set_handler(_session_question_handler)
 
 
 async def _open_event_journal() -> None:
@@ -1280,6 +1285,13 @@ def _ensure_persistent_loop_started(
             on_tool_result=_loop_on_tool_result,
             permission_check=_loop_permission_check,
             announce_permission_batch=_loop_announce_permission_batch,
+            # A call a turn leaves un-run gets a not_run result: without one
+            # it is tool debt, which stops the executor claiming the next
+            # message. The gate records each call's final status.
+            close_unrun_calls=True,
+            permission_no_answer_status=lambda call_id: (
+                _session.tool_decisions.get(call_id) if _session is not None else None
+            ),
             current_permission_mode=_loop_current_permission_mode,
             on_turn_start=_loop_on_turn_start,
             on_turn_complete=_loop_on_turn_complete,
@@ -1617,6 +1629,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # --- Shutdown ---
+    if stateless:
+        # Every executor stop from here on is the intended SIGTERM drain: a
+        # claim loop that ends while the steps below settle must not hard-exit.
+        from agent.api.turn_executor import mark_lifespan_stopping
+
+        mark_lifespan_stopping()
     logger.info("Shutting down persistent agent")
 
     attaching = any(
@@ -2292,6 +2310,7 @@ def session_transport_bindings() -> SessionTransportBindings:
             welcome=SessionWelcomePorts(
                 durable_control_modes=lambda: _durable_session_control_modes(),
                 pending_permissions=lambda: _pending_permission_requests(),
+                pending_questions=lambda: _pending_question_requests(),
                 running_tool=lambda session: _welcome_running_tool(session),
                 running_tools=lambda session: _welcome_running_tools(session),
             ),
@@ -2339,19 +2358,30 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
     @app.get("/health")
     async def health():
         app_guide = _app_guide_health()
-        return JSONResponse(
-            {
-                "status": (
-                    "healthy" if app_guide.get("state") == "ready" else "degraded"
-                ),
-                "mode": "stateless" if _stateless_mode() else "persistent",
-                "thread_id": _session_identity.thread_id,
-                "uptime_seconds": (datetime.now() - _started_at).total_seconds()
-                if _started_at
-                else 0,
-                "app_guide": app_guide,
-            }
-        )
+        stateless = _stateless_mode()
+        stopped = False
+        if stateless:
+            from agent.api.turn_executor import executor_stopped_unexpectedly
+
+            stopped = executor_stopped_unexpectedly()
+        payload = {
+            "status": (
+                "unhealthy"
+                if stopped
+                else "healthy"
+                if app_guide.get("state") == "ready"
+                else "degraded"
+            ),
+            "mode": "stateless" if stateless else "persistent",
+            "thread_id": _session_identity.thread_id,
+            "uptime_seconds": (datetime.now() - _started_at).total_seconds()
+            if _started_at
+            else 0,
+            "app_guide": app_guide,
+        }
+        if stateless:
+            payload["executor"] = "stopped" if stopped else "running"
+        return JSONResponse(payload, status_code=503 if stopped else 200)
 
     @app.post("/api/lifecycle/termination-fence")
     async def termination_fence(request: Request):
@@ -6052,7 +6082,6 @@ async def _loop_on_tool_execution_start(tool_name: str, tool_call_id: str) -> No
     """Latch the exact claim/turn crossing a real tool's effect boundary."""
 
     global _tool_inflight
-    del tool_name
     if not await _loop_runtime_effect_authority_current():
         if not _protected_cloud_runtime_ready():
             _session_input.schedule_protected_reclaim()
@@ -6086,6 +6115,11 @@ async def _loop_on_tool_execution_start(tool_name: str, tool_call_id: str) -> No
         _tool_inflight_calls.clear()
     _tool_inflight_calls.add(str(tool_call_id or ""))
     _tool_inflight = True
+    # An MCP server's question during this call names it on its card. The
+    # callback returns straight into ``tool.ainvoke`` in this task.
+    from agent.tools.mcp.manager import RUNNING_TOOL_CALL
+
+    RUNNING_TOOL_CALL.set((str(tool_name), str(tool_call_id or "")))
 
 
 async def _loop_on_tool_result(
@@ -6159,9 +6193,18 @@ _PERMISSION_POLL_SECONDS: float = 1.0
 
 
 async def _insert_permission_request(
-    tool_call_id: str, tool_name: str, tool_args: Dict[str, Any]
+    tool_call_id: str,
+    tool_name: str,
+    tool_args: Dict[str, Any],
+    *,
+    kind: str = "tool",
+    request: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """INSERT a pending row and return its UUID. None on failure."""
+    """INSERT a pending row and return its UUID. None on failure.
+
+    ``kind='question'`` holds an MCP server's question (its card in
+    ``request``) instead of a tool's approval."""
+    request_json = json.dumps(_safe_serialize(request)) if request is not None else None
     if (
         _session is None
         or _session.postgres_conn is None
@@ -6217,13 +6260,15 @@ async def _insert_permission_request(
                     row_id = await conn.fetchval(
                         "INSERT INTO thread_permission_requests "
                         "(thread_id, tool_call_id, tool_name, tool_args, "
-                        " accepted_lease_token) "
-                        "VALUES ($1, $2, $3, $4::jsonb, $5::bigint) "
+                        " kind, request, accepted_lease_token) "
+                        "VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7::bigint) "
                         "RETURNING id",
                         _session_identity.thread_id,
                         tool_call_id,
                         tool_name,
                         json.dumps(_safe_serialize(tool_args)),
+                        kind,
+                        request_json,
                         int(handle.lease_token),
                     )
                 return str(row_id) if row_id is not None else None
@@ -6232,13 +6277,15 @@ async def _insert_permission_request(
             # autocommit shape.
             row_id = await conn.fetchval(
                 "INSERT INTO thread_permission_requests "
-                "(thread_id, tool_call_id, tool_name, tool_args) "
-                "VALUES ($1, $2, $3, $4::jsonb) "
+                "(thread_id, tool_call_id, tool_name, tool_args, kind, request) "
+                "VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb) "
                 "RETURNING id",
                 _session_identity.thread_id,
                 tool_call_id,
                 tool_name,
                 json.dumps(_safe_serialize(tool_args)),
+                kind,
+                request_json,
             )
         return str(row_id) if row_id is not None else None
     except Exception as e:
@@ -6294,6 +6341,7 @@ async def _has_terminal_permission_decision(tool_call_id: str) -> bool:
                 "SELECT 1 FROM thread_permission_requests "
                 "WHERE thread_id = $1 AND tool_call_id = $2 "
                 "  AND status IN ('approved', 'denied') "
+                "  AND kind = 'tool' "
                 "LIMIT 1",
                 _session_identity.thread_id,
                 tool_call_id,
@@ -6598,6 +6646,7 @@ async def _pending_permission_requests() -> List[Dict[str, Any]]:
                 "SELECT id, tool_call_id, tool_name, tool_args "
                 "FROM thread_permission_requests "
                 "WHERE thread_id = $1 AND status = 'pending' "
+                "  AND kind = 'tool' "
                 "ORDER BY requested_at ASC",
                 _session_identity.thread_id,
             )
@@ -6913,6 +6962,7 @@ async def _resolve_pending_permission(
                     "UPDATE thread_permission_requests "
                     "SET status = $2, decided_at = now(), decided_by = $3 "
                     "WHERE id = $1 AND thread_id = $4 AND status = 'pending' "
+                    "  AND kind = 'tool' "
                     "RETURNING id, status, tool_call_id, thread_id",
                     approval_id,
                     decision,
@@ -6926,6 +6976,7 @@ async def _resolve_pending_permission(
                     "WHERE id = ("
                     "  SELECT id FROM thread_permission_requests "
                     "  WHERE thread_id = $1 AND status = 'pending' "
+                    "    AND kind = 'tool' "
                     "  ORDER BY requested_at DESC LIMIT 1"
                     ") "
                     "RETURNING id, status, tool_call_id, thread_id",
@@ -7024,6 +7075,7 @@ async def _loop_permission_check(
                         "SELECT id, status FROM thread_permission_requests "
                         "WHERE thread_id = $1 AND tool_call_id = $2 "
                         "  AND status IN ('approved', 'denied', 'pending') "
+                        "  AND kind = 'tool' "
                         "ORDER BY decided_at DESC NULLS LAST, requested_at DESC "
                         "LIMIT 1",
                         _session_identity.thread_id,
@@ -7150,6 +7202,232 @@ async def _loop_permission_check(
         return outcome
     finally:
         _gates_in_flight.discard(tool_call_id)
+
+
+async def _pending_question_requests() -> List[Dict[str, Any]]:
+    """Every MCP server question still waiting on this Session's user, shaped
+    like the ``question.request`` broadcast, for the ``session.state`` welcome
+    frame (a reload must be able to answer the card). Soft-fails to ``[]``."""
+    if (
+        _session is None
+        or _session.postgres_conn is None
+        or _session_identity.thread_id is None
+    ):
+        return []
+    from shared.mcp_questions import question_card
+
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, tool_call_id, request "
+                "FROM thread_permission_requests "
+                "WHERE thread_id = $1 AND status = 'pending' "
+                "  AND kind = 'question' "
+                "ORDER BY requested_at ASC",
+                _session_identity.thread_id,
+            )
+    except Exception as e:
+        logger.warning("Pending question lookup failed: %s", e)
+        return []
+    cards: List[Dict[str, Any]] = []
+    for row in rows:
+        request = row["request"]
+        if isinstance(request, str):
+            try:
+                request = json.loads(request)
+            except Exception:
+                request = {}
+        cards.append(question_card(row["tool_call_id"], row["id"], request))
+    return cards
+
+
+#: How often a question's wait checks for a Stop of its turn.
+_QUESTION_INTERRUPT_POLL_SECONDS: float = 0.5
+
+
+async def _wait_for_question_answer(request_id: str) -> str:
+    """The permission wait, ended also by any interrupt pending for this turn.
+
+    A tool's gate is answered before its tool runs, so a Stop reaches it as a
+    hard interrupt. A question is asked while its tool runs, and a Stop with a
+    tool in flight is graceful: it waits for the tool, which waits for the
+    answer, so the card stayed until the pod went away (k3d, 2026-11-17).
+    Here a pending interrupt of the current turn (a person's Stop, the
+    executor shutting down, a lost lease) ends the wait as ``interrupted``:
+    the server hears ``cancel``, its tool returns, and the Stop completes.
+    """
+    waiting = asyncio.create_task(_wait_for_permission_resolution(request_id))
+    try:
+        while True:
+            done, _pending = await asyncio.wait(
+                {waiting}, timeout=_QUESTION_INTERRUPT_POLL_SECONDS
+            )
+            if waiting in done:
+                return waiting.result()
+            if _session_input.peek_interrupt_cause() is not None:
+                logger.info(
+                    "MCP question %s ends unanswered: its turn was stopped", request_id
+                )
+                return "interrupted"
+    finally:
+        if not waiting.done():
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
+
+
+async def _retire_unanswered_question(request_id: str) -> str:
+    """Expire a question its call can no longer use; return the row's status.
+
+    A tool's gate stays pending after Stop, because the turn that calls the
+    tool again picks it up. A question belongs to one call: once that call has
+    ended, an answer has nowhere to go, and a pending row would put the card
+    back on every reload with buttons that do nothing. So it is retired as a
+    non-decision ('expired', which the server hears as ``cancel``). A decision
+    that landed first is kept and returned.
+    """
+    if _session is None or _session.postgres_conn is None:
+        return "unavailable"
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            await conn.execute(
+                "UPDATE thread_permission_requests "
+                "SET status = 'expired', decided_at = now(), "
+                "    decided_by = 'system' "
+                "WHERE id = $1 AND status = 'pending' AND kind = 'question'",
+                request_id,
+            )
+            status = await conn.fetchval(
+                "SELECT status FROM thread_permission_requests WHERE id = $1",
+                request_id,
+            )
+    except Exception as e:
+        logger.warning(
+            "Retiring an unanswered MCP question failed (id=%s): %s", request_id, e
+        )
+        return "unavailable"
+    return str(status) if status is not None else "expired"
+
+
+async def _session_question_handler(question: Any) -> Any:
+    """Ask this Session's user an MCP server's question, on a card.
+
+    Owner decisions of 2026-11-17 (knowledge-base/knowledge/features/
+    mcp_client_2026_07_28_elicitation.md): in ``autonomous`` mode nobody is
+    asked and the connector's setting holds (``None``); in ``read_only`` and
+    ``auto_accept`` the card asks, with "Always accept in this session" for a
+    yes/no. The question waits in ``thread_permission_requests``
+    (``kind='question'``) on the same durable wait as a tool's approval, so a
+    Stop, an untethered expiry or the end of the Session answers ``cancel``,
+    never a refusal the user did not make.
+    """
+    from agent.tools.mcp.manager import QuestionAnswer
+    from shared.mcp_questions import question_card
+
+    if _session is None:
+        return None
+    # A committed mid-turn mode change applies to this question too.
+    await _drain_current_thread_controls()
+    if _session is None:
+        return None
+    if normalize_permission_mode(_session.permission_mode) == AUTONOMOUS:
+        return None
+
+    tool_call_id = question.tool_call_id or f"mcp-question-{uuid4()}"
+    request = {
+        "server": question.server,
+        "server_slug": question.server_slug,
+        "datasource_id": question.datasource_id,
+        "tool": question.tool,
+        "mode": question.mode,
+        "message": question.message,
+        "schema": question.requested_schema,
+        "url": question.url,
+        "confirmation": question.confirmation,
+        # The form's field order: JSONB keeps an array's order, never an
+        # object's keys', and the card shows the fields as the server asked.
+        "field_order": list((question.requested_schema or {}).get("properties") or {}),
+    }
+    request_id = await _insert_permission_request(
+        tool_call_id,
+        question.tool or f"mcp__{question.server_slug}",
+        {},
+        kind="question",
+        request=request,
+    )
+    if request_id is None:
+        return QuestionAnswer(
+            "decline",
+            note=f"[server question] {question.server} asked a question SRW "
+            "could not show to the user, so SRW declined it.",
+        )
+    _broadcast("question.request", question_card(tool_call_id, request_id, request))
+    if (
+        _officer_cfg() is None
+        and _orchestrator_client is not None
+        and _session_identity.thread_id is not None
+    ):
+        if _stateless_mode():
+            await _safe_mark_stateless_natural_pause(require_untethered=True)
+        elif not _subscribers:
+            asyncio.create_task(
+                _safe_set_thread_status("awaiting_user"),
+                name="mcp-question-awaiting-user",
+            )
+
+    try:
+        final_status = await _wait_for_question_answer(request_id)
+    except asyncio.CancelledError:
+        # The call was cancelled while its question waited. Close the card
+        # before the call unwinds; the server's request ends with the call.
+        status = await asyncio.shield(_retire_unanswered_question(request_id))
+        _broadcast(
+            "question.resolved",
+            {
+                "id": tool_call_id,
+                "approval_id": request_id,
+                "server": question.server,
+                "decision": status,
+            },
+        )
+        raise
+    if final_status not in ("approved", "denied", "expired"):
+        # A Stop, or a database the wait could not read.
+        final_status = await _retire_unanswered_question(request_id)
+    response: Dict[str, Any] = {}
+    if final_status == "approved" and _session is not None:
+        try:
+            async with _session.postgres_conn.acquire() as conn:
+                raw = await conn.fetchval(
+                    "SELECT response FROM thread_permission_requests WHERE id = $1",
+                    request_id,
+                )
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            response = dict(raw) if isinstance(raw, dict) else {}
+        except Exception as e:
+            # The accept is recorded but its content is unreadable: send no
+            # answer rather than an empty one the user never gave.
+            logger.warning("MCP question answer unreadable (id=%s): %s", request_id, e)
+            final_status = "unavailable"
+    _broadcast(
+        "question.resolved",
+        {
+            "id": tool_call_id,
+            "approval_id": request_id,
+            "server": question.server,
+            "decision": final_status,
+        },
+    )
+    if final_status == "approved":
+        content = response.get("content")
+        return QuestionAnswer(
+            "accept",
+            content if isinstance(content, dict) else None,
+            always_accept=response.get("always_accept") is True,
+        )
+    if final_status == "denied":
+        return QuestionAnswer("decline")
+    return QuestionAnswer("cancel")
 
 
 async def _resilient_cloud_sync(
@@ -10858,6 +11136,61 @@ async def _model_swap_fit_ladder(new_config: Any) -> Optional[str]:
     return None
 
 
+# The embedding and rerank env keys a live config update may change.
+_LIVE_EMBEDDING_ENV_KEYS = (
+    "EMBEDDING_PROVIDER",
+    "EMBEDDING_MODEL",
+    "EMBEDDING_SERVED_MODEL",
+    "EMBEDDING_BASE_URL",
+    "EMBEDDING_API_KEY",
+    "EMBEDDING_TLS_PINNED_CERT",
+    # The rerank slot is credential-bearing too; a change must round-trip
+    # through the orchestrator for base_url/api_key enrichment. The bound
+    # scorer keeps its attach-time transport until re-attach.
+    "RERANK_MODEL",
+    "RERANK_SERVED_MODEL",
+    "RERANK_BASE_URL",
+    "RERANK_API_KEY",
+    "RERANK_TLS_PINNED_CERT",
+)
+
+
+def _apply_live_embedding_env(
+    new_env_block: Dict[str, Any], names: tuple = _LIVE_EMBEDDING_ENV_KEYS
+) -> bool:
+    """Apply a live config update's embedding and rerank env keys.
+
+    Returns whether the block names any of ``names``; only then is anything
+    changed. A ``None`` value is not applied. The memory-embedding singleton
+    is reset so the next call builds its client from the new values.
+    """
+    if not any(k in new_env_block for k in names):
+        return False
+    from shared.runtime.core.transport_resolution import (
+        clear_replaced_endpoint_pins,
+        clear_served_model_env,
+    )
+
+    # A served string belongs to the model it came with: drop the old one of
+    # every slot this block touches before applying it.
+    clear_served_model_env(
+        sorted({k.split("_", 1)[0] for k in names if k in new_env_block})
+    )
+    applied = {
+        k: str(new_env_block[k])
+        for k in names
+        if k in new_env_block and new_env_block[k] is not None
+    }
+    # A pin belongs to the URL it came with: a new, unpinned URL names no pin,
+    # so the old one is dropped. A slot whose URL stays keeps its pin.
+    clear_replaced_endpoint_pins(applied)
+    os.environ.update(applied)
+    from shared.runtime.services import embedding_service as _embedding_module
+
+    _embedding_module._embedding_service = None
+    return True
+
+
 async def _handle_config_update(
     ws: WebSocket,
     config_override: Dict[str, Any],
@@ -10949,20 +11282,7 @@ async def _handle_config_update(
         # with the right base_url + api_key (custom/system endpoint or
         # built-in provider key) and returns the merged dict. Every managed
         # change must commit its generation before any local mutation.
-        embedding_env_keys = (
-            "EMBEDDING_PROVIDER",
-            "EMBEDDING_MODEL",
-            "EMBEDDING_SERVED_MODEL",
-            "EMBEDDING_BASE_URL",
-            "EMBEDDING_API_KEY",
-            # The rerank slot is credential-bearing too; a change must round-
-            # trip through the orchestrator for base_url/api_key enrichment.
-            # The bound scorer keeps its attach-time transport until re-attach.
-            "RERANK_MODEL",
-            "RERANK_SERVED_MODEL",
-            "RERANK_BASE_URL",
-            "RERANK_API_KEY",
-        )
+        embedding_env_keys = _LIVE_EMBEDDING_ENV_KEYS
         ds_update = datasource_ids is not None
         tools_update = bool(config_override.get("tools"))
         authorization_update = tools_update or ds_update or security_runtime_update
@@ -11229,28 +11549,7 @@ async def _handle_config_update(
 
         # Reset embedding singleton if embedding env keys changed.
         new_env_block = effective_override.get("env_keys") or {}
-        if any(k in new_env_block for k in embedding_env_keys):
-            from shared.runtime.core.transport_resolution import (
-                clear_served_model_env,
-            )
-
-            # A served string belongs to the model it came with: drop the old
-            # one of every slot this block touches before applying it.
-            clear_served_model_env(
-                sorted(
-                    {
-                        k.split("_", 1)[0]
-                        for k in embedding_env_keys
-                        if k in new_env_block
-                    }
-                )
-            )
-            for k in embedding_env_keys:
-                if k in new_env_block and new_env_block[k] is not None:
-                    os.environ[k] = str(new_env_block[k])
-            from shared.runtime.services import embedding_service as _embedding_module
-
-            _embedding_module._embedding_service = None
+        if _apply_live_embedding_env(new_env_block, embedding_env_keys):
             logger.info(
                 "Embedding hot-swapped: provider=%s, model=%s, base_url=%s",
                 new_env_block.get(

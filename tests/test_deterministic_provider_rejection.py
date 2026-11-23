@@ -741,8 +741,12 @@ async def _execute_once(
     *,
     base_url=BASE_URL,
     recover_after=None,
+    raise_error=None,
 ):
     """One worker execute invocation; returns (node result, wire requests).
+
+    ``raise_error``: the transport raises it instead of answering (a TLS-level
+    failure; no HTTP response exists).
 
     ``recover_after``: answer 200 once that many requests have failed.
     """
@@ -750,6 +754,8 @@ async def _execute_once(
 
     def respond(http_request):
         wire.append(json.loads(http_request.content))
+        if raise_error is not None:
+            raise raise_error
         if recover_after is not None and len(wire) > recover_after:
             return httpx.Response(200, json=_COMPLETION)
         return httpx.Response(status, json=payload)
@@ -1025,3 +1031,26 @@ def test_rejection_message_without_model_or_provider_fields_stays_legible():
     edge = _describe_llm_rejection(_openai_status(400, text=EDGE_400), CONTRIBUTOR)
     assert "provider edge" in edge
     assert "<html>" not in edge
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("worker_runtime")
+async def test_changed_pinned_certificate_fails_the_job_on_the_first_attempt(
+    request, tmp_path, monkeypatch
+):
+    """A pin failure is deterministic: one request, no outage freeze, and the
+    failed job carries the whole pin sentence, not the SDK's "Connection error."."""
+    from shared.tls_pinning import CertificateChangedError
+
+    pin_error = CertificateChangedError("llm.example", 443, "AA:BB", "CC:DD")
+    result, wire = await _execute_once(
+        request, tmp_path, monkeypatch, 0, None, raise_error=pin_error
+    )
+
+    assert len(wire) == 1
+    assert result["should_stop"] is True
+    assert result.get("freeze_data") is None
+    error = result["error"]
+    assert error["recoverable"] is False
+    assert error["message"] == str(pin_error)
+    assert "Connection error." not in error["message"]

@@ -169,6 +169,8 @@ def test_workspace_lifecycle_cutover_can_retire_only_after_convergence() -> None
         "orchestrator.workspaceLifecycleProtocolCutoverEnabled=false",
         "--set",
         "orchestrator.manifestContractCutoverEnabled=false",
+        "--set",
+        "orchestrator.vmRemoteOperationProtocol.enabled=false",
     )
     deployment = next(
         item
@@ -184,6 +186,8 @@ def test_workspace_lifecycle_cutover_can_retire_only_after_convergence() -> None
         "orchestrator.workspaceLifecycleProtocolCutoverEnabled=false",
         "--set",
         "orchestrator.workspaceCleanupReconciliationEnabled=true",
+        "--set",
+        "orchestrator.vmRemoteOperationProtocol.enabled=false",
     )
     cleanup_deployment = next(
         item

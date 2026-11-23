@@ -1009,8 +1009,13 @@ describe('ProjectDetailPageComponent cloud storage settings', () => {
     const {component} = createComponent();
     expect('toggleCloudReadOnly' in component).toBe(false);
     expect('settingsCloudReadOnly' in component).toBe(false);
-    expect(en.projectDetail.settings.cloudAccessHint).toContain('Cloud folders');
-    expect(de.projectDetail.settings.cloudAccessHint).toBeTruthy();
+    // The hint names the group of the Connectors tab that holds the level.
+    expect(en.projectDetail.settings.cloudAccessHint).toContain(
+      en.projectDetail.datasources.groups.included.title,
+    );
+    expect(de.projectDetail.settings.cloudAccessHint).toContain(
+      de.projectDetail.datasources.groups.included.title,
+    );
     expect('readOnlyAgent' in en.projectDetail.settings).toBe(false);
   });
 
@@ -1183,5 +1188,233 @@ describe("ProjectDetailPageComponent the project's own connectors", () => {
     component.projectDatasources.set([FOLDER]);
     component.updateDatasourceReadOnly('folder', 'true');
     expect(updateProjectDatasource).not.toHaveBeenCalled();
+  });
+});
+
+describe('ProjectDetailPageComponent connectors tab', () => {
+  const PROJECT = '22222222-2222-2222-2222-222222222222';
+
+  function linked(id: string, overrides: Partial<ProjectDatasource> = {}): ProjectDatasource {
+    return {...linkedDatasource(id), ...overrides};
+  }
+
+  const KB = linked('kb', {type: 'kb', managed_key: `project-kb:${PROJECT}`});
+  const FOLDER = linked('folder', {
+    type: 'cloud_folder',
+    connection_url: null,
+    config: {},
+    managed_key: `project-cloud:${PROJECT}`,
+  });
+  const COPY = linked('copy', {
+    type: 'cloud_folder_checkout',
+    connection_url: null,
+    config: {},
+    managed_key: `project-cloud-checkout:${PROJECT}`,
+  });
+
+  function withUpdate() {
+    const made = createComponent({drivers: BUILTIN_DRIVERS});
+    const updateProjectDatasource = vi.fn().mockReturnValue(of({status: 'updated'}));
+    (made.api as unknown as {updateProjectDatasource: unknown}).updateProjectDatasource =
+      updateProjectDatasource;
+    return {...made, updateProjectDatasource};
+  }
+
+  it("lists what SRW keeps for the project first, in a fixed order, then what was linked", () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    // As the server sends them: by link time, the knowledge base first.
+    component.projectDatasources.set([KB, linked('pg'), COPY, FOLDER, linked('mail', {type: 'email'})]);
+
+    const groups = component.connectorGroups();
+    expect(groups.map((group) => group.id)).toEqual(['included', 'linked']);
+    expect(groups[0].rows.map((ds) => ds.id)).toEqual(['folder', 'copy', 'kb']);
+    expect(groups[1].rows.map((ds) => ds.id)).toEqual(['pg', 'mail']);
+  });
+
+  it('always shows the linked group, since it carries the Link action', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    expect(component.connectorGroups()).toEqual([{id: 'linked', rows: []}]);
+
+    component.projectDatasources.set([FOLDER]);
+    expect(component.connectorGroups().map((group) => [group.id, group.rows.length])).toEqual([
+      ['included', 1],
+      ['linked', 0],
+    ]);
+  });
+
+  it('names a connector SRW keeps for what it is to the project', () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    expect(component.linkTitleKey(FOLDER)).toBe('datasources.platform.kind.projectCloud');
+    expect(component.linkTitleKey(KB)).toBe('datasources.platform.kind.projectKb');
+    // A member's own connector shows its name.
+    expect(component.linkTitleKey(linked('pg'))).toBeNull();
+  });
+
+  it('gives every type an icon, and an unknown one the generic icon', () => {
+    const {component} = createComponent();
+    expect(component.typeIcon('postgresql')).toBe('database');
+    expect(component.typeIcon('cloud_folder')).toBe('folder');
+    expect(component.typeIcon('a_driver_from_next_year')).toBe('storage');
+  });
+
+  it("lets a link's note be written everywhere but on a cloud folder", () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    expect(component.linkNoteEditable(linked('pg'))).toBe(true);
+    expect(component.linkNoteEditable(KB)).toBe(true);
+    expect(component.linkNoteEditable(FOLDER)).toBe(false);
+    expect(component.linkNoteEditable(COPY)).toBe(false);
+  });
+
+  it("does not copy the connector's description onto the link when the note is left as shown", () => {
+    const {component, updateProjectDatasource} = withUpdate();
+    component.projectDatasources.set([linked('pg', {description: 'Bookings and guests'})]);
+
+    component.editingLinkNote.set('pg');
+    component.saveLinkNote('pg', 'Bookings and guests ');
+
+    expect(updateProjectDatasource).not.toHaveBeenCalled();
+    expect(component.editingLinkNote()).toBeNull();
+  });
+
+  it('saves a changed note, and clears it when the text is removed', () => {
+    const {api, component, updateProjectDatasource} = withUpdate();
+    const row = linked('pg', {description: 'Bookings and guests', project_description: 'Read only here'});
+    // The list reloads after each save.
+    api.getProjectDatasources.mockReturnValue(of([row]));
+    component.projectDatasources.set([row]);
+
+    component.editingLinkNote.set('pg');
+    component.saveLinkNote('pg', 'Ask before any write');
+    expect(updateProjectDatasource).toHaveBeenLastCalledWith('project-a', 'pg', {
+      description: 'Ask before any write',
+    });
+
+    component.editingLinkNote.set('pg');
+    component.saveLinkNote('pg', '   ');
+    expect(updateProjectDatasource).toHaveBeenLastCalledWith('project-a', 'pg', {description: null});
+  });
+
+  it("shows a kept knowledge base's own wording as text, and only the project's note as the note", () => {
+    const {component} = createComponent({drivers: BUILTIN_DRIVERS});
+    // SRW's description reaches no agent (the server sends only the note).
+    expect(component.keptLink(KB)).toBe(true);
+    expect(component.linkNote({...KB, description: "This project's knowledge base"})).toBe('');
+    expect(
+      component.linkNote({...KB, description: 'Decisions only', project_description: 'Decisions only'}),
+    ).toBe('Decisions only');
+    // A connector its members linked: the note, else its own description.
+    expect(component.linkNote(linked('pg', {description: 'Bookings'}))).toBe('Bookings');
+  });
+
+  it("saves the first note on a kept knowledge base, though SRW's wording is shown", () => {
+    const {component, updateProjectDatasource} = withUpdate();
+    const kb = {...KB, description: "This project's knowledge base"};
+    component.projectDatasources.set([kb]);
+    // Left empty: nothing.
+    component.editingLinkNote.set('kb');
+    component.saveLinkNote('kb', '');
+    expect(updateProjectDatasource).not.toHaveBeenCalled();
+    // Written: saved.
+    component.editingLinkNote.set('kb');
+    component.saveLinkNote('kb', 'Decisions only');
+    expect(updateProjectDatasource).toHaveBeenLastCalledWith('project-a', 'kb', {
+      description: 'Decisions only',
+    });
+  });
+
+  it('asks before unlinking, and unlinks only once the user confirms', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const unlink = vi.fn().mockReturnValue(of({status: 'unlinked'}));
+    (api as unknown as {unlinkProjectDatasource: unknown}).unlinkProjectDatasource = unlink;
+    const pg = linked('pg');
+
+    component.askUnlink(pg);
+    expect(component.pendingUnlink()).toBe(pg);
+    expect(unlink).not.toHaveBeenCalled();
+
+    component.confirmUnlink();
+    expect(unlink).toHaveBeenCalledWith('project-a', 'pg');
+    expect(component.pendingUnlink()).toBeNull();
+  });
+
+  it('never offers to unlink what SRW keeps, and a dismissed dialog unlinks nothing', () => {
+    const {api, component} = createComponent({drivers: BUILTIN_DRIVERS});
+    const unlink = vi.fn().mockReturnValue(of({status: 'unlinked'}));
+    (api as unknown as {unlinkProjectDatasource: unknown}).unlinkProjectDatasource = unlink;
+
+    component.askUnlink(FOLDER);
+    expect(component.pendingUnlink()).toBeNull();
+    component.askUnlink(linked('pg'));
+    component.pendingUnlink.set(null);
+    component.confirmUnlink();
+    expect(unlink).not.toHaveBeenCalled();
+    for (const bundle of [en, de]) {
+      expect(bundle.projectDetail.datasources.unlinkDialog.title).toBeTruthy();
+      expect(bundle.projectDetail.datasources.unlinkDialog.message).toBeTruthy();
+    }
+  });
+
+  it('saves nothing once Escape has closed the editor', () => {
+    const {component, updateProjectDatasource} = withUpdate();
+    component.projectDatasources.set([linked('pg')]);
+
+    component.editingLinkNote.set('pg');
+    component.editingLinkNote.set(null);
+    // The blur that follows the field being removed.
+    component.saveLinkNote('pg', 'typed, then abandoned');
+
+    expect(updateProjectDatasource).not.toHaveBeenCalled();
+  });
+
+  it('links the connector picked from the list', () => {
+    const {api, component} = createComponent();
+    const pg = datasource('pg');
+    component.allDatasources.set([pg, datasource('other')]);
+
+    component.linkCandidate('pg');
+
+    expect(api.linkProjectDatasource).toHaveBeenCalledWith('project-a', 'pg', {});
+    expect(component.dsLinkId()).toBe('');
+  });
+
+  it('opens and closes the list of connectors to link', () => {
+    const {component} = createComponent();
+    expect(component.linkPickerOpen()).toBe(false);
+    component.toggleLinkPicker();
+    expect(component.linkPickerOpen()).toBe(true);
+    component.toggleLinkPicker();
+    expect(component.linkPickerOpen()).toBe(false);
+  });
+
+  it('sends whoever needs a new connector to the catalog, with this project as its scope', () => {
+    const {component} = createComponent();
+    const router = (component as unknown as {router: {navigate: ReturnType<typeof vi.fn>}}).router;
+
+    component.openNewConnector();
+
+    expect(router.navigate).toHaveBeenCalledWith(['/datasources'], {
+      queryParams: {project: 'project-a'},
+    });
+  });
+
+  it('has both group headings, and the label the app guide names, in English and German', () => {
+    for (const bundle of [en, de]) {
+      const strings = bundle.projectDetail.datasources;
+      expect(strings.groups.included.title).toBeTruthy();
+      expect(strings.groups.included.hint).toBeTruthy();
+      expect(strings.groups.linked.title).toBeTruthy();
+      expect(strings.groups.linked.hint).toBeTruthy();
+      expect(strings.picker.open).toBeTruthy();
+      expect(strings.emptyHint).toBeTruthy();
+    }
+    // config/skills/app-guide names these two; tests/test_app_guide_content.py
+    // holds the guide to them.
+    expect(en.projectDetail.datasources.cloudFolders.colAccess).toBe('Default access');
+    // One name for what SRW keeps, here and on Customize → Connectors.
+    expect(en.projectDetail.datasources.groups.included.title).toBe('Kept by SRW');
+    expect(en.projectDetail.datasources.groups.included.title).toBe(en.datasources.kept.title);
+    expect(de.projectDetail.datasources.groups.included.title).toBe(de.datasources.kept.title);
+    expect(en.datasources.platform.managedByProject).toContain('Kept by SRW');
+    expect(en.projectDetail.datasources.accessEnforcedBy).toBe('How SRW limits it:');
   });
 });

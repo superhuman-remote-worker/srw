@@ -23,6 +23,12 @@ import logging
 import httpx
 
 from shared.runtime.llm.structured_recovery import extract_json_candidate
+from shared.tls_pinning import (
+    TlsPin,
+    httpx_client_kwargs,
+    pin_applies,
+    read_stored_pin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +87,18 @@ def _infer_provider(model: str) -> str:
     return "openai"
 
 
-async def _resolve_triage_config(db) -> tuple[str, str, str] | None:
+async def _resolve_triage_config(
+    db,
+) -> tuple[str, str, str, TlsPin | None] | None:
     """Pull model, base_url, and api_key from the DB-backed config.
+
+    The fourth value is the endpoint row's pinned certificate (``None`` when it
+    stores none, or for the default OpenAI route).
 
     Returns None when the DB has no default configured or no usable key —
     the caller treats that as ``triage unavailable`` and queues the message.
+    A stored pin that can't be read also gives None: calling the endpoint
+    without its pin would verify it against the CA list instead.
     """
     if db is None:
         return None
@@ -99,6 +112,7 @@ async def _resolve_triage_config(db) -> tuple[str, str, str] | None:
         return None
 
     base_url: str | None = None
+    tls_pin: TlsPin | None = None
     try:
         if hasattr(db, "list_models") and hasattr(db, "get_system_llm_endpoint"):
             rows = await db.list_models(capabilities=["chat"], enabled_only=True)
@@ -117,6 +131,22 @@ async def _resolve_triage_config(db) -> tuple[str, str, str] | None:
                         endpoint = None
                     if isinstance(endpoint, dict):
                         base_url = endpoint.get("base_url")
+                        if pin_applies(base_url):
+                            try:
+                                tls_pin = read_stored_pin(
+                                    endpoint.get("tls_pin_cert"),
+                                    endpoint.get("tls_pin_sha256"),
+                                )
+                            except ValueError as e:
+                                logger.error(
+                                    "triage: endpoint %s has a pinned TLS "
+                                    "certificate that can't be read (%s); "
+                                    "trust it again or remove the pin in "
+                                    "Admin \u2192 Models",
+                                    provider_ref,
+                                    e,
+                                )
+                                return None
                 break
     except Exception as e:  # noqa: BLE001
         logger.debug("triage catalog lookup failed for %s: %s", model, e)
@@ -134,7 +164,7 @@ async def _resolve_triage_config(db) -> tuple[str, str, str] | None:
     if not api_key:
         return None
 
-    return model, base_url, api_key
+    return model, base_url, api_key, tls_pin
 
 
 async def triage_message(
@@ -166,7 +196,7 @@ async def triage_message(
         logger.debug("No LLM config available for message triage — defaulting to queue")
         return fallback
 
-    model, base_url, api_key = resolved
+    model, base_url, api_key, tls_pin = resolved
 
     phase_str = f"Phase {phase_number}" if phase_number is not None else "unknown phase"
     context = (
@@ -176,7 +206,9 @@ async def triage_message(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(
+            timeout=15, **httpx_client_kwargs(tls_pin, asynchronous=True)
+        ) as client:
             resp = await client.post(
                 f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},

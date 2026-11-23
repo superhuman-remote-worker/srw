@@ -276,7 +276,7 @@ def test_the_readonly_verdict():
     read_write = sorted({*GITEA_MCP_READ_TOOLS, *gate.GITEA_WRITE_TOOLS})
     refused = {
         "tool": "create_repo",
-        "error": "McpError: Unknown tool: create_repo",
+        "error": "MCPError: Unknown tool: create_repo",
     }
     good = {
         "status": "connected",

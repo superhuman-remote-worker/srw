@@ -191,7 +191,11 @@ ingress:
 # how to render an internal-only gateway, but deliberately provides no wildcard
 # viewer ingress/TLS; file viewing/editing is unaffected. For an isolated local
 # edge test, the chart can generate and reconcile its fixed restricted DB role.
+# The shared browser (Open browser in a Container Session's Canvas) is on by
+# default; set sharedBrowser.enabled: false to hide it.
 canvas:
+  sharedBrowser:
+    enabled: true
   livePreview:
     enabled: false
     deniedPorts: []

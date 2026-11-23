@@ -13,30 +13,31 @@
   min-height: 320px;
   flex-direction: column;
   background: var(--app-bg);
+  container-type: inline-size;
 }
 
+// Title and status share the first row; the address row gets the full pane
+// width, so the URL is not squeezed by the status pills at the default
+// (~585 px) Canvas width.
 .browser-toolbar {
-  display: flex;
-  min-width: 0;
-  min-height: 48px;
-  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    'title indicators'
+    'nav nav';
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 5px 12px;
+  min-width: 0;
+  flex: 0 0 auto;
   padding: 7px 12px;
   box-sizing: border-box;
   background: var(--panel-bg);
   border-bottom: 1px solid var(--border-color);
 }
 
-.browser-page {
-  display: grid;
-  flex: 1 1 auto;
-  min-width: 0;
-  gap: 5px;
-}
-
 .browser-title {
+  grid-area: title;
+  min-width: 0;
   overflow: hidden;
   color: var(--text-primary);
   font-size: 12px;
@@ -45,6 +46,7 @@
 }
 
 .browser-navigation {
+  grid-area: nav;
   display: flex;
   min-width: 0;
   align-items: center;
@@ -53,7 +55,7 @@
 
 .browser-url-label {
   display: flex;
-  min-width: 120px;
+  min-width: 96px;
   flex: 1 1 auto;
 }
 
@@ -102,8 +104,56 @@
 }
 
 .browser-indicators {
+  grid-area: indicators;
+  justify-self: end;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   color: var(--text-muted);
   font-size: 11px;
+}
+
+.browser-size {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  margin-left: 3px;
+  padding: 1px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-control);
+}
+
+.browser-size-option {
+  display: grid;
+  width: 26px;
+  height: 24px;
+  place-items: center;
+  padding: 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-control);
+}
+
+.browser-size-option:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--surface-2);
+}
+
+.browser-size-option[aria-pressed='true'] {
+  color: var(--accent-color);
+  background: color-mix(in srgb, var(--accent-color) 14%, transparent);
+}
+
+.browser-size-option:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 1px;
+}
+
+.browser-size-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .browser-connection,
@@ -159,24 +209,24 @@
   border-bottom: 1px solid var(--danger);
 }
 
+// The stage takes the space left by the toolbar, whatever the picture's size:
+// its measured size is what the page is sized to in Fit mode, so the canvas
+// must never feed back into it.
 .browser-stage {
   position: relative;
-  display: flex;
+  display: block;
   min-width: 0;
   min-height: 0;
-  flex: 1 1 auto;
-  align-items: center;
-  justify-content: center;
+  flex: 1 1 0;
   overflow: hidden;
   background: #15171b;
 }
 
+// Placed by the component (fitBrowserFrame): 1:1 CSS pixels, scaled down
+// only when the page is larger than the stage, centred on whole pixels.
 .browser-surface {
+  position: absolute;
   display: block;
-  width: 100%;
-  height: auto;
-  max-width: 100%;
-  max-height: 100%;
   background: white;
   outline: none;
   touch-action: none;
@@ -218,18 +268,9 @@
   }
 }
 
-@media (width <= 620px) {
+@container (width <= 420px) {
   .browser-toolbar {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .browser-indicators {
-    width: 100%;
-    flex-wrap: wrap;
-  }
-
-  .browser-navigation {
-    width: 100%;
+    column-gap: 8px;
+    padding-inline: 8px;
   }
 }

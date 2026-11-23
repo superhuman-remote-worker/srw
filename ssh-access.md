@@ -108,6 +108,9 @@ using a **Personal Access Token (PAT)**. Configure the PAT before connecting:
 2. Save it to `~/.config/srw/token` (create the file with mode `0600` — the helper
    warns on stderr if it's group- or world-readable, since it holds a bearer
    credential), **or** export it as `$SRW_TOKEN` in your shell.
+   The [`srw` command-line client](docs/cli.md) keeps its own files in the same
+   directory and reads this file too, when `SRW_API_URL` is set and `SRW_TOKEN`
+   is not.
 
 From there it's automatic: on **every** connection, `srw-ssh-proxy` exchanges that
 PAT for a fresh, short-lived *attach token* (`POST /api/ssh/attach-token`) before

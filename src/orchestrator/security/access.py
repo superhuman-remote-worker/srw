@@ -41,6 +41,7 @@ from uuid import UUID
 
 from fastapi import HTTPException, Request
 
+from orchestrator.security import token_scopes
 from orchestrator.security.auth import require_approved_user
 from orchestrator.security.config_redaction import (  # noqa: F401 — re-exported
     redact_config_override,
@@ -243,6 +244,40 @@ async def _denied(
         request=request,
     )
     return HTTPException(status_code=403, detail=detail)
+
+
+async def require_token_scopes(
+    request: Any,
+    db,
+    user: dict[str, Any],
+    *needed: str,
+    resource_type: str,
+    resource_id: str | None = None,
+) -> None:
+    """Check a personal access token's scopes below the route table.
+
+    The route table (``security.token_scopes``) decides from the method and
+    the path. A service calls this where the content of a request needs a
+    further scope, such as a manifest apply that carries a Job. It refuses
+    exactly as ``token_scopes.require_scopes`` does (a no-op for every other
+    credential) and records the refusal as the same ``token_scope_denied``
+    event the token resolver writes for a route, which a refusal raised in a
+    service would otherwise never leave.
+    """
+    try:
+        token_scopes.require_scopes(user, *needed)
+    except HTTPException as exc:
+        held = sorted(str(scope) for scope in user.get("scopes") or [])
+        await log_security_event(
+            db,
+            event_type="token_scope_denied",
+            user=user,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            detail=f"{exc.detail} (token scopes: {held})",
+            request=request,
+        )
+        raise
 
 
 # =============================================================================

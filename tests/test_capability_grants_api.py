@@ -58,13 +58,26 @@ from orchestrator.security import auth as auth_module
 from orchestrator.services import grant_enforcement as grant_enforcement_module
 
 _UID = "11111111-1111-1111-1111-111111111111"
+#: An administrator's global ``shell_tools: false``. The grant is on by
+#: default since 2026-11-11, so a test of the shell gate's denial, strip or
+#: safety re-check states the restriction instead of relying on the default.
+_SHELL_OFF = [{"key": "shell_tools", "value_json": False}]
+#: The same for the other grants opened by default on 2026-11-11.
+_DELEGATION_OFF = [{"key": "delegation", "value_json": False}]
+_VM_OFF = [{"key": "vm_workspace", "value_json": False}]
+_PERMISSION_AUTO_ACCEPT = [{"key": "permission_mode", "value_json": "auto_accept"}]
+_AUTONOMY_REVIEW = [{"key": "autonomy_ceiling", "value_json": "review"}]
 
 
-def _patch_grants_db(monkeypatch, *, user_rows=None, is_admin=False):
+def _patch_grants_db(monkeypatch, *, user_rows=None, is_admin=False, global_rows=None):
     fake = AsyncMock()
     fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": is_admin})
     fake.list_grants_for_scopes = AsyncMock(
-        return_value={"user": user_rows or [], "project": [], "global": []}
+        return_value={
+            "user": user_rows or [],
+            "project": [],
+            "global": list(global_rows or []),
+        }
     )
     monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     return fake
@@ -92,7 +105,7 @@ async def test_enforce_save_grants_admin_bypasses():
 async def test_enforce_save_grants_raises_422_for_ungranted(monkeypatch):
     fake = AsyncMock()
     fake.list_grants_for_scopes = AsyncMock(
-        return_value={"user": [], "project": [], "global": []}
+        return_value={"user": [], "project": [], "global": _SHELL_OFF}
     )
     fake.get_projects_for_user = AsyncMock(return_value=[])
     monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
@@ -111,7 +124,7 @@ async def test_enforce_save_grants_raises_422_for_ungranted(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_enforce_dispatch_grants_raises_grantdenied(monkeypatch):
-    _patch_grants_db(monkeypatch)
+    _patch_grants_db(monkeypatch, global_rows=_SHELL_OFF)
     with pytest.raises(grant_enforcement_module.GrantDenied) as ei:
         await grant_enforcement_module.enforce_dispatch_grants(
             {"tools": {"shell": ["ls"]}},
@@ -174,7 +187,9 @@ async def test_lifecycle_runner_allows_full_autonomy(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_user_runner_still_denies_full_autonomy(monkeypatch):
-    _patch_grants_db(monkeypatch)
+    # Under an administrator's review ceiling (the default is full since
+    # 2026-11-11), a user runner is held to it; the lifecycle runner below is not.
+    _patch_grants_db(monkeypatch, global_rows=_AUTONOMY_REVIEW)
     with pytest.raises(grant_enforcement_module.GrantDenied) as ei:
         await grant_enforcement_module.enforce_dispatch_grants(
             {"autonomy": "full"},
@@ -190,7 +205,7 @@ async def test_user_runner_still_denies_full_autonomy(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_lifecycle_runner_keeps_owner_capability_limits(monkeypatch):
-    _patch_grants_db(monkeypatch)
+    _patch_grants_db(monkeypatch, global_rows=_VM_OFF)
     with pytest.raises(grant_enforcement_module.GrantDenied) as ei:
         await grant_enforcement_module.enforce_dispatch_grants(
             {"autonomy": "full", "workspace": {"backend": "vm"}},
@@ -208,13 +223,14 @@ async def test_lifecycle_runner_keeps_owner_capability_limits(monkeypatch):
 @pytest.mark.asyncio
 async def test_enforce_session_create_grants_raises_422_for_denied_mode(monkeypatch):
     # Session create/update PEP (Layer 2): a permission_mode above the owner's
-    # ceiling (default 'read_only', no grant) → 422 with the violation, so a
+    # ceiling (here an administrator's global auto_accept; the default is
+    # autonomous since 2026-11-11) → 422 with the violation, so a
     # never-startable session is rejected at the API instead of timing out at
     # provisioning. knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
     fake = AsyncMock()
     fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": False})
     fake.list_grants_for_scopes = AsyncMock(
-        return_value={"user": [], "project": [], "global": []}
+        return_value={"user": [], "project": [], "global": _PERMISSION_AUTO_ACCEPT}
     )
     monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     with pytest.raises(HTTPException) as ei:
@@ -304,7 +320,7 @@ async def test_enforce_job_create_grants_raises_422_for_ungranted(monkeypatch):
     fake = AsyncMock()
     fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": False})
     fake.list_grants_for_scopes = AsyncMock(
-        return_value={"user": [], "project": [], "global": []}
+        return_value={"user": [], "project": [], "global": _VM_OFF}
     )
     monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     with pytest.raises(HTTPException) as ei:
@@ -408,14 +424,14 @@ async def test_duplicate_expert_strips_an_ungranted_tool_and_reports_it(monkeypa
         "icon": "smart_toy",
         "color": "#6B7280",
         # A real, correctly-categorised (shape-valid) shell tool list — not a
-        # smuggle — that the copier's own grants do not cover: shell_tools
-        # defaults to deny in the CATALOG.
+        # smuggle — that the copier's own grants do not cover: an
+        # administrator restricted shell_tools (on by default since 2026-11-11).
         "config": {"tools": {"shell": ["run_command"], "git": ["git_status"]}},
     }
     fake = AsyncMock()
     fake.get_expert_visible_by_id = AsyncMock(return_value=source_row)
     fake.list_grants_for_scopes = AsyncMock(
-        return_value={"user": [], "project": [], "global": []}
+        return_value={"user": [], "project": [], "global": _SHELL_OFF}
     )
     fake.create_expert = AsyncMock(return_value={"id": "forked-id"})
     monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
@@ -505,7 +521,9 @@ async def test_duplicate_expert_still_forks_when_the_gate_allows(monkeypatch):
     }
 
 
-def _duplicate_env(monkeypatch, *, source_row, grant_rows=(), is_admin=False):
+def _duplicate_env(
+    monkeypatch, *, source_row, grant_rows=(), is_admin=False, global_rows=()
+):
     """Shared scaffold for the strip-and-report tests below: a visible source
     row, a grants lookup returning `grant_rows` for the user scope, and the
     kill switch held open (each of these tests isolates the grants half, same
@@ -513,7 +531,11 @@ def _duplicate_env(monkeypatch, *, source_row, grant_rows=(), is_admin=False):
     fake = AsyncMock()
     fake.get_expert_visible_by_id = AsyncMock(return_value=source_row)
     fake.list_grants_for_scopes = AsyncMock(
-        return_value={"user": list(grant_rows), "project": [], "global": []}
+        return_value={
+            "user": list(grant_rows),
+            "project": [],
+            "global": list(global_rows),
+        }
     )
     fake.create_expert = AsyncMock(side_effect=lambda **kw: {"id": "forked-id", **kw})
     monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
@@ -625,6 +647,7 @@ async def test_duplicate_expert_safety_recheck_fires_when_the_strip_map_misses(
             "color": "#6B7280",
             "config": {"tools": {"shell": ["run_command"]}},
         },
+        global_rows=_SHELL_OFF,
     )
 
     with pytest.raises(HTTPException) as ei:
@@ -643,13 +666,14 @@ async def test_duplicate_expert_scholar_end_to_end_for_a_default_grants_user(
     actually fixed: `scholar` is the expert the route's own docstring names
     ("start from scholar"), a bundled (disk) expert, not a DB row — so this
     goes through `_bundled_expert_bundle`, the real config.yaml, unlike every
-    other test in this file. A default-grants non-admin gets a 200, the
-    stored row has no `tools.shell` and no `tools.delegation`, and the
-    response names both as dropped.
+    other test in this file. A non-admin whose delegation an administrator
+    restricted gets a 200, the stored row keeps `tools.shell` (on by default)
+    but has no `tools.delegation`, and the response names only delegation as
+    dropped. (Under the plain defaults nothing drops since 2026-11-11.)
     """
     fake = AsyncMock()
     fake.list_grants_for_scopes = AsyncMock(
-        return_value={"user": [], "project": [], "global": []}
+        return_value={"user": [], "project": [], "global": _DELEGATION_OFF}
     )
     fake.create_expert = AsyncMock(side_effect=lambda **kw: {"id": "forked-id", **kw})
     monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
@@ -675,9 +699,9 @@ async def test_duplicate_expert_scholar_end_to_end_for_a_default_grants_user(
         MagicMock(), "scholar"
     )
 
-    assert set(result["dropped"]) == {"shell_tools", "delegation"}
+    assert set(result["dropped"]) == {"delegation"}
     stored = fake.create_expert.await_args.kwargs["config"]
-    assert "shell" not in stored.get("tools", {})
+    assert stored["tools"]["shell"]
     assert "delegation" not in stored.get("tools", {})
     assert "enabled" not in stored.get("delegation", {})
     # Scholar's delegation.max_concurrent is not the violation (only .enabled
@@ -691,15 +715,17 @@ async def test_duplicate_expert_scholar_end_to_end_for_a_default_grants_user(
 # scholar, developer, critic, bughunter and product-qa (shell + delegation),
 # plus designer and designer-interactive (shell). This is the after: every one
 # forks (200) for the same default-grants non-admin, and drops exactly the
-# grants the brief measured, no more and no less.
+# grants the defaults withhold, no more and no less. Since 2026-11-11
+# shell_tools and delegation are both on by default, so the defaults withhold
+# nothing these experts use and every one forks unchanged.
 _PREVIOUSLY_REFUSED_SHIPPED_EXPERTS = {
-    "scholar": {"shell_tools", "delegation"},
-    "developer": {"shell_tools", "delegation"},
-    "critic": {"shell_tools", "delegation"},
-    "bughunter": {"shell_tools", "delegation"},
-    "designer": {"shell_tools"},
-    "designer-interactive": {"shell_tools"},
-    "product-qa": {"shell_tools", "delegation"},
+    "scholar": set(),
+    "developer": set(),
+    "critic": set(),
+    "bughunter": set(),
+    "designer": set(),
+    "designer-interactive": set(),
+    "product-qa": set(),
 }
 
 
@@ -786,6 +812,7 @@ def _fork_env(
     is_admin=False,
     personal_defaults_ok: bool | None = None,
     kill_switch_on=True,
+    global_rows=(),
 ):
     """Shared scaffold, the fork_my_expert_default mirror of `_duplicate_env`
     above. `personal_defaults_ok=None` (the default) leaves
@@ -799,7 +826,11 @@ def _fork_env(
     """
     fake = AsyncMock()
     fake.list_grants_for_scopes = AsyncMock(
-        return_value={"user": list(grant_rows), "project": [], "global": []}
+        return_value={
+            "user": list(grant_rows),
+            "project": [],
+            "global": list(global_rows),
+        }
     )
     fake.fork_and_set_user_expert_default = AsyncMock(
         side_effect=lambda **kw: _fake_fork_row(**kw)
@@ -848,15 +879,15 @@ def _db_selection(config: dict) -> SimpleNamespace:
 async def test_fork_my_expert_default_strips_a_bundled_source_and_reports_it(
     monkeypatch,
 ):
-    """Test group 1: a default-grants non-admin forks `scholar` — a BUNDLED
-    (disk) source, reached via `_bundled_expert_bundle`, not a DB row — and
-    gets 200 with `dropped` naming both grants scholar's real config.yaml
-    needs (shell_tools, delegation) that default grants withhold. The stored
-    row is read back from the mock's own call args, not the response, and
-    must actually lack both: a route that reports `dropped` while persisting
-    the original would be worse than the refusal it replaced.
+    """Test group 1: a non-admin whose delegation an administrator restricted
+    forks `scholar` — a BUNDLED (disk) source, reached via
+    `_bundled_expert_bundle`, not a DB row — and gets 200 with `dropped`
+    naming the grant scholar's real config.yaml needs that the restriction
+    withholds. The stored row is read back from the mock's own call args, not
+    the response, and must actually lack it: a route that reports `dropped`
+    while persisting the original would be worse than the refusal it replaced.
     """
-    fake = _fork_env(monkeypatch, grant_rows=[])
+    fake = _fork_env(monkeypatch, grant_rows=[], global_rows=_DELEGATION_OFF)
 
     result = await catalogue_route(expert_routes.fork_my_expert_default)(
         MagicMock(),
@@ -864,10 +895,11 @@ async def test_fork_my_expert_default_strips_a_bundled_source_and_reports_it(
         expert_schemas.ExpertDefaultForkRequest(expert_id="scholar"),
     )
 
-    assert set(result["dropped"]) == {"shell_tools", "delegation"}
+    # shell_tools stays on (its default): only delegation drops.
+    assert set(result["dropped"]) == {"delegation"}
     assert result["source"] == "user"
     stored = fake.fork_and_set_user_expert_default.await_args.kwargs["source"]["config"]
-    assert "shell" not in stored.get("tools", {})
+    assert stored["tools"]["shell"]
     assert "delegation" not in stored.get("tools", {})
     assert "enabled" not in stored.get("delegation", {})
     # delegation.max_concurrent is not the violation (only .enabled is) and
@@ -881,7 +913,7 @@ async def test_fork_my_expert_default_strips_a_db_source_and_reports_it(monkeypa
     a DB row (no explicit `expert_id` posted, so this resolves someone else's
     personal or the application default), not a bundled one. Same
     strip-and-report outcome, proving the fix covers both branches."""
-    fake = _fork_env(monkeypatch, grant_rows=[])
+    fake = _fork_env(monkeypatch, grant_rows=[], global_rows=_SHELL_OFF)
     monkeypatch.setattr(
         expert_authoring_module,
         "resolve_root_expert",
@@ -1010,7 +1042,7 @@ async def test_fork_my_expert_default_safety_recheck_fires_when_the_strip_map_mi
         "strip_to_grants",
         lambda fragment, grants: (fragment, []),  # claims nothing to drop
     )
-    fake = _fork_env(monkeypatch, grant_rows=[])
+    fake = _fork_env(monkeypatch, grant_rows=[], global_rows=_SHELL_OFF)
 
     with pytest.raises(HTTPException) as ei:
         await catalogue_route(expert_routes.fork_my_expert_default)(
@@ -1034,7 +1066,9 @@ async def test_fork_my_expert_default_actually_sets_the_personal_default(
     the personal-default pointer now names the SAME id the response reports,
     and resolves to the STRIPPED config, not the source's original.
     """
-    fake = _fork_env(monkeypatch, grant_rows=[])
+    fake = _fork_env(
+        monkeypatch, grant_rows=[], global_rows=_SHELL_OFF + _DELEGATION_OFF
+    )
     pointer: dict[str, Any] = {"row": None}
 
     async def _fork_and_set(*, user_id, expert_type, source):

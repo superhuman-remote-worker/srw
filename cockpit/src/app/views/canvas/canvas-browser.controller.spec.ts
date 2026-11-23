@@ -4,6 +4,7 @@ import { environment } from '../../core/environment';
 import { CanvasState } from '../../core/models/canvas.model';
 import { BROWSER_MESSAGE_TYPE, BrowserPageState } from './canvas-browser-protocol';
 import {
+  BROWSER_HANDSHAKE_TIMEOUT_MS,
   CANVAS_BROWSER_BITMAP_FACTORY,
   CANVAS_BROWSER_SOCKET_FACTORY,
   CANVAS_BROWSER_TIMEOUTS,
@@ -67,8 +68,8 @@ function decodeClient(data: ArrayBuffer): {type: number; body: unknown} {
   };
 }
 
-function frame(generation = GENERATION): ArrayBuffer {
-  const header = utf8.encode(JSON.stringify({ generation, w: 1280, h: 720, ts: 1_753_200_000 }));
+function frame(generation = GENERATION, size: {w?: number; h?: number} = {w: 1280, h: 720}): ArrayBuffer {
+  const header = utf8.encode(JSON.stringify({ generation, ...size, ts: 1_753_200_000 }));
   const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xdb, 1, 2, 3]);
   const wire = new Uint8Array(3 + header.byteLength + jpeg.byteLength);
   wire[0] = BROWSER_MESSAGE_TYPE.FRAME;
@@ -83,6 +84,7 @@ class FakeSocket {
   readonly closes: Array<{ code?: number; reason?: string }> = [];
   binaryType: BinaryType = 'blob';
   readyState = 0;
+  onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
@@ -91,6 +93,7 @@ class FakeSocket {
 
   open(): void {
     this.readyState = 1;
+    this.onopen?.(new Event('open'));
   }
 
   send(data: ArrayBuffer): void {
@@ -427,7 +430,7 @@ describe('Canvas shared-browser controller', () => {
 
     expect(controller.connectionStatus()).toBe('reconnecting');
     expect(controller.errorCode()).toBe('browser_stream_unavailable');
-    expect(timeouts.delays).toEqual([250]);
+    expect(timeouts.delays).toEqual([BROWSER_HANDSHAKE_TIMEOUT_MS, 250]);
 
     timeouts.runNext();
     expect(sockets).toHaveLength(2);
@@ -482,10 +485,13 @@ describe('Canvas shared-browser controller', () => {
     expect(controller.sendControl({op: 'take_baton'})).toBe(false);
     expect(controller.pageState()?.baton).toBe('agent');
     expect(controller.pendingBaton()).toBe('user');
-    expect(decodeClient(socket.sent[0])).toEqual({
-      type: BROWSER_MESSAGE_TYPE.CONTROL,
-      body: {op: 'take_baton'},
-    });
+    expect(socket.sent.slice(0, 2).map(decodeClient)).toEqual([
+      {
+        type: BROWSER_MESSAGE_TYPE.CONTROL,
+        body: {op: 'client_features', features: ['viewport_control']},
+      },
+      {type: BROWSER_MESSAGE_TYPE.CONTROL, body: {op: 'take_baton'}},
+    ]);
 
     socket.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState({baton: 'user'})));
     expect(controller.pendingBaton()).toBeNull();
@@ -527,7 +533,7 @@ describe('Canvas shared-browser controller', () => {
       params: {type: 'keyUp', key: 'A', code: 'KeyA', location: 0, modifiers: 0},
     })).toBe(false);
 
-    expect(socket.sent.slice(1).map(decodeClient)).toEqual([
+    expect(socket.sent.slice(2).map(decodeClient)).toEqual([
       {
         type: BROWSER_MESSAGE_TYPE.INPUT,
         body: {
@@ -596,8 +602,9 @@ describe('Canvas shared-browser controller', () => {
       kind: 'mouse',
       params: {type: 'mouseMoved', x: 3, y: 4},
     })).toBe(true);
-    expect(firstSocket.sent).toHaveLength(1);
-    expect(secondSocket.sent).toHaveLength(1);
+    // Each view's opt-in plus its own input; nothing crosses views.
+    expect(firstSocket.sent).toHaveLength(2);
+    expect(secondSocket.sent).toHaveLength(2);
   });
 
   it('rejects input after visibility teardown or source replacement', () => {
@@ -617,7 +624,9 @@ describe('Canvas shared-browser controller', () => {
       kind: 'mouse',
       params: {type: 'mouseMoved', x: 1, y: 2},
     })).toBe(false);
-    expect(first.sent).toHaveLength(0);
+    expect(first.sent.map(decodeClient).map((sent) => (sent.body as {op?: string}).op)).toEqual([
+      'client_features',
+    ]);
   });
 
   it('treats malformed server data as terminal and supports explicit retry', () => {
@@ -629,6 +638,103 @@ describe('Canvas shared-browser controller', () => {
     controller.retry();
     expect(sockets).toHaveLength(2);
     expect(controller.connectionStatus()).toBe('connecting');
+  });
+
+  it('gives up on a handshake that never completes and reconnects', () => {
+    controller.syncPresentation(true, 'thread-1', browserState());
+    const stuck = sockets[0];
+    expect(timeouts.delays).toEqual([BROWSER_HANDSHAKE_TIMEOUT_MS]);
+
+    timeouts.runNext();
+
+    expect(stuck.closes).toHaveLength(1);
+    expect(controller.connectionStatus()).toBe('reconnecting');
+    expect(controller.errorCode()).toBe('browser_stream_handshake_timeout');
+    expect(timeouts.delays.at(-1)).toBe(250);
+    stuck.open();
+    stuck.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState()));
+    expect(controller.connectionStatus()).toBe('reconnecting');
+
+    timeouts.runNext();
+    expect(sockets).toHaveLength(2);
+    sockets[1].open();
+    expect(timeouts.pending).toBe(0);
+    sockets[1].message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState()));
+    expect(controller.connectionStatus()).toBe('ready');
+  });
+
+  it('keeps a slow but opened handshake and a message-first socket alive', () => {
+    controller.syncPresentation(true, 'thread-1', browserState());
+    sockets[0].open();
+    expect(timeouts.pending).toBe(0);
+
+    controller.syncPresentation(true, 'thread-1', browserState(2));
+    expect(timeouts.pending).toBe(1);
+    sockets[1].message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState()));
+    expect(timeouts.pending).toBe(0);
+    expect(sockets[1].closes).toHaveLength(0);
+  });
+
+  it('opts in to viewport control and sizes the page only while driving', () => {
+    controller.syncPresentation(true, 'thread-1', browserState());
+    const socket = sockets[0];
+    socket.open();
+    socket.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState({baton: 'user'})));
+    expect(decodeClient(socket.sent[0])).toEqual({
+      type: BROWSER_MESSAGE_TYPE.CONTROL,
+      body: {op: 'client_features', features: ['viewport_control']},
+    });
+    // An older daemon ignores the opt-in: no capability, nothing sent.
+    expect(controller.viewportControl()).toBe(false);
+    expect(controller.requestViewport(390, 844)).toBe(false);
+
+    socket.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, {
+      ...pageState({baton: 'agent'}),
+      viewport_control: true,
+    }));
+    expect(controller.viewportControl()).toBe(true);
+    expect(controller.requestViewport(390, 844)).toBe(false);
+
+    socket.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, {
+      ...pageState({baton: 'user'}),
+      viewport_control: true,
+    }));
+    expect(controller.requestViewport(390.5, 844)).toBe(false);
+    expect(controller.requestViewport(1280, 720)).toBe(false);
+    expect(controller.requestViewport(390, 844)).toBe(true);
+    expect(decodeClient(socket.sent.at(-1)!)).toEqual({
+      type: BROWSER_MESSAGE_TYPE.CONTROL,
+      body: {op: 'set_viewport', width: 390, height: 844},
+    });
+    expect(socket.sent).toHaveLength(2);
+
+    socket.serverClose(1006, false);
+    expect(controller.viewportControl()).toBe(false);
+    timeouts.runNext();
+  });
+
+  it('carries the CSS size of each decoded frame with it', async () => {
+    controller.syncPresentation(true, 'thread-1', browserState());
+    const socket = sockets[0];
+    socket.message(serverJson(BROWSER_MESSAGE_TYPE.STATE, pageState()));
+    socket.message(frame(GENERATION, {w: 1919.4, h: 992}));
+    await flushPromises();
+    expect(controller.frameSize()).toEqual({width: 1919, height: 992});
+    const first = controller.frameSize();
+
+    socket.message(frame(GENERATION, {w: 1919, h: 992}));
+    await flushPromises();
+    expect(controller.frameSize()).toBe(first);
+
+    socket.message(frame(GENERATION, {}));
+    await flushPromises();
+    expect(controller.frameSize()).toBeNull();
+    expect(controller.frame()).not.toBeNull();
+
+    socket.message(frame(GENERATION, {w: 390, h: 844}));
+    await flushPromises();
+    controller.syncPresentation(false, 'thread-1', browserState());
+    expect(controller.frameSize()).toBeNull();
   });
 
   it('destroys with no live listener, timer, socket, or bitmap', async () => {

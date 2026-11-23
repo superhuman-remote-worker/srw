@@ -1,0 +1,9 @@
+# The one to-do of a job without phases that resumes after a reviewer's feedback,
+# a bounced deliverable check or a reply to a question it asked. An expert may
+# ship its own copy; one that does not hold exactly one to-do is replaced by
+# this file.
+todos:
+  - id: 1
+    content: >-
+      Continue the task in the brief, taking the message above into account.
+      When the task is done, call job_complete.

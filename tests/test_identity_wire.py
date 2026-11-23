@@ -157,7 +157,10 @@ async def test_auth_me_wraps_the_projection(harness):
     result = await identity_routes.auth_me(
         request=object(), dependencies=harness.dependencies
     )
-    assert result == {"user": identity.user_dict(harness.user)}
+    assert result == {
+        "user": identity.user_dict(harness.user),
+        "credential": identity.credential_dict(harness.user),
+    }
 
 
 @pytest.mark.asyncio
@@ -307,3 +310,146 @@ async def test_bearer_with_usable_subject_still_resolves(monkeypatch):
     assert response.status_code == 200, response.text
     assert response.json() == {"id": str(USER_ID)}
     db.get_user_by_keycloak_sub.assert_awaited_once_with("kc-sub-1")
+
+
+# =============================================================================
+# The credential block
+# =============================================================================
+
+EXPIRES = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+
+def test_a_personal_access_token_reads_its_name_scopes_and_expiry():
+    user = user_row(
+        auth_method="pat",
+        scopes=["resources:write", "jobs:read"],
+        token_name="ci pipeline",
+        token_expires_at=EXPIRES,
+        token_id="not-for-the-wire",
+    )
+    assert identity.credential_dict(user) == {
+        "method": "pat",
+        "token_name": "ci pipeline",
+        "scopes": ["jobs:read", "resources:write"],
+        "scope": None,
+        "expires_at": EXPIRES,
+    }
+
+
+def test_an_mcp_token_reads_its_scope_string():
+    scope = f"project:{PROJECT_ID}"
+    user = user_row(auth_method="mcp", scopes=[scope], token_name="laptop")
+    assert identity.credential_dict(user) == {
+        "method": "mcp",
+        "token_name": "laptop",
+        "scopes": None,
+        "scope": scope,
+        "expires_at": None,
+    }
+
+
+def test_a_keycloak_sign_in_has_no_token_fields():
+    assert identity.credential_dict(user_row()) == {
+        "method": "oidc",
+        "token_name": None,
+        "scopes": None,
+        "scope": None,
+        "expires_at": None,
+    }
+
+
+def test_the_user_projection_is_the_same_for_every_credential():
+    """The credential is a sibling key. ``user_dict`` stays the pinned
+    allowlist above, whichever credential presents the user."""
+    token_user = user_row(
+        auth_method="pat", scopes=["admin"], token_name="x", token_id="y"
+    )
+    assert identity.user_dict(token_user) == identity.user_dict(user_row())
+
+
+@pytest.mark.asyncio
+async def test_auth_me_over_http_carries_the_credential(harness):
+    harness.user = user_row(
+        auth_method="pat",
+        scopes=["jobs:read"],
+        token_name="ci pipeline",
+        token_expires_at=EXPIRES,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=harness.app()), base_url="http://test"
+    ) as client:
+        body = (await client.get("/api/auth/me")).json()
+    assert body["credential"]["method"] == "pat"
+    assert body["credential"]["token_name"] == "ci pipeline"
+    assert body["credential"]["scopes"] == ["jobs:read"]
+    assert body["credential"]["expires_at"].startswith("2027-01-01T00:00:00")
+
+
+# =============================================================================
+# The resolvers put the token's name and expiry on the user
+# =============================================================================
+
+
+class TokenStore:
+    """What ``security.auth`` reads to resolve a bearer token."""
+
+    def __init__(self, kind, **token):
+        self.row = {"id": USER_ID, "user_id": USER_ID, "kind": kind, **token}
+
+    async def get_auth_token_by_hash(self, digest):
+        return self.row
+
+    async def get_user(self, user_id):
+        return user_row()
+
+    async def touch_auth_token(self, token_id, ip):
+        return None
+
+    async def record_security_event(self, **event):
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bearer", "store", "expected"),
+    [
+        (
+            "ak_" + "a" * 32,
+            TokenStore(
+                "api", name="ci pipeline", scopes=["chat:read"], expires_at=EXPIRES
+            ),
+            {
+                "method": "pat",
+                "token_name": "ci pipeline",
+                "scopes": ["chat:read"],
+                "scope": None,
+            },
+        ),
+        (
+            "srw_" + "a" * 32,
+            TokenStore("mcp", name="laptop", scope="user", expires_at=EXPIRES),
+            {"method": "mcp", "token_name": "laptop", "scopes": None, "scope": "user"},
+        ),
+    ],
+)
+async def test_a_token_learns_what_it_is_from_auth_me(bearer, store, expected):
+    """Through the real resolvers: the route is the only place a token can
+    read its own name, reach and expiry (the token routes refuse tokens)."""
+    app = mount_router(
+        identity_routes.router,
+        factories={
+            "identity_dependencies_factory": lambda: (
+                identity_routes.IdentityDependencies(store=store)
+            )
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/api/auth/me", headers={"Authorization": f"Bearer {bearer}"}
+        )
+    assert response.status_code == 200, response.text
+    credential = response.json()["credential"]
+    assert credential.pop("expires_at").startswith("2027-01-01T00:00:00")
+    assert credential == expected

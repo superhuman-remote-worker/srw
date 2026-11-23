@@ -568,3 +568,145 @@ async def test_commit_rejects_workspace_change_without_writing(monkeypatch):
 
     assert error.value.code == "workspace_generation_changed"
     assert written is False
+
+
+# ---------------------------------------------------------------------------
+# Same-cluster VM Sessions (WP7)
+# ---------------------------------------------------------------------------
+
+from tests._canvas_vm_fixtures import (  # noqa: E402
+    VM_LAUNCHER,
+    VM_PROVISION_GENERATION,
+    VM_ROOTDISK,
+    restored_vm_context,
+    vm_thread,
+)
+
+
+class _VMCanvasService:
+    writes: list = []
+
+    def __init__(self, received_db):
+        del received_db
+
+    async def set_if_changed(
+        self, thread_id, presentation, *, expected_presentation_revision
+    ):
+        del expected_presentation_revision
+        type(self).writes.append((thread_id, presentation))
+        return CanvasMutation(changed=True, record=_record())
+
+
+@pytest.mark.asyncio
+async def test_prepare_on_a_vm_hands_the_attested_vm_target(monkeypatch):
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    thread = vm_thread(thread_id=_THREAD_ID)
+
+    async def exec_info(received, *, initial_baton, generation_resolver):
+        assert received is thread
+        assert initial_baton == "user"
+        return {
+            "generation": str(_BROWSER_GENERATION),
+            "token": "private",
+            "port": 38801,
+            "baton": "user",
+        }
+
+    monkeypatch.setattr(browser_canvas, "exec_stream_info", exec_info)
+    monkeypatch.setattr(browser_canvas, "resolve_ssh_key_path", lambda: "/tmp/key")
+    monkeypatch.setattr(browser_canvas, "asyncssh", object())
+    monkeypatch.setenv("CANVAS_SHARED_BROWSER_ENABLED", "true")
+
+    async def resolver():
+        return thread
+
+    prepared = await browser_canvas.prepare_browser_canvas(
+        thread, initial_baton="user", generation_resolver=resolver
+    )
+
+    assert prepared.browser_generation == _BROWSER_GENERATION
+    assert prepared.workspace_target.vm_runtime == (
+        VM_PROVISION_GENERATION,
+        "vm-uid",
+        VM_LAUNCHER,
+        VM_ROOTDISK,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict", "status", "code"),
+    [
+        ("current", None, None),
+        ("changed", 409, "workspace_generation_changed"),
+        ("unknown", 503, "transport_unavailable"),
+    ],
+)
+async def test_commit_on_a_vm_needs_a_fresh_controller_proof(
+    monkeypatch, verdict, status, code
+):
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    thread = vm_thread(thread_id=_THREAD_ID)
+    target = browser_canvas.resolve_canvas_workspace_target(
+        thread, browser_canvas.canvas_workspace_generation(thread)
+    )
+    attested = []
+
+    async def attest(received):
+        attested.append(received)
+        return verdict
+
+    _VMCanvasService.writes = []
+    monkeypatch.setattr(
+        browser_canvas, "browser_capability", lambda thread: _capability()
+    )
+    monkeypatch.setattr(browser_canvas, "attest_vm_workspace_target", attest)
+    monkeypatch.setattr(browser_canvas, "CanvasService", _VMCanvasService)
+
+    prepared = PreparedBrowser(_BROWSER_GENERATION, target)
+    if status is None:
+        mutation = await browser_canvas.commit_browser_canvas(
+            _RouteDB(thread), _THREAD_ID, prepared, title="Shared browser"
+        )
+        assert mutation.changed is True
+        assert len(_VMCanvasService.writes) == 1
+    else:
+        with pytest.raises(browser_canvas.BrowserCanvasError) as error:
+            await browser_canvas.commit_browser_canvas(
+                _RouteDB(thread), _THREAD_ID, prepared, title="Shared browser"
+            )
+        assert (error.value.status_code, error.value.code) == (status, code)
+        assert _VMCanvasService.writes == []
+    assert attested == [target]
+
+
+@pytest.mark.asyncio
+async def test_commit_on_a_vm_restored_meanwhile_is_refused_before_proof(
+    monkeypatch,
+):
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    thread = vm_thread(thread_id=_THREAD_ID)
+    target = browser_canvas.resolve_canvas_workspace_target(
+        thread, browser_canvas.canvas_workspace_generation(thread)
+    )
+
+    async def forbidden(received):
+        raise AssertionError(received)
+
+    _VMCanvasService.writes = []
+    monkeypatch.setattr(
+        browser_canvas, "browser_capability", lambda thread: _capability()
+    )
+    monkeypatch.setattr(browser_canvas, "attest_vm_workspace_target", forbidden)
+    monkeypatch.setattr(browser_canvas, "CanvasService", _VMCanvasService)
+
+    with pytest.raises(browser_canvas.BrowserCanvasError) as error:
+        await browser_canvas.commit_browser_canvas(
+            _RouteDB(vm_thread(restored_vm_context(), thread_id=_THREAD_ID)),
+            _THREAD_ID,
+            PreparedBrowser(_BROWSER_GENERATION, target),
+            title="Shared browser",
+        )
+
+    assert error.value.code == "workspace_generation_changed"
+    assert _VMCanvasService.writes == []

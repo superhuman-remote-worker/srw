@@ -210,7 +210,8 @@ export function isBundledSkill(s: Skill): boolean {
         display: flex;
         gap: 0.5rem;
       }
-      .grid th,
+      /* Body cells only: a top-aligned header cell pins its label to the top
+         edge of the shared 36px header row. */
       .grid td {
         vertical-align: top;
       }

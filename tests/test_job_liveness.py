@@ -174,6 +174,170 @@ class TestSingleFixtureEverySurface:
         assert "%" not in progress_text  # no fabricated percentage, ever
 
 
+PARKED = {
+    "command_id": "03dc2497-cad4-4481-8af0-d94fccf04ec2",
+    "attempts": 5,
+    "error_code": "HTTPException",
+}
+PARKED_REASON = (
+    "completion report 03dc2497 is parked after 5 failed attempts "
+    "(HTTPException); an administrator must unpark or force-resolve it"
+)
+
+
+def _parked_db(*, heartbeat: datetime | None):
+    db = _db(heartbeat=heartbeat)
+    db.parked_completion_commands_for_jobs = AsyncMock(return_value={JOB_ID: PARKED})
+    return db
+
+
+class TestParkedCompletionOnEverySurface:
+    """A parked completion report says so first, on every liveness surface.
+
+    knowledge-base/knowledge/issues/workspace_report_after_automatic_pod_cleanup_parks_job_in_processing.md
+    (WP4 a): the job's state is unchanged; only the first reason is added,
+    and only with completion commands on.
+    """
+
+    @pytest.mark.asyncio
+    async def test_parked_completion_leads_the_reasons_and_keeps_the_state(self):
+        verdict = await compute_job_liveness(
+            _stalled_job(),
+            audit_reader=_audit_reader(end=STALLED_AUDIT_END),
+            db=_parked_db(heartbeat=NOW - timedelta(seconds=30)),
+            threshold_minutes=30,
+            now=NOW,
+            completion_commands_enabled=True,
+        )
+        assert verdict["state"] == "suspected_stuck"
+        assert verdict["reasons"][0] == PARKED_REASON
+        assert EXPECTED_REASON in verdict["reasons"]
+
+    @pytest.mark.asyncio
+    async def test_paused_job_keeps_paused_with_the_reason_first(self):
+        paused = {**_stalled_job(), "status": "paused", "assigned_agent_id": None}
+        verdict = await compute_job_liveness(
+            paused,
+            db=_parked_db(heartbeat=None),
+            now=NOW,
+            completion_commands_enabled=True,
+        )
+        assert verdict["state"] == "paused"
+        assert verdict["reasons"] == [PARKED_REASON, "paused by control plane"]
+
+    @pytest.mark.asyncio
+    async def test_flag_off_never_reads_completion_commands(self):
+        db = _parked_db(heartbeat=NOW - timedelta(seconds=30))
+        verdict = await compute_job_liveness(
+            _stalled_job(),
+            audit_reader=_audit_reader(end=STALLED_AUDIT_END),
+            db=db,
+            threshold_minutes=30,
+            now=NOW,
+        )
+        await compute_jobs_liveness(
+            [_stalled_job()],
+            audit_reader=_audit_reader(end=STALLED_AUDIT_END),
+            db=db,
+            threshold_minutes=30,
+            now=NOW,
+        )
+        db.parked_completion_commands_for_jobs.assert_not_awaited()
+        assert PARKED_REASON not in verdict["reasons"]
+
+    @pytest.mark.asyncio
+    async def test_batch_reads_parked_commands_once(self):
+        db = _parked_db(heartbeat=NOW - timedelta(seconds=30))
+        other = {**_stalled_job(), "id": str(uuid.uuid4())}
+        results = await compute_jobs_liveness(
+            [_stalled_job(), other],
+            audit_reader=_audit_reader(end=STALLED_AUDIT_END),
+            db=db,
+            threshold_minutes=30,
+            now=NOW,
+            completion_commands_enabled=True,
+        )
+        db.parked_completion_commands_for_jobs.assert_awaited_once_with(
+            [JOB_ID, other["id"]]
+        )
+        assert results[JOB_ID]["reasons"][0] == PARKED_REASON
+        assert PARKED_REASON not in results[other["id"]]["reasons"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_costs_only_the_line(self):
+        db = _parked_db(heartbeat=NOW - timedelta(seconds=30))
+        db.parked_completion_commands_for_jobs.side_effect = RuntimeError("down")
+        verdict = await compute_job_liveness(
+            _stalled_job(),
+            audit_reader=_audit_reader(end=STALLED_AUDIT_END),
+            db=db,
+            threshold_minutes=30,
+            now=NOW,
+            completion_commands_enabled=True,
+        )
+        assert verdict["state"] == "suspected_stuck"
+        assert verdict["reasons"][0] == EXPECTED_REASON
+
+    @pytest.mark.asyncio
+    async def test_progress_stuck_row_and_sitrep_carry_the_reason(self, monkeypatch):
+        from orchestrator.services import job_inspection
+
+        db = _parked_db(heartbeat=NOW - timedelta(seconds=30))
+        db.get_job_progress = AsyncMock(
+            return_value={"job_id": JOB_ID, "status": "processing"}
+        )
+        progress = await job_inspection.get_job_progress(
+            job_id=JOB_ID,
+            authorized_job=_stalled_job(),
+            dependencies=job_inspection.JobInspectionDependencies(
+                store=db,
+                audit_reader=_audit_reader(end=STALLED_AUDIT_END),
+                user_visible_project_ids=AsyncMock(return_value="all"),
+                mcp_scope_project_id=lambda _: None,
+                active_job_statuses=job_inspection.ME_ACTIVE_JOB_STATUSES,
+                completion_commands_enabled=True,
+            ),
+        )
+        assert progress["reasons"][0] == PARKED_REASON
+        assert PARKED_REASON in fmt.format_job_progress(JOB_ID, progress)
+
+        verdict = await compute_job_liveness(
+            _stalled_job(),
+            audit_reader=_audit_reader(end=STALLED_AUDIT_END),
+            db=db,
+            threshold_minutes=30,
+            now=NOW,
+            completion_commands_enabled=True,
+        )
+        row = {**_stalled_job(), **verdict}
+        row["created_at"] = row["created_at"].isoformat()
+        row["updated_at"] = row["updated_at"].isoformat()
+        stuck_text = fmt.format_stuck_jobs(
+            {"jobs": [row], "threshold_minutes": 30, "threshold_source": "x"}
+        )
+        assert PARKED_REASON in stuck_text
+
+        # The sitrep prints the reasons of an otherwise ``active`` job too
+        # when its completion is parked (recent audit activity, 5m ago).
+        monkeypatch.setattr(
+            sitrep,
+            "_HANDLES",
+            sitrep.ReportingHandles(completion_commands_enabled=True),
+        )
+        db.query_jobs = AsyncMock(return_value=JobQueryResult(jobs=[_stalled_job()]))
+        lines, _prints = await sitrep._jobs_section(
+            db,
+            _audit_reader(end=NOW - timedelta(minutes=5)),
+            PROJECT_ID,
+            {},
+            None,
+            NOW,
+        )
+        rendered = "\n".join(lines)
+        assert "[active]" in rendered
+        assert "completion report 03dc2497 is parked" in rendered
+
+
 class TestHonestUnavailability:
     @pytest.mark.asyncio
     async def test_audit_down_without_heartbeat_evidence_is_unavailable(self):
@@ -488,7 +652,9 @@ class TestJobElapsed:
             job_id=JOB_ID,
             authorized_job={"id": JOB_ID, "status": "pending_review"},
             dependencies=SimpleNamespace(
-                store=store, audit_reader=_audit_reader(end=LAST_STEP)
+                store=store,
+                audit_reader=_audit_reader(end=LAST_STEP),
+                completion_commands_enabled=False,
             ),
         )
         assert payload["elapsed_seconds"] == RAN_FOR

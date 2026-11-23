@@ -17,7 +17,7 @@ If you cannot do (1)-(3) from the mission alone, the mission is under-specified.
 
 ### Step 2: Build the Threat Model
 
-For the target's contract, enumerate the ways it could be violated. Use the vector taxonomy from your strategic-phase prompt as a starting set, but apply only what fits — do not mechanically enumerate every category for every target.
+For the target's contract, enumerate the ways it could be violated. Use the vector taxonomy from your {% if has_tool("next_phase_todos") %}strategic-phase prompt{% else %}direct-task instructions{% endif %} as a starting set, but apply only what fits — do not mechanically enumerate every category for every target.
 
 Rank the vectors by (likelihood × impact). Pick the top 5-8 for this hunt. Record the ranked list with `kb_write` (type=decision, tag=hunt-plan).
 
@@ -164,7 +164,7 @@ These are reference shapes for the mission a dispatcher hands you. Each one defi
 - **Out of scope**: anything outside the chosen endpoint family.
 
 ### Mission template: "race / concurrency probe on operation Z"
-- **Target surface**: a single stateful operation that mutates shared state (e.g. JSONB context merge, todo state transition, persistent-session resume).
+- **Target surface**: a single stateful operation that mutates shared state (e.g. JSONB context merge, {% if has_tool("next_phase_todos") %}todo state transition{% else %}job status transition{% endif %}, persistent-session resume).
 - **Contract**: operation is idempotent / serializable / atomic per its stated guarantees.
 - **Threat vectors to prioritize**: two concurrent invocations losing one write; retry causing duplicate side effect; partial failure leaving inconsistent state; resume after crash producing different result than no crash.
 - **Reproduction style**: script that spawns N concurrent invocations and asserts the final state matches a serial execution.

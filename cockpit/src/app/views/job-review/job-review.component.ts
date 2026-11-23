@@ -23,6 +23,7 @@ import {
   workspaceContractWarns as warnsForWorkspaceContract,
 } from '../../core/util/workspace-contract-presentation';
 import {jobWorkspaceUrl} from '../../core/util/job-workspace-url';
+import {jobDisplayName} from '../../core/util/job-name';
 import {
   checkoutCaptureState,
   jobCloudAction,
@@ -216,7 +217,7 @@ export function selectDeliveryRepository(
           <span class="status-message">
             {{ 'jobReview.empty.notPending' | transloco }}
           </span>
-          <span class="job-desc">{{ job()!.description }}</span>
+          <span class="job-desc">{{ jobName(job()) }}</span>
         </div>
       } @else if (job()!.diff_status === 'pending') {
         <!-- Mode A diff review (see knowledge-history/done/job_cloud_export.md).
@@ -837,6 +838,7 @@ export function selectDeliveryRepository(
   ],
 })
 export class JobReviewComponent {
+  readonly jobName = jobDisplayName;
   private readonly api = inject(ApiService);
   private readonly data = inject(DataService);
   private readonly transloco = inject(TranslocoService);

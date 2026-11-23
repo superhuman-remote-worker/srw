@@ -21,7 +21,7 @@ Examples:
     python -m agent --mode persistent --port 8002 --thread-id <uuid>
 
     # Stateless turn executor: claims session_turn units from the shared
-    # run_queue instead of registering/heartbeating (stateless_agents.md M3).
+    # run_queue instead of registering/heartbeating.
     python -m agent --mode stateless --config session_base --port 8001
 
     # Loop mode: after a job/session completes, return to IDLE instead of
@@ -29,6 +29,10 @@ Examples:
     # is not respawned automatically.
     python -m agent --port 8001 --loop
 """
+
+# The module docstring above is the ``--help`` epilog, so it stays free of
+# design-vault pointers. Stateless mode design:
+# knowledge-base/knowledge/features/stateless_agents.md M3.
 
 import argparse
 import logging
@@ -103,7 +107,7 @@ def parse_args():
             "Agent mode: 'dual' (accepts jobs or sessions, default), 'worker' "
             "(jobs only), 'persistent' (sessions only), or 'stateless' "
             "(claims session turns from the run_queue — no registration, no "
-            "heartbeat; stateless_agents.md M3)"
+            "heartbeat)"
         ),
     )
     parser.add_argument(

@@ -125,8 +125,16 @@ async def resolve_live_voice(
     expert_row: dict[str, Any] | None,
     config_override: dict[str, Any] | None,
 ) -> LiveVoice:
-    """The live voice of the job's expert, as dispatch will resolve it."""
+    """The live voice of the job's expert, as dispatch will resolve it.
+
+    Also refuses a configuration that resolves without phases: a live job has
+    its own procedure and starts in a tactical phase, where ``job_complete``
+    is refused. Admission writes ``phases: true`` on every live-session job
+    (``job_admission.stamp_job_phases``) and refuses an explicit ``false``
+    (``job_admission.admit_job_phases``), so this is a backstop.
+    """
     from orchestrator.services.config_resolver import resolve_config
+    from shared.job_phases import plans_in_phases
     from shared.runtime.core.loader import canonical_config_name
     from shared.runtime.core.subagent_roster import RosterResolutionError
 
@@ -155,6 +163,11 @@ async def resolve_live_voice(
         raise LiveVoiceError(
             f"The expert's config could not be resolved ({type(exc).__name__})"
         ) from None
+    if not plans_in_phases(blob.get("agent")):
+        raise LiveVoiceError(
+            "This job's configuration runs it without phases, which a "
+            "live-session job cannot do: set phases to true for it."
+        )
     return live_voice_of(blob.get("agent") or {})
 
 

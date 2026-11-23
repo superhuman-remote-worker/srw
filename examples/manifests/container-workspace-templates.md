@@ -727,6 +727,29 @@ Resume; it does not create an empty replacement volume. Cancel retains its
 normal terminal cleanup policy, and an older recovery receipt cannot follow
 that policy into storage deletion.
 
+### When the workspace ran out of memory
+
+A process that goes over the workspace container's memory limit gets the whole
+container killed, SSH included, and the Pod fails. The cluster records that as
+`OOMKilled` on the container. SRW reads it from the dead Pod during the cleanup
+above, keeps it on the Job, and the hold says so instead of "transport lost":
+
+> workspace ran out of memory (limit 4 GiB) and was stopped; interrupted command
+> outcome is unknown; explicit Resume required. Resume raises the job's memory
+> limit to 8 GiB.
+
+The next Resume runs the Job with twice the limit that was killed, once per Job,
+never above `workspace.memoryGrowth.max` (default `16Gi`; empty switches it off).
+Only the limit grows; the request, which the node reserves, stays. Every later
+Pod of that Job keeps the larger limit. When no growth is left (the Job was
+raised once already, its limit is at the maximum, growth is off, or the cluster
+refused a Pod with the larger limit), the hold says instead: "To run it with
+more memory, start a new job on a workspace template with more memory."
+
+A cause is stated only on that record. A container that ended with exit code
+137 and no `OOMKilled` keeps the transport-lost wording: a liveness kill or a
+lost runtime event looks the same. Session workspaces are not covered.
+
 If the TCP probe succeeds, the Job still pauses for explicit Resume: connectivity
 does not establish whether the interrupted command ran. This path retains the
 running workspace and creates no cleanup intent. Duplicate accepted reports

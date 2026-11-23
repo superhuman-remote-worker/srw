@@ -140,6 +140,10 @@ class SeedDB:
         expected_seed_version=None,
         expected_subagents=None,
         replacement_subagents=None,
+        expected_description=None,
+        replacement_description=None,
+        expected_persona=None,
+        replacement_persona=None,
     ):
         # Models PostgresDB.upgrade_managed_expert_seed: `$additions || config`
         # (the row wins every key it has) under a `seed_version < $3` guard.
@@ -154,6 +158,19 @@ class SeedDB:
                 return None
             row["config"] = {**row["config"], "subagents": replacement_subagents}
         row["config"] = {**config_additions, **row["config"]}
+        if expected_description is not None:
+            expected = expected_description.strip()
+            if str(row.get("description") or "").strip() == expected:
+                row["description"] = replacement_description
+            if str(row["config"].get("description") or "").strip() == expected:
+                row["config"] = {
+                    **row["config"],
+                    "description": replacement_description,
+                }
+        if expected_persona is not None:
+            prompts = dict(row.get("prompts") or {})
+            if str(prompts.get("persona") or "").strip() == expected_persona.strip():
+                row["prompts"] = {**prompts, "persona": replacement_persona}
         row["seed_version"] = seed_version
         return row
 
@@ -194,7 +211,7 @@ async def test_seed_upgrade_adds_only_the_keys_the_row_lacks():
     await seed_managed_default_experts(db, ROOT / "config")
 
     upgraded = db.rows["application-default-session-seed"]
-    assert upgraded["seed_version"] == 3
+    assert upgraded["seed_version"] == 4
     assert upgraded["config"]["subagents"]["default"] == "explorer"
     assert set(upgraded["config"]["subagents"]["roster"]) == {
         "explorer",
@@ -216,7 +233,7 @@ async def test_seed_upgrade_never_replaces_an_operators_roster():
 
     await seed_managed_default_experts(db, ROOT / "config")
 
-    assert row["seed_version"] == 3
+    assert row["seed_version"] == 4
     assert row["config"]["subagents"] == theirs
 
 
@@ -238,8 +255,12 @@ async def test_seed_upgrade_is_a_no_op_at_the_current_version():
 
 
 @pytest.mark.asyncio
-async def test_future_seed_target_still_repairs_v2_with_historical_safe_roster():
+async def test_v2_roster_skips_the_seed_3_pin_on_its_way_to_4():
+    """Seed 3 pinned the implementer to `shell: []`; seed 4 lifts that pin, so
+    a v2 row (unpinned) needs no roster repair at all, and a future bundle's
+    unrelated roster change still never reaches it."""
     from orchestrator.services.default_experts import (
+        _ASSISTANT_V2_SUBAGENTS,
         MANAGED_SEEDS,
         upgrade_managed_seed,
     )
@@ -248,9 +269,8 @@ async def test_future_seed_target_still_repairs_v2_with_historical_safe_roster()
     await seed_managed_default_experts(db, ROOT / "config")
     spec = next(s for s in MANAGED_SEEDS if s["expert_type"] == "session")
     row = db.rows[spec["managed_key"]]
-    safe_v3_roster = deepcopy(row["config"]["subagents"])
     row["seed_version"] = 2
-    row["config"]["subagents"]["roster"]["implementer"].pop("tools")
+    row["config"]["subagents"] = deepcopy(_ASSISTANT_V2_SUBAGENTS)
     future_bundle = load_seed_bundle(
         ROOT / "config", directory="assistant", expert_type="session"
     )
@@ -258,12 +278,154 @@ async def test_future_seed_target_still_repairs_v2_with_historical_safe_roster()
     future_bundle["config"]["subagents"]["default"] = "reader"
 
     await upgrade_managed_seed(
-        db, spec={**spec, "seed_version": 4}, bundle=future_bundle, row=row
+        db, spec={**spec, "seed_version": 5}, bundle=future_bundle, row=row
     )
 
-    assert row["seed_version"] == 4
-    assert row["config"]["subagents"] == safe_v3_roster
+    assert row["seed_version"] == 5
+    assert row["config"]["subagents"] == _ASSISTANT_V2_SUBAGENTS
     assert row["config"]["future_top_level_key"] is True
+
+
+def _v3_assistant(db):
+    """Rewind the managed assistant to what a pre-2026-11-11 install holds:
+    seed 3, the pinned roster, no `tools` key, the description without a shell."""
+    from orchestrator.services.default_experts import (
+        _ASSISTANT_V3_DESCRIPTION,
+        _ASSISTANT_V3_SUBAGENTS,
+    )
+
+    row = db.rows["application-default-session-seed"]
+    row["seed_version"] = 3
+    row["config"] = {k: v for k, v in row["config"].items() if k != "tools"}
+    row["config"]["subagents"] = deepcopy(_ASSISTANT_V3_SUBAGENTS)
+    row["description"] = _ASSISTANT_V3_DESCRIPTION
+    row["config"]["description"] = _ASSISTANT_V3_DESCRIPTION + "\n"
+    return row
+
+
+@pytest.mark.asyncio
+async def test_v3_assistant_gains_the_shell_an_unpinned_roster_and_the_description():
+    from orchestrator.services.default_experts import _ASSISTANT_V4_SUBAGENTS
+
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    bundle = load_seed_bundle(
+        ROOT / "config", directory="assistant", expert_type="session"
+    )
+    row = _v3_assistant(db)
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 4
+    assert row["config"]["tools"] == {
+        "shell": ["run_command", "cancel_command", "shell_read"]
+    }
+    assert row["config"]["subagents"] == _ASSISTANT_V4_SUBAGENTS
+    assert "tools" not in row["config"]["subagents"]["roster"]["implementer"]
+    assert row["description"] == bundle["description"]
+    assert row["config"]["description"] == bundle["description"]
+
+
+@pytest.mark.asyncio
+async def test_v3_assistant_keeps_an_operators_tools_roster_and_description():
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    row = _v3_assistant(db)
+    row["config"]["tools"] = {"shell": []}
+    row["config"]["subagents"]["roster"]["critic"] = {"$ref": "critic"}
+    theirs = deepcopy(row["config"]["subagents"])
+    row["description"] = "Our house assistant."
+    row["config"]["description"] = "Our house assistant."
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 4
+    assert row["config"]["tools"] == {"shell": []}
+    assert row["config"]["subagents"] == theirs
+    assert row["description"] == "Our house assistant."
+    assert row["config"]["description"] == "Our house assistant."
+
+
+def _v1_general_worker(db):
+    """Rewind the managed General Worker to what a pre-2026-11-11 install holds."""
+    from orchestrator.services.default_experts import (
+        _GENERAL_WORKER_V1_DESCRIPTION,
+        _GENERAL_WORKER_V1_PERSONA,
+    )
+
+    row = db.rows["application-default-worker-seed"]
+    row["seed_version"] = 1
+    row["config"] = {k: v for k, v in row["config"].items() if k != "tools"}
+    row["description"] = _GENERAL_WORKER_V1_DESCRIPTION
+    row["config"]["description"] = _GENERAL_WORKER_V1_DESCRIPTION + "\n"
+    row["prompts"] = {**row["prompts"], "persona": _GENERAL_WORKER_V1_PERSONA + "\n"}
+    return row
+
+
+@pytest.mark.asyncio
+async def test_v1_general_worker_gains_the_shell_and_the_new_description():
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    bundle = load_seed_bundle(
+        ROOT / "config", directory="general-worker", expert_type="worker"
+    )
+    row = _v1_general_worker(db)
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 3
+    assert row["config"]["tools"] == {
+        "shell": ["run_command", "cancel_command", "shell_read"]
+    }
+    assert row["description"] == bundle["description"]
+    assert "no shell" not in row["description"]
+    assert row["config"]["description"] == bundle["description"]
+    assert row["prompts"]["persona"] == bundle["prompts"]["persona"]
+
+
+@pytest.mark.asyncio
+async def test_v1_general_worker_keeps_an_operators_tools_and_description():
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    row = _v1_general_worker(db)
+    row["config"]["tools"] = {"shell": []}
+    row["description"] = "Our house worker."
+    row["config"]["description"] = "Our house worker."
+    row["prompts"] = {**row["prompts"], "persona": "Our house persona."}
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 3
+    assert row["prompts"]["persona"] == "Our house persona."
+    assert row["config"]["tools"] == {"shell": []}
+    assert row["description"] == "Our house worker."
+    assert row["config"]["description"] == "Our house worker."
+
+
+@pytest.mark.asyncio
+async def test_v2_general_worker_gets_the_outcome_first_persona_only():
+    """A seed-2 row (shell already granted) still holds the v1 persona; seed 3
+    replaces exactly that persona and touches nothing else."""
+    from orchestrator.services.default_experts import _GENERAL_WORKER_V1_PERSONA
+
+    db = SeedDB()
+    await seed_managed_default_experts(db, ROOT / "config")
+    bundle = load_seed_bundle(
+        ROOT / "config", directory="general-worker", expert_type="worker"
+    )
+    row = db.rows["application-default-worker-seed"]
+    row["seed_version"] = 2
+    row["description"] = "Our house worker."
+    row["prompts"] = {**row["prompts"], "persona": _GENERAL_WORKER_V1_PERSONA}
+    config_before = deepcopy(row["config"])
+
+    await seed_managed_default_experts(db, ROOT / "config")
+
+    assert row["seed_version"] == 3
+    assert row["prompts"]["persona"] == bundle["prompts"]["persona"]
+    assert "pdf-report" in row["prompts"]["persona"]
+    assert row["description"] == "Our house worker."
+    assert row["config"] == config_before
 
 
 def test_default_expert_migration_shape():
@@ -405,12 +567,12 @@ def test_seed_bundles_carry_the_role_tag():
     assert session["tags"][-1] == "session" and session["tags"].count("session") == 1
 
 
-def test_seed_bundle_reads_expert_local_phase_skill_bodies(tmp_path):
-    """U2: the managed seed's prompts.strategic/tactical come from the
-    expert-local phase skills (body only)."""
+def test_seed_bundle_leaves_expert_local_phase_skills_out_of_prompts(tmp_path):
+    """An expert-local phase skill is read from the expert's directory at
+    freeze time; the managed seed never copies its body into prompts (the
+    strategic/tactical prompt keys are retired, migration 0567)."""
     expert_dir = tmp_path / "experts" / "seeded"
     (expert_dir / "skills" / "strategic-phase").mkdir(parents=True)
-    (expert_dir / "skills" / "tactical-phase").mkdir(parents=True)
     (expert_dir / "config.yaml").write_text(
         "$extends: worker_base\nagent_id: seeded\ndisplay_name: Seeded\n"
     )
@@ -419,20 +581,10 @@ def test_seed_bundle_reads_expert_local_phase_skill_bodies(tmp_path):
         "---\nname: strategic-phase\ndescription: d\ncatalog: hidden\n---\n\n"
         "# Strategic phase\n\nSEEDED STRATEGIC BODY\n"
     )
-    (expert_dir / "skills" / "tactical-phase" / "SKILL.md").write_text(
-        "---\nname: tactical-phase\ndescription: d\ncatalog: hidden\n---\n\n"
-        "# Tactical phase\n\nSEEDED TACTICAL BODY\n"
-    )
 
     bundle = load_seed_bundle(tmp_path, directory="seeded", expert_type="worker")
 
-    assert bundle["prompts"]["persona"] == "I am seeded.\n"
-    assert (
-        bundle["prompts"]["strategic"] == "# Strategic phase\n\nSEEDED STRATEGIC BODY\n"
-    )
-    assert "catalog: hidden" not in bundle["prompts"]["strategic"]
-    assert bundle["prompts"]["tactical"] == "# Tactical phase\n\nSEEDED TACTICAL BODY\n"
-    # The bundled worker seed itself ships no phase prompt of its own.
+    assert bundle["prompts"] == {"persona": "I am seeded.\n"}
     seed = load_seed_bundle(
         ROOT / "config", directory="general-worker", expert_type="worker"
     )

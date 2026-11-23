@@ -71,6 +71,9 @@ import {
 import {JobCloudAction, jobCloudAction} from '../../core/util/job-cloud';
 import {newRequestId} from '../../core/util/request-id';
 import {jobWorkspaceUrl} from '../../core/util/job-workspace-url';
+import {JOB_TITLE_MAX_LENGTH, jobDisplayName, jobMayStillBeNamed, jobNameSuggestion} from '../../core/util/job-name';
+import {plansInPhases} from '../../core/util/phases';
+import {AppInlineEditableTextComponent} from '../../ui/inline-editable-text';
 
 /**
  * Angular's ParamMap keeps repeated keys, which is how multi-value filters
@@ -129,6 +132,7 @@ export type {JobCloudAction};
     JobListFooterComponent,
     JobDetailPanelComponent,
     VMCreationWaitComponent,
+    AppInlineEditableTextComponent,
   ],
   template: `
     <div class="job-list-container">
@@ -313,14 +317,32 @@ export type {JobCloudAction};
                           [title]="getUserName(row.job.user_id)"
                         ></span>
                       }
-                      <span class="prompt-text" [title]="row.job.description">
-                        {{ row.job.description }}
+                      <!-- The job's name: its title once someone named it, else
+                           the task text. The pencil renames; the task text is
+                           untouched and stays in the panel below. -->
+                      <span class="prompt-text" data-testid="job-name">
+                        <app-inline-editable-text
+                          [value]="jobName(row.job)"
+                          [editValue]="jobNameSuggestion(row.job)"
+                          [maxLength]="jobTitleMaxLength"
+                          [ariaLabel]="'common.rename' | transloco"
+                          (save)="onRenameJob(row.job, $event)"
+                        />
                       </span>
                     </div>
                     <div class="job-id" [style.padding-left.px]="row.isChild ? 16 : 0">
                       {{ row.job.id }}
                       @if (row.isChild && row.job.config_name) {
                         <span class="config-badge">{{ row.job.config_name }}</span>
+                      }
+                      <!-- Jobs that plan in phases only: off is the default,
+                           and an unknown value (null) gets no badge either. -->
+                      @if (plansInPhases(row.job)) {
+                        <span
+                          class="config-badge phases-badge"
+                          data-testid="job-phases-badge"
+                          [title]="'jobs.tooltip.phasesBadge' | transloco"
+                        >{{ 'jobs.phasesBadge' | transloco }}</span>
                       }
                     </div>
                     @if (row.job.workspace_contract) {
@@ -374,6 +396,11 @@ export type {JobCloudAction};
                     @if (row.job.status === 'failed' && row.job.error_message && !row.job.vm_creation && !row.job.workspace_creation) {
                       <div class="job-error" [style.padding-left.px]="row.isChild ? 16 : 0" [title]="row.job.error_message">
                         {{ 'jobs.failureReason' | transloco }}: {{ row.job.error_message }}
+                      </div>
+                    }
+                    @if (row.job.status === 'paused' && row.job.error_message && !row.job.vm_creation && !row.job.workspace_creation && !row.job.workspace_recovery) {
+                      <div class="job-error" [style.padding-left.px]="row.isChild ? 16 : 0" [title]="row.job.error_message">
+                        {{ 'jobs.detail.pausedReason' | transloco }}: {{ row.job.error_message }}
                       </div>
                     }
                   </td>
@@ -595,7 +622,7 @@ export type {JobCloudAction};
         size="sm"
         (closed)="confirmDeleteOpen.set(false)"
       >
-        {{ pendingJob()?.description }}
+        {{ jobName(pendingJob()) }}
         <div appDialogActions>
           <app-button variant="secondary" (clicked)="confirmDeleteOpen.set(false)">
             {{ 'common.cancel' | transloco }}
@@ -878,6 +905,11 @@ export type {JobCloudAction};
         color: var(--accent-color);
         margin-left: 2px;
         flex-shrink: 0;
+      }
+
+      .config-badge.phases-badge {
+        background: color-mix(in srgb, var(--info) 15%, transparent);
+        color: var(--info);
       }
 
       .delegation-badge {
@@ -1389,6 +1421,9 @@ export class JobListComponent implements OnInit, OnDestroy {
     if (this.refreshInterval) {
       clearInterval(this.refreshInterval);
     }
+    if (this.nameWatch) {
+      clearTimeout(this.nameWatch);
+    }
     if (this.searchDebounce) {
       clearTimeout(this.searchDebounce);
     }
@@ -1489,6 +1524,7 @@ export class JobListComponent implements OnInit, OnDestroy {
         this.pendingNewCount.set(0);
         this.lastUpdatedAt.set(Date.now());
         this.isLoading.set(false);
+        this.watchForNewNames();
       },
       error: () => {
         if (serial === this.requestSerial) this.isLoading.set(false);
@@ -1541,6 +1577,43 @@ export class JobListComponent implements OnInit, OnDestroy {
         });
       }
     });
+  }
+
+  // The server names a new job a few seconds after it is created. The 30 s
+  // poll would show that name up to half a minute late, right when someone
+  // has just come back from New Job and is looking at the row. So a load that
+  // shows a row still waiting for its name looks again twice, soon.
+  private static readonly NAME_WATCH_DELAYS_MS = [4000, 10000];
+  private nameWatch: ReturnType<typeof setTimeout> | null = null;
+
+  private watchForNewNames(attempt = 0): void {
+    if (this.nameWatch) return;
+    const delay = JobListComponent.NAME_WATCH_DELAYS_MS[attempt];
+    if (delay === undefined || !this.jobs().some((job) => jobMayStillBeNamed(job))) return;
+    this.nameWatch = setTimeout(() => {
+      this.nameWatch = null;
+      if (this.canPoll()) this.pollForChanges();
+      this.watchForNewNames(attempt + 1);
+    }, delay);
+  }
+
+  readonly jobName = jobDisplayName;
+  readonly jobNameSuggestion = jobNameSuggestion;
+  readonly jobTitleMaxLength = JOB_TITLE_MAX_LENGTH;
+  /** Rows of jobs that plan in phases carry a badge. */
+  readonly plansInPhases = plansInPhases;
+
+  /** Rename from the row's pencil: shown at once, put back if the server refuses. */
+  onRenameJob(job: JobSummary, title: string): void {
+    const previous = job.title ?? null;
+    this.setJobTitle(job.id, title);
+    this.api.renameJob(job.id, title).subscribe((renamed) => {
+      this.setJobTitle(job.id, renamed ? renamed.title : previous);
+    });
+  }
+
+  private setJobTitle(jobId: string, title: string | null): void {
+    this.jobs.update((current) => current.map((job) => (job.id === jobId ? {...job, title} : job)));
   }
 
   showNewJobs(): void {

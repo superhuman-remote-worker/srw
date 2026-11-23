@@ -133,9 +133,9 @@ and Qwen3 Reranker 8B and pins the four defaults.
 
 Otherwise you add models in Cockpit after the first login (below). The form's
 **Use AI subscriptions** option instead installs a proxy that lets you connect a
-supported subscription account under **Settings → AI Subscriptions**; a
-subscription may not supply every capability, so you may still need a
-provider for the rest.
+supported subscription account under **Settings → Administration →
+Subscriptions**; a subscription may not supply every capability, so you may
+still need a provider for the rest.
 
 ## Run SRW locally with k3d
 
@@ -203,3 +203,17 @@ it **Completed**. To let a job complete on its own, set **Autonomy** to
 **Full** in the job's execution settings (your administrator may need to allow
 that level for you). [Concepts](concepts.md) explains statuses and autonomy
 levels.
+
+## From the terminal
+
+Everything above also works without the browser. `srw` is a command-line
+client for people and pipelines: it keeps experts and other configuration as
+files, starts jobs, waits for them and fetches their results.
+
+```bash
+curl -fsSL https://docs.superhuman-remote-worker.com/install.sh | sh
+srw login --server https://api.example.com
+srw run "Summarise the open issues in this project" --wait
+```
+
+[srw CLI](cli.md) covers installing, logging in and a first walkthrough.

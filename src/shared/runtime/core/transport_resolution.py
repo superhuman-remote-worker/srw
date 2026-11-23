@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Optional
 from urllib.parse import urlsplit
 
+from shared.tls_pinning import TLS_PINNED_CERT_SUFFIX, TlsPin
+
 # Providers whose create_llm factory RAISES when no api_key resolves.
 KEY_REQUIRED_PROVIDERS = frozenset(
     {"openrouter", "mistral", "anthropic", "google", "groq"}
@@ -333,6 +335,7 @@ _DISPATCH_ENV_SUFFIXES = (
     "PROVIDER",
     "PROFILE_ID",
     "DIMENSIONS",
+    "TLS_PINNED_CERT",
 )
 # Non-secret tuning an owner may set through a project override's env_keys.
 # Each carries neither a key nor a URL, so it cannot move a credential.
@@ -394,6 +397,47 @@ def clear_served_model_env(prefixes: Optional[Iterable[str]] = None) -> None:
         os.environ.pop(f"{prefix}_SERVED_MODEL", None)
         if prefix == "CITATION_LLM":
             os.environ.pop(CITATION_PROVIDER_ENV_KEY, None)
+
+
+def endpoint_pins_replaced_by(
+    block: Optional[Mapping], env: Optional[Mapping[str, str]] = None
+) -> tuple[str, ...]:
+    """The ``{PREFIX}_TLS_PINNED_CERT`` names whose endpoint ``block`` replaces.
+
+    ``block`` holds the values about to be applied over ``env`` (default
+    ``os.environ``); only strings count, as only strings are exported. A
+    prefix's endpoint is replaced when, after the block is applied, the URL
+    its reader picks (the first non-empty of :func:`env_endpoint_names`) comes
+    from the block, or the block leaves the prefix with no URL at all. A block
+    that names no endpoint for a prefix, or only its key, replaces nothing.
+    """
+    source = os.environ if env is None else env
+    given = {k for k, v in (block or {}).items() if isinstance(v, str)}
+    replaced: list[str] = []
+    for prefix in _DISPATCH_ENV_PREFIXES:
+        names = env_endpoint_names(prefix)
+        if not given.intersection(names):
+            continue
+        picked = next(
+            (n for n in names if (block[n] if n in given else source.get(n))), None
+        )
+        if picked is None or picked in given:
+            replaced.append(f"{prefix}_{TLS_PINNED_CERT_SUFFIX}")
+    return tuple(replaced)
+
+
+def clear_replaced_endpoint_pins(block: Optional[Mapping]) -> None:
+    """Drop the pin of every endpoint ``block`` replaces, before it is applied.
+
+    A pin belongs to the base URL it travels with. Agent pods are reused, and
+    a block that brings a new, unpinned URL for a prefix carries no pin name
+    at all (dispatch writes one only next to a pinned endpoint's URL), so the
+    previous block's pin would stay and pair with the new URL. The pair is
+    replaced together: a prefix the block leaves alone keeps its URL and its
+    pin, because dropping only the pin would send the old URL unpinned.
+    """
+    for name in endpoint_pins_replaced_by(block):
+        os.environ.pop(name, None)
 
 
 # Set by ``create_llm`` on every chat client it builds, so a recorder that
@@ -474,6 +518,7 @@ class CitationTransport:
     base_url: Optional[str]
     api_key: Optional[str]
     key_source: str
+    tls_pin: Optional[TlsPin] = None
 
 
 def is_openai_default_endpoint(base_url: Optional[str]) -> bool:
@@ -519,10 +564,20 @@ def resolve_citation_transport(env: Optional[Mapping] = None) -> CitationTranspo
     names = env_endpoint_names("CITATION_LLM")
     url_var = next((name for name in names if env.get(name)), names[-1])
     base_url = env.get(url_var) or None
+    # The pin belongs to the endpoint whichever spelling names it. An
+    # unreadable or malformed pin is refused like any other unusable transport
+    # (the agent degrades the citation client); it never becomes "no pin".
+    try:
+        tls_pin = TlsPin.from_env("CITATION_LLM", env)
+    except ValueError as exc:
+        raise CitationTransportError(str(exc)) from exc
     dedicated = env.get("CITATION_LLM_API_KEY") or None
     if dedicated:
         return CitationTransport(
-            base_url=base_url, api_key=dedicated, key_source="CITATION_LLM_API_KEY"
+            base_url=base_url,
+            api_key=dedicated,
+            key_source="CITATION_LLM_API_KEY",
+            tls_pin=tls_pin,
         )
     if not is_openai_default_endpoint(base_url):
         raise CitationTransportError(
@@ -537,4 +592,5 @@ def resolve_citation_transport(env: Optional[Mapping] = None) -> CitationTranspo
         base_url=base_url,
         api_key=shared,
         key_source="OPENAI_API_KEY" if shared else "none",
+        tls_pin=tls_pin,
     )

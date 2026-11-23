@@ -24,6 +24,7 @@ from shared.runtime.services.auxiliary import (
     KnowledgeAssemblyResult,
 )
 from shared.runtime.services.knowledge_store import KnowledgeRecord, KnowledgeStore
+from tests._kb_context import KbMockContext
 
 
 def _make_store():
@@ -306,7 +307,7 @@ def _lock(claimed: bool):
 
 
 def _make_tool_context(stale_notes, *, active_total=1000, lock_claimed=True):
-    tc = MagicMock()
+    tc = KbMockContext()  # the project's knowledge base is attached
     tc.project_id = str(uuid.uuid4())
     ks = AsyncMock()
     ks.get_stale_notes = AsyncMock(return_value=stale_notes)

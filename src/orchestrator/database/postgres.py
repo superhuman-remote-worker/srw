@@ -54,6 +54,7 @@ from shared.connectors.builtin import (
     legacy_types_with_config_key,
 )
 from shared.connectors.platform import (
+    connector_description_for_agent_sql,
     native_cloud_project_sql,
     native_project_sql,
     native_user_sql,
@@ -215,9 +216,18 @@ from shared.operator_pause_hold import (
     operator_pause_hold_present_sql,
 )
 from shared.workspace_disk import (
+    RESUME_REQUIRED,
     WorkspaceDiskFullReport,
+    WorkspaceMemoryKill,
+    WorkspaceTermination,
     WorkspaceVolumeGrowth,
+    decide_memory_growth,
+    new_memory_growth_record,
+    recorded_termination,
     workspace_disk_full_action,
+    workspace_hold_facts,
+    workspace_kept_clause,
+    workspace_memory_attention,
 )
 from orchestrator.services.ssh_handles import is_valid_handle, mint_ssh_handle
 
@@ -932,6 +942,49 @@ def _different_valid_k8s_runtime(
     except RuntimeError:
         return None
     return current_runtime if current_runtime != retired_runtime else None
+
+
+def _workspace_memory_kill(
+    workspace: Mapping[str, Any],
+    *,
+    runtime: str,
+    termination: WorkspaceTermination | None = None,
+    cap_bytes: int | None = None,
+) -> tuple[WorkspaceMemoryKill, dict[str, Any]] | None:
+    """The out-of-memory facts of a hold for ``runtime``, and its row updates.
+
+    ``termination`` is a fresh read of the dead Pod; without one, the job
+    row's settled record for the same runtime counts. Anything but a recorded
+    ``OOMKilled`` returns None and the hold keeps its usual wording. The
+    updates keep the record and, the first time, the one larger limit the
+    next Resume runs with (``memory_growth``, read by the Pod creator).
+    knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
+    """
+    record = (
+        termination
+        if termination is not None and termination.pod_uid == runtime
+        else recorded_termination(workspace, runtime)
+    )
+    if record is None or record.cause != "out_of_memory":
+        return None
+    previous = workspace.get("memory_growth")
+    growth = decide_memory_growth(
+        limit_bytes=record.memory_limit_bytes,
+        previous=previous,
+        cap_bytes=cap_bytes,
+        runtime_incarnation=runtime,
+    )
+    updates: dict[str, Any] = {"last_termination": record.as_dict()}
+    grown = new_memory_growth_record(
+        growth,
+        from_bytes=record.memory_limit_bytes,
+        runtime_incarnation=runtime,
+        at=datetime.now(timezone.utc).isoformat(),
+        previous=previous,
+    )
+    if grown is not None:
+        updates["memory_growth"] = grown
+    return WorkspaceMemoryKill.from_termination(record, growth), updates
 
 
 def _json_object_or_empty(value: Any) -> dict[str, Any]:
@@ -4103,6 +4156,7 @@ class PostgresDB:
             id_param = f"${len(values)}"
             conditions.append(
                 f"(j.description ILIKE {description_param} "
+                f"OR j.title ILIKE {description_param} "
                 f"OR j.id::text LIKE {id_param})"
             )
 
@@ -4283,7 +4337,7 @@ class PostgresDB:
                       FROM subtree
                      GROUP BY root_id
                 )
-                SELECT j.id, j.description, j.status,
+                SELECT j.id, j.description, j.title, j.status,
                        j.completion_outcome_kind, j.origin,
                        j.config_name,
                        -- A DB expert's job stores config_name='worker_base'
@@ -4304,6 +4358,10 @@ class PostgresDB:
                        j.config_override AS _workspace_config_override,
                        j.context AS _workspace_context,
                        j.context->'snapshot'->>'status' AS snapshot_status,
+                       -- Whether the job plans in phases (shared.job_phases),
+                       -- as admission wrote it on the job; NULL when unknown.
+                       CASE j.config_override->>'phases' WHEN 'true' THEN true
+                            WHEN 'false' THEN false END AS phases,
                        p.name AS project_name,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
                        (pa.id IS NOT NULL) AS pending_approval,
@@ -4487,7 +4545,8 @@ class PostgresDB:
                        j.error_message, j.error_details, j.runner_kind,
                        j.execution_lane,
                        j.created_by_thread_id, j.wake_on_complete,
-                       j.created_at, j.updated_at, j.description, j.context,
+                       j.created_at, j.updated_at, j.description, j.title,
+                       j.context,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
                        wr.workspace_recovery AS _workspace_recovery,
                        (SELECT jsonb_build_object(
@@ -7617,6 +7676,39 @@ class PostgresDB:
             interrupted_command=True,
         )
 
+    async def hold_retired_workspace_recovery(
+        self,
+        job_id: str,
+        *,
+        expected_workspace: Dict[str, Any],
+        expected_agent_id: str | None,
+        error_detail: str,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
+        memory_growth_cap_bytes: int | None = None,
+    ) -> Dict[str, Any] | None:
+        """Hold an interrupted command whose runtime was already retired.
+
+        The lifecycle reconciler can retire a failed Pod before the worker's
+        report arrives. That retirement settled an exact ``preserve`` cleanup
+        of this runtime, so the report finds the row ``deleted`` instead of
+        ``ready``. The same hold as the unknown-outcome mode applies, proven by
+        the settled projection Resume already accepts; no cleanup is admitted.
+        knowledge-base/knowledge/issues/workspace_report_after_automatic_pod_cleanup_parks_job_in_processing.md
+        """
+        return await self._hold_workspace_recovery_attention(
+            job_id,
+            expected_workspace=expected_workspace,
+            expected_agent_id=expected_agent_id,
+            recovery_cap=0,
+            error_detail=error_detail,
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+            interrupted_command=True,
+            retired_runtime=True,
+            memory_growth_cap_bytes=memory_growth_cap_bytes,
+        )
+
     async def hold_full_workspace_disk(
         self,
         job_id: str,
@@ -7667,6 +7759,8 @@ class PostgresDB:
         disk_full: WorkspaceDiskFullReport | None = None,
         disk_growth: WorkspaceVolumeGrowth | None = None,
         requeue: bool = False,
+        retired_runtime: bool = False,
+        memory_growth_cap_bytes: int | None = None,
     ) -> Dict[str, Any] | None:
         """Retain uncertain container work behind the existing explicit-resume fence.
 
@@ -7677,9 +7771,17 @@ class PostgresDB:
 
         ``requeue`` is the one exception to the hold: a full disk whose volume
         grew while no command was running resumes without an explicit Resume.
+
+        ``retired_runtime`` is the unknown-outcome mode for a runtime that an
+        exact ``preserve`` cleanup already retired: the row must be ``deleted``
+        and settled for its own runtime, with nothing else in flight. When that
+        cleanup recorded an ``OOMKilled`` for the runtime, the hold says the
+        workspace ran out of memory and what the next Resume does about it.
         """
         if (completion_command_id is None) != (completion_finalizing_by is None):
             raise ValueError("completion command and finalizer must be paired")
+        if retired_runtime and (not interrupted_command or disk_full is not None):
+            raise ValueError("a retired runtime holds only an interrupted command")
         if requeue and (
             disk_full is None
             or disk_full.command_in_flight
@@ -7736,7 +7838,11 @@ class PostgresDB:
                     or job["control_active"]
                     or OPERATOR_PAUSE_HOLD_CONTEXT_KEY in context
                     or workspace.get("provisioner") != "k8s"
-                    or (interrupted_command and workspace.get("status") != "ready")
+                    or (
+                        interrupted_command
+                        and workspace.get("status")
+                        != ("deleted" if retired_runtime else "ready")
+                    )
                     or workspace.get("_runtime_incarnation") != runtime_uid
                     or any(
                         workspace.get(key) != expected_workspace.get(key)
@@ -7827,6 +7933,28 @@ class PostgresDB:
                         or error.get("type") != "workspace_unavailable"
                     ):
                         return None
+                if retired_runtime and not await conn.fetchval(
+                    # The proof Resume relies on (container_retained_projection_sql):
+                    # an exact preserve cleanup of this very runtime settled the
+                    # row to ``deleted``, kept the claim, and no creator or other
+                    # cleanup of the owner is still in flight.
+                    "SELECT managed_repository_workspace_cleanup_projection_is_settled("
+                    "'job',$1,'workspace_container',$2::text,$2::text,'deleted') "
+                    "AND EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND scope='workspace_container' "
+                    "AND runtime_incarnation::text=$2::text AND result_kind='settled' "
+                    "AND target_disposition='deleted' AND resource_policy='preserve') "
+                    "AND NOT EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND scope='workspace_container' "
+                    "AND (settled_at IS NULL OR (runtime_incarnation::text=$2::text "
+                    "AND resource_policy<>'preserve'))) "
+                    "AND NOT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND scope='workspace_container' "
+                    "AND settled_at IS NULL)",
+                    job_uuid,
+                    runtime_uid,
+                ):
+                    return None
                 attempts = int(workspace.get("recovery_attempts") or 0) + (
                     0
                     if worker_queue_exhausted
@@ -7843,6 +7971,31 @@ class PostgresDB:
                     and attempts <= recovery_cap
                 ):
                     return None
+                # A full disk was measured through a live transport and an
+                # interrupted command passed the live probe: the Pod runs. A
+                # retired runtime, or an exhausted one the reconciler already
+                # retired, is gone. Otherwise this hold removed nothing and
+                # nobody checked the Pod.
+                facts = workspace_hold_facts(
+                    runtime_replaced=(
+                        True
+                        if retired_runtime
+                        or (disk_full is None and workspace.get("status") == "deleted")
+                        else False
+                        if disk_full is not None or interrupted_command
+                        else None
+                    ),
+                    binding=context.get("_workspace_binding"),
+                )
+                memory_kill = (
+                    _workspace_memory_kill(
+                        workspace,
+                        runtime=runtime_uid,
+                        cap_bytes=memory_growth_cap_bytes,
+                    )
+                    if retired_runtime
+                    else None
+                )
                 outcome = {
                     "status": "handled",
                     "job_id": job_id,
@@ -7854,6 +8007,10 @@ class PostgresDB:
                             disk_full, disk_growth, resumed=requeue
                         )
                         if disk_full is not None
+                        else memory_kill[0].action()
+                        + " "
+                        + workspace_kept_clause(**facts)
+                        if memory_kill is not None
                         else (
                             "workspace transport lost; interrupted command outcome is unknown; "
                             if interrupted_command
@@ -7861,11 +8018,15 @@ class PostgresDB:
                             if worker_queue_exhausted
                             else f"workspace recovery exhausted after {recovery_cap} attempts; "
                         )
-                        + "workspace and checkpoints retained; explicit Resume required"
+                        + RESUME_REQUIRED
+                        + ". "
+                        + workspace_kept_clause(**facts)
                     ],
                     **({"cleanup_pending": False} if interrupted_command else {}),
                 }
                 updates = {"recovery_attempts": attempts}
+                if memory_kill is not None:
+                    updates.update(memory_kill[1])
                 if disk_growth is not None and disk_growth.grown:
                     # The volume grows once per job; a later full disk holds.
                     updates["disk_growth"] = disk_growth.as_dict()
@@ -7877,6 +8038,7 @@ class PostgresDB:
                     )
                 freeze = {
                     "freeze_type": "workspace_recovery_attention",
+                    **facts,
                     "recovery_attempts": attempts,
                     "budget": "worker_queue"
                     if worker_queue_exhausted
@@ -7885,6 +8047,11 @@ class PostgresDB:
                     **(
                         {"reason": "interrupted_command_outcome_unknown"}
                         if interrupted_command and disk_full is None
+                        else {}
+                    ),
+                    **(
+                        workspace_memory_attention(memory_kill[0])
+                        if memory_kill is not None
                         else {}
                     ),
                     **(
@@ -7958,12 +8125,19 @@ class PostgresDB:
         error_detail: str,
         completion_command_id: str | None = None,
         completion_finalizing_by: str | None = None,
+        termination: WorkspaceTermination | None = None,
+        memory_growth_cap_bytes: int | None = None,
     ) -> Dict[str, Any] | None:
         """Atomically hold uncertain work and admit only exact preserve cleanup.
 
         A legacy report gets a restrictive hold, without a cleanup continuation.
         Durable reports retain a pending receipt until physical cleanup settles.
         This never infers process zero or permission to rerun an interrupted tool.
+
+        ``termination`` is the recovery arm's read of the dead Pod. An
+        ``OOMKilled`` there words the hold as a memory kill at once; otherwise
+        :meth:`complete_workspace_recovery_cleanup` upgrades the text from the
+        record the cleanup settled.
         """
         if (completion_command_id is None) != (completion_finalizing_by is None):
             raise ValueError("completion command and finalizer must be paired")
@@ -8081,6 +8255,18 @@ class PostgresDB:
                     return None
                 hold_id = str(uuid4())
                 attempts = int(workspace.get("recovery_attempts") or 0) + 1
+                # A durable report's preserve cleanup deletes the dead Pod; a
+                # legacy report's hold removes nothing.
+                facts = workspace_hold_facts(
+                    runtime_replaced=True if command_uuid is not None else None,
+                    binding=context.get("_workspace_binding"),
+                )
+                memory_kill = _workspace_memory_kill(
+                    workspace,
+                    runtime=runtime,
+                    termination=termination,
+                    cap_bytes=memory_growth_cap_bytes,
+                )
                 outcome = {
                     "status": "handled",
                     "job_id": job_id,
@@ -8089,11 +8275,19 @@ class PostgresDB:
                     "held_for_resume": True,
                     "cleanup_pending": command_uuid is not None,
                     "actions": [
-                        "workspace transport lost; interrupted command outcome is unknown; "
-                        "workspace storage and checkpoints retained; explicit Resume required"
+                        (
+                            memory_kill[0].action()
+                            if memory_kill is not None
+                            else "workspace transport lost; interrupted command "
+                            f"outcome is unknown; {RESUME_REQUIRED}."
+                        )
+                        + " "
+                        + workspace_kept_clause(**facts)
                     ],
                 }
                 updates = {"recovery_attempts": attempts}
+                if memory_kill is not None:
+                    updates.update(memory_kill[1])
                 if command_uuid is not None:
                     # Do not let the general cleanup preparer cancel an open
                     # creator or classify somebody else's ambiguous intent.
@@ -8174,7 +8368,13 @@ class PostgresDB:
                     json.dumps(
                         {
                             "reason": "interrupted_command_outcome_unknown",
+                            **facts,
                             "detail": str(error_detail)[:1000],
+                            **(
+                                workspace_memory_attention(memory_kill[0])
+                                if memory_kill is not None
+                                else {}
+                            ),
                         }
                     ),
                     outcome["actions"][0],
@@ -8242,8 +8442,15 @@ class PostgresDB:
         value: Any,
         *,
         completion_finalizing_by: str,
+        memory_growth_cap_bytes: int | None = None,
     ) -> Dict[str, Any] | None:
-        """Acknowledge physical preserve settlement without lifting its hold."""
+        """Acknowledge physical preserve settlement without lifting its hold.
+
+        The settled cleanup recorded how the retired runtime ended. When that
+        is an ``OOMKilled`` and the hold does not say so yet (the report came
+        before the kubelet published the Pod's end), the hold's text, its
+        attention and the job's error message say it now, in the same write.
+        """
         receipt = ContainerRecoveryCleanup.parse(value)
         if receipt is None:
             return None
@@ -8280,24 +8487,55 @@ class PostgresDB:
                 }
                 if workspace["recovery_cleanup"]["phase"] == "settled":
                     return outcome
+                hold = context.get(OPERATOR_PAUSE_HOLD_CONTEXT_KEY) or {}
+                attention = hold.get("attention") if isinstance(hold, dict) else None
+                attention = attention if isinstance(attention, dict) else {}
+                workspace_updates: dict[str, Any] = {
+                    "recovery_cleanup": {**receipt.as_dict(), "phase": "settled"},
+                }
+                attention_updates: dict[str, Any] = {}
+                memory_kill = (
+                    None
+                    if WorkspaceMemoryKill.from_attention(attention) is not None
+                    else _workspace_memory_kill(
+                        workspace,
+                        runtime=receipt.runtime_incarnation,
+                        cap_bytes=memory_growth_cap_bytes,
+                    )
+                )
+                if memory_kill is not None:
+                    action = (
+                        memory_kill[0].action()
+                        + " "
+                        + workspace_kept_clause(
+                            runtime_replaced=attention.get("runtime_replaced"),
+                            volume_kept=attention.get("volume_kept"),
+                        )
+                    )
+                    outcome["actions"] = [action]
+                    workspace_updates.update(memory_kill[1])
+                    attention_updates = workspace_memory_attention(memory_kill[0])
+                workspace_updates["recovery_completion_outcome"] = outcome
                 changed = await conn.fetchval(
-                    "UPDATE jobs SET context=jsonb_set(context,'{workspace_container}',"
-                    "context->'workspace_container'||$2::jsonb),updated_at=clock_timestamp() "
+                    "UPDATE jobs SET context=CASE WHEN $5::jsonb='{}'::jsonb THEN "
+                    "jsonb_set(context,'{workspace_container}',"
+                    "context->'workspace_container'||$2::jsonb) ELSE "
+                    "jsonb_set(jsonb_set(context,'{workspace_container}',"
+                    "context->'workspace_container'||$2::jsonb),"
+                    f"'{{{OPERATOR_PAUSE_HOLD_CONTEXT_KEY},attention}}',"
+                    f"COALESCE(context->'{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}'->'attention',"
+                    "'{}'::jsonb)||$5::jsonb) END,"
+                    "error_message=COALESCE($6::text,error_message),"
+                    "updated_at=clock_timestamp() "
                     "WHERE id=$1 AND EXISTS(SELECT 1 FROM job_completion_commands "
                     "WHERE id=$3 AND job_id=$1 AND state='finalizing' AND finalizing_by=$4 "
                     "AND lease_expires_at>clock_timestamp() AND deadline_at>clock_timestamp()) RETURNING id",
                     UUID(receipt.job_id),
-                    json.dumps(
-                        {
-                            "recovery_cleanup": {
-                                **receipt.as_dict(),
-                                "phase": "settled",
-                            },
-                            "recovery_completion_outcome": outcome,
-                        }
-                    ),
+                    json.dumps(workspace_updates),
                     UUID(receipt.command_id),
                     completion_finalizing_by,
+                    json.dumps(attention_updates),
+                    outcome["actions"][0] if memory_kill is not None else None,
                 )
                 return outcome if changed else None
 
@@ -8346,7 +8584,22 @@ class PostgresDB:
                 or intent["result_kind"] != "settled"
                 or intent["settled_at"] is None
                 or intent["resources_captured_at"] is None
-                or intent["pvc_uid"] is None
+            ):
+                return None
+            # No claim captured: retained storage only when the runtime never
+            # had one, as its own creation recorded (an emptyDir home). A
+            # claim lost since then is not that, and keeps Resume refused.
+            # knowledge-base/knowledge/issues/dead_pod_hold_without_volume_refuses_every_resume.md
+            if intent["pvc_uid"] is None and not await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                "WHERE id::text=$1 AND owner_kind='job' AND owner_id=$2 "
+                "AND scope='workspace_container' AND runtime_incarnation=$3::uuid "
+                "AND claim_token::text=$4 AND result_kind='settled' "
+                "AND settled_at IS NOT NULL AND pvc_uid IS NULL)",
+                workspace.get("_creation_reservation_id"),
+                job_uuid,
+                receipt.runtime_incarnation,
+                workspace.get("_creation_claim_token"),
             ):
                 return None
             return dict(intent)
@@ -12165,7 +12418,8 @@ class PostgresDB:
                       FROM descendants
                      ORDER BY id, depth
                 )
-                SELECT j.id, j.parent_job_id, u.depth, j.description, j.status,
+                SELECT j.id, j.parent_job_id, u.depth, j.description, j.title,
+                       j.status,
                        j.config_name, j.origin, j.error_message,
                        j.created_at, j.completed_at, j.updated_at
                   FROM unique_descendants u
@@ -12177,6 +12431,48 @@ class PostgresDB:
             )
 
         return [dict(row) for row in rows]
+
+    async def update_job_title(self, job_id: str, title: str | None) -> bool:
+        """Set or clear a job's display title (a person renaming the job).
+
+        ``None`` clears it, and readers show the description again. Writes
+        only the title; ``updated_at`` still moves, because its trigger fires
+        on every write to the row.
+
+        Returns True if the job exists.
+        """
+        try:
+            uuid_val = UUID(str(job_id))
+        except (ValueError, AttributeError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE jobs SET title = $2 WHERE id = $1",
+                uuid_val,
+                title,
+            )
+        return result == "UPDATE 1"
+
+    async def set_job_title_if_unnamed(self, job_id: str, title: str) -> bool:
+        """Store a generated title unless the job has a name by now.
+
+        The ``title IS NULL`` guard is what lets a person's rename win over
+        the auxiliary model, in either order: a name set first is kept, and a
+        later rename replaces the generated one like any other.
+
+        Returns True if this call named the job.
+        """
+        try:
+            uuid_val = UUID(str(job_id))
+        except (ValueError, AttributeError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE jobs SET title = $2 WHERE id = $1 AND title IS NULL",
+                uuid_val,
+                title,
+            )
+        return result == "UPDATE 1"
 
     async def store_resolved_config(
         self, job_id: str, resolved_config: Dict[str, Any]
@@ -23184,8 +23480,16 @@ class PostgresDB:
         claimant: str,
         claim_token: int,
         recovery_receipt: Dict[str, Any] | None = None,
+        termination: Dict[str, Any] | None = None,
     ) -> bool:
-        """Atomically publish cleanup-complete and the exact final projection."""
+        """Atomically publish cleanup-complete and the exact final projection.
+
+        ``termination`` is how the retired runtime's workspace container
+        ended, read from the exact Pod before its delete. A job keeps it as
+        ``workspace_container.last_termination`` for that runtime only, so a
+        hold can name a memory kill. It grants nothing.
+        knowledge-base/knowledge/issues/workspace_out_of_memory_is_reported_as_transport_lost.md
+        """
 
         constrained = ContainerRecoveryCleanup.parse(recovery_receipt)
         if recovery_receipt is not None and constrained is None:
@@ -23439,6 +23743,26 @@ class PostgresDB:
                     )
                     if updated != "UPDATE 1":
                         raise RuntimeError("workspace cleanup projection was lost")
+                    recorded = WorkspaceTermination.from_dict(termination)
+                    if (
+                        owner_kind == "job"
+                        and scope == "workspace_container"
+                        and recorded is not None
+                        and recorded.pod_uid == expected_runtime
+                    ):
+                        # The cleanup projection must equal the exact settled
+                        # shape (managed_repo_workspace_cleanup_projection_
+                        # authorized_now), so the record follows it in the same
+                        # transaction. It is outside the authority envelope.
+                        await conn.execute(
+                            "UPDATE jobs SET context=jsonb_set(context,"
+                            "'{workspace_container,last_termination}',$2::jsonb) "
+                            "WHERE id=$1 AND context->'workspace_container'"
+                            "->>'_runtime_incarnation'=$3",
+                            owner_uuid,
+                            json.dumps(recorded.as_dict()),
+                            expected_runtime,
+                        )
                 return True
 
     async def restore_settled_thread_workspace_cleanup_projection(
@@ -36339,6 +36663,55 @@ class PostgresDB:
             """,
             *args,
         )
+
+    async def parked_completion_commands_for_jobs(
+        self, job_ids: Any
+    ) -> Dict[str, Dict[str, Any]]:
+        """Each job whose oldest unfinished completion command is parked.
+
+        Route ``alert_only`` of the routing view: the command waits for an
+        operator's unpark or force-resolve and nothing automatic moves it.
+        Keyed by job id; jobs without such a command are absent. Callers ask
+        only with completion commands enabled.
+        """
+        ids: list[UUID] = []
+        for job_id in job_ids or ():
+            try:
+                ids.append(UUID(str(job_id)))
+            except (TypeError, ValueError):
+                continue
+        if not ids:
+            return {}
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT route.job_id, route.command_id, route.command_attempts, "
+                "command.error_code, command.reported_at "
+                "FROM job_completion_sweep_exclusions AS route "
+                "JOIN job_completion_commands AS command ON command.id=route.command_id "
+                "WHERE route.job_id=ANY($1::uuid[]) AND route.route='alert_only'",
+                ids,
+            )
+        return {
+            str(row["job_id"]): {
+                "command_id": str(row["command_id"]),
+                "attempts": int(row["command_attempts"]),
+                "error_code": row["error_code"],
+                "reported_at": row["reported_at"],
+            }
+            for row in rows
+        }
+
+    async def completion_command_state(self, command_id: str) -> str | None:
+        """The current state of one completion command, or None if unknown."""
+        try:
+            command_uuid = UUID(str(command_id))
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT state FROM job_completion_commands WHERE id=$1",
+                command_uuid,
+            )
 
     async def _completion_resume_blocked_on_conn(
         self,
@@ -52273,10 +52646,22 @@ class PostgresDB:
         visibility: str | None = None,
         ownership: str | None = None,
         availability: str | None = None,
+        managed: bool | None = None,
         limit: int = 50,
         cursor: str | None = None,
     ) -> Dict[str, Any]:
         """Cursor-page the management catalog after authorization/filtering.
+
+        ``managed`` splits the catalog by who keeps a row: True for the ones
+        SRW provisions (``platform_owned_sql``: a project's folders and
+        knowledge base, a user's cloud), False for the ones people created,
+        None for both.
+
+        The first page (no ``cursor``) also carries ``type_counts``: how many
+        rows each type has under every filter but ``type``, so a type strip
+        can show its counts without narrowing to the type that is selected.
+        Each row carries ``native_project_name``: the name of the project a
+        connector SRW keeps belongs to (NULL for any other row).
 
         ``visible_project_ids`` must come from the caller's authenticated
         project memberships. ``restrict_to_projects`` is used by a
@@ -52353,8 +52738,6 @@ class PostgresDB:
                 "OR COALESCE(d.description, '') ILIKE '%' || {param} || '%')",
                 q.strip(),
             )
-        if ds_type:
-            add_condition("d.type = {param}", ds_type)
         if filter_project_uuid:
             add_condition(
                 "EXISTS (SELECT 1 FROM project_datasources filter_pd "
@@ -52374,6 +52757,10 @@ class PostgresDB:
             conditions.append("d.created_by = $1")
         elif ownership == "shared":
             conditions.append("d.created_by IS DISTINCT FROM $1")
+        if managed is True:
+            conditions.append(platform_owned_sql("d"))
+        elif managed is False:
+            conditions.append(f"NOT {platform_owned_sql('d')}")
         if availability == "all":
             conditions.append("d.scope_mode = 'all'")
         elif availability == "projects":
@@ -52388,6 +52775,13 @@ class PostgresDB:
                 "SELECT 1 FROM project_datasources availability_pd "
                 "WHERE availability_pd.datasource_id = d.id)"
             )
+        # Every filter but the type: what the type counts are taken over.
+        # The type and the cursor come last, so these conditions use only
+        # the parameters before them.
+        facet_where = " AND ".join(conditions)
+        facet_values = list(values)
+        if ds_type:
+            add_condition("d.type = {param}", ds_type)
         if cursor_created_at is not None and cursor_id is not None:
             values.extend([cursor_created_at, cursor_id])
             conditions.append(
@@ -52421,7 +52815,11 @@ class PostgresDB:
                                    WHERE pd.datasource_id = d.id
                                      AND pd.project_id = ANY($2::uuid[])
                                ), ARRAY[]::uuid[])
-                       END AS project_ids
+                       END AS project_ids,
+                       (
+                           SELECT native_p.name FROM projects native_p
+                           WHERE native_p.id::text = {native_project_sql("d")}
+                       ) AS native_project_name
                 FROM datasources d
                 WHERE {where_clause}
                 ORDER BY d.created_at DESC, d.id DESC
@@ -52429,6 +52827,25 @@ class PostgresDB:
                 """,
                 *values,
             )
+            type_counts: dict[str, int] | None = None
+            if page is None:
+                # The one-row join names $1..$4, which the conditions may
+                # leave out (an administrator's have no owner test).
+                counted = await conn.fetch(
+                    f"""
+                    SELECT d.type, count(*)::int AS n
+                    FROM datasources d
+                    CROSS JOIN (
+                        SELECT $1::uuid AS owner_id, $2::uuid[] AS visible_ids,
+                               $3::boolean AS full_admin,
+                               $4::boolean AS restricted
+                    ) AS catalog_params
+                    WHERE {facet_where}
+                    GROUP BY d.type
+                    """,
+                    *facet_values,
+                )
+                type_counts = {str(row["type"]): int(row["n"]) for row in counted}
 
         has_more = len(rows) > safe_limit
         page_rows = rows[:safe_limit]
@@ -52439,7 +52856,10 @@ class PostgresDB:
             next_cursor = _encode_page_cursor(
                 {"created_at": last["created_at"], "id": last["id"]}
             )
-        return {"items": items, "next_cursor": next_cursor}
+        result: Dict[str, Any] = {"items": items, "next_cursor": next_cursor}
+        if type_counts is not None:
+            result["type_counts"] = type_counts
+        return result
 
     async def list_project_linkable_datasources(
         self,
@@ -53750,6 +54170,32 @@ class PostgresDB:
                     )
             ds["_owner_can_autonomous_send"] = allowed
 
+    async def _stamp_mcp_server_questions_default(
+        self, datasources: List[Dict[str, Any]]
+    ) -> None:
+        """Stamp the installation's default for MCP server questions on each
+        row (``shared.mcp_questions``), so the (sync) dispatch payload builder
+        resolves a connector without its own choice. One read per
+        resolution (a registered MCP driver's type is not known here, so
+        every row is stamped); an unreadable setting leaves the factory
+        default (decline)."""
+        from shared.mcp_questions import SYSTEM_SETTING_KEY, setting_or_none
+
+        if not datasources:
+            return
+        default = None
+        try:
+            row = await self.get_system_setting(SYSTEM_SETTING_KEY)
+            value = (row or {}).get("value")
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, dict):
+                default = setting_or_none(value.get("default"))
+        except Exception:
+            logger.exception("MCP server-questions default unreadable; declining")
+        for ds in datasources:
+            ds["_server_questions_default"] = default
+
     async def resolve_datasources_for_job(
         self, job_id: str, project_id: str | None = None
     ) -> List[Dict[str, Any]]:
@@ -53778,10 +54224,15 @@ class PostgresDB:
 
         project_uuid = UUID(project_id) if project_id else None
 
+        # What the agent is told about each connector (its README line): the
+        # project's note on the link, else the connector's own description,
+        # except for a connector SRW keeps, whose description is SRW's own
+        # wording of what its README entry already says.
+        description = connector_description_for_agent_sql("d", "pd.description")
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
-                SELECT DISTINCT d.id, d.name, d.description, d.type,
+                f"""
+                SELECT DISTINCT d.id, d.name, {description} AS description, d.type,
                     d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch, d.read_only,
                     d.created_by, d.is_global, d.scope_mode, d.auto_attach,
@@ -53800,6 +54251,7 @@ class PostgresDB:
 
         resolved = [_datasource_row_to_dict(row) for row in rows]
         await self._stamp_email_autonomous_send(resolved)
+        await self._stamp_mcp_server_questions_default(resolved)
         return resolved
 
     async def resolve_datasources_for_thread(
@@ -53851,10 +54303,13 @@ class PostgresDB:
                 pass
 
         native_project = native_project_sql("d")
+        # The note the thread's projects agree on (one project, or several
+        # with the same note), as for the job path's README line.
+        description = connector_description_for_agent_sql("d", "project_policy.note")
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT d.id, d.name, d.description, d.type,
+                SELECT d.id, d.name, {description} AS description, d.type,
                     d.connection_url, d.credentials, d.config,
                     d.cli_hint, d.default_branch, d.read_only,
                     d.created_by, d.is_global, d.scope_mode, d.auto_attach,
@@ -53870,7 +54325,9 @@ class PostgresDB:
                 LEFT JOIN LATERAL (
                     SELECT BOOL_OR(pd.read_only) AS read_only,
                            CASE WHEN count(DISTINCT pd.access) = 1
-                                THEN min(pd.access) END AS access
+                                THEN min(pd.access) END AS access,
+                           CASE WHEN count(DISTINCT pd.description) = 1
+                                THEN min(pd.description) END AS note
                     FROM project_datasources pd
                     WHERE pd.datasource_id = d.id
                       AND pd.project_id = ANY($2::uuid[])
@@ -53884,6 +54341,7 @@ class PostgresDB:
 
         resolved = [_datasource_row_to_dict(row) for row in rows]
         await self._stamp_email_autonomous_send(resolved)
+        await self._stamp_mcp_server_questions_default(resolved)
         return resolved
 
     # -- Job ↔ Datasource junction (N:M) --------------------------------------
@@ -56477,7 +56935,9 @@ class PostgresDB:
         """
         query = """
             SELECT id, user_id, label, base_url, api_key, key_prefix,
-                   transport_kind, created_at, updated_at
+                   transport_kind, created_at, updated_at,
+                   tls_pin_sha256, tls_pin_cert, tls_pin_subject, tls_pin_issuer,
+                   tls_pin_not_after, tls_pinned_at, tls_pinned_by
             FROM llm_endpoints
             WHERE id = $1
         """
@@ -56828,6 +57288,10 @@ class PostgresDB:
         expected_seed_version: int | None = None,
         expected_subagents: Dict[str, Any] | None = None,
         replacement_subagents: Dict[str, Any] | None = None,
+        expected_description: str | None = None,
+        replacement_description: str | None = None,
+        expected_persona: str | None = None,
+        replacement_persona: str | None = None,
     ) -> Dict[str, Any] | None:
         """Additive seed upgrade (services.default_experts.upgrade_managed_seed).
 
@@ -56838,12 +57302,20 @@ class PostgresDB:
         The optional repair triplet replaces only a matching roster subtree
         at the exact expected seed version. PostgreSQL rechecks both after
         waiting for a concurrent update; operator edits therefore win.
+        The optional description pair replaces the description (column and
+        ``config.description``) only where it still equals the expected text,
+        compared after stripping; any other description is the operator's.
+        The persona pair does the same for ``prompts.persona``.
         """
         repair = (expected_seed_version, expected_subagents, replacement_subagents)
         if any(value is not None for value in repair) and any(
             value is None for value in repair
         ):
             raise ValueError("Managed seed repair requires version and both rosters")
+        if (expected_description is None) != (replacement_description is None):
+            raise ValueError("Managed seed description repair requires both texts")
+        if (expected_persona is None) != (replacement_persona is None):
+            raise ValueError("Managed seed persona repair requires both texts")
         async with self.transaction_scope():
             await self._lock_expert_catalog()
             raw = await self.fetchrow(
@@ -56864,16 +57336,29 @@ class PostgresDB:
             config = {**(config_additions or {}), **config}
             if replacement_subagents is not None:
                 config["subagents"] = replacement_subagents
+            description = None  # NULL keeps the column (COALESCE below)
+            if expected_description is not None:
+                expected = expected_description.strip()
+                if str(current.get("description") or "").strip() == expected:
+                    description = replacement_description
+                if str(config.get("description") or "").strip() == expected:
+                    config["description"] = replacement_description
+            prompts = dict(current.get("prompts") or {})
+            if expected_persona is not None and (
+                str(prompts.get("persona") or "").strip() == expected_persona.strip()
+            ):
+                prompts["persona"] = replacement_persona
             row = await self.fetchrow(
-                "UPDATE experts SET seed_version=$2,version=version+1,updated_at=now() WHERE id=$1 RETURNING *",
+                "UPDATE experts SET seed_version=$2,description=COALESCE($3,description),version=version+1,updated_at=now() WHERE id=$1 RETURNING *",
                 current["id"],
                 seed_version,
+                description,
             )
             return await self._persist_expert_resource(
                 {
                     **dict(row),
                     "config": config,
-                    "prompts": current.get("prompts") or {},
+                    "prompts": prompts,
                 }
             )
 
@@ -57835,7 +58320,9 @@ class PostgresDB:
                 """
                 SELECT id, label, base_url, key_prefix, transport_kind,
                        source, helm_value_hash, source_updated_at,
-                       created_at, updated_at
+                       created_at, updated_at,
+                       tls_pin_sha256, tls_pin_cert, tls_pin_subject, tls_pin_issuer,
+                       tls_pin_not_after, tls_pinned_at, tls_pinned_by
                 FROM llm_endpoints
                 WHERE user_id IS NULL
                 ORDER BY label
@@ -57853,7 +58340,9 @@ class PostgresDB:
                 """
                 SELECT id, label, base_url, api_key, key_prefix,
                        transport_kind, source, helm_value_hash,
-                       source_updated_at, created_at, updated_at
+                       source_updated_at, created_at, updated_at,
+                       tls_pin_sha256, tls_pin_cert, tls_pin_subject, tls_pin_issuer,
+                       tls_pin_not_after, tls_pinned_at, tls_pinned_by
                 FROM llm_endpoints
                 WHERE id = $1 AND user_id IS NULL
                 """,
@@ -57965,14 +58454,14 @@ class PostgresDB:
                 args.append(key_prefix)
                 param_idx += 1
 
+        # The returned row carries the pin columns: an edit keeps the pin
+        # (decision 4), and the response is serialized from this row.
         if not sets:
             # No-op patch — just return current row for parity with user variant.
             async with self.acquire() as conn:
                 row = await conn.fetchrow(
-                    """
-                    SELECT id, label, base_url, key_prefix, transport_kind,
-                           source, helm_value_hash, source_updated_at,
-                           created_at, updated_at
+                    f"""
+                    SELECT {self._TLS_PIN_COLUMNS}
                     FROM llm_endpoints
                     WHERE id = $1 AND user_id IS NULL
                     """,
@@ -57985,13 +58474,186 @@ class PostgresDB:
             UPDATE llm_endpoints
             SET {", ".join(sets)}
             WHERE id = $1 AND user_id IS NULL
-            RETURNING id, label, base_url, key_prefix, transport_kind,
-                      source, helm_value_hash, source_updated_at,
-                      created_at, updated_at
+            RETURNING {self._TLS_PIN_COLUMNS}
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(query, *args)
             return dict(row) if row else None
+
+    _TLS_PIN_COLUMNS = (
+        "id, label, base_url, key_prefix, transport_kind, source, "
+        "helm_value_hash, source_updated_at, created_at, updated_at, "
+        "tls_pin_sha256, tls_pin_cert, tls_pin_subject, tls_pin_issuer, "
+        "tls_pin_not_after, tls_pinned_at, tls_pinned_by"
+    )
+
+    @staticmethod
+    def _tls_pin_audit_detail(row: Any, *, sha256: str, **extra: str) -> str:
+        """``label=… origin=… sha256=… [previous=…] subject=… not_after=…``."""
+        from shared.runtime.core.transport_resolution import endpoint_origin
+
+        origin = endpoint_origin(row["base_url"])
+        origin_text = f"{origin[0]}://{origin[1]}:{origin[2]}" if origin else ""
+        parts = [f"label={row['label']}", f"origin={origin_text}", f"sha256={sha256}"]
+        parts.extend(f"{k}={v}" for k, v in extra.items())
+        return " ".join(parts)
+
+    @staticmethod
+    def _tls_pin_admin_uuid(admin_user_id: Any) -> UUID | None:
+        """The admin's id as a UUID; a malformed one degrades to NULL, as in
+        ``record_security_event``: the pin change and its audit row are still
+        worth writing, and must not fail as a 500."""
+        if not admin_user_id:
+            return None
+        try:
+            return UUID(str(admin_user_id))
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    @classmethod
+    async def _insert_tls_pin_audit(
+        cls,
+        conn: Any,
+        *,
+        event_type: str,
+        endpoint_id: str,
+        admin_user_id: str | None,
+        method: str | None,
+        path: str | None,
+        detail: str,
+    ) -> None:
+        await conn.execute(
+            """
+            INSERT INTO security_events
+                (event_type, user_id, auth_method, real_is_admin, view_as,
+                 resource_type, resource_id, method, path, detail, client_ip)
+            VALUES ($1, $2, NULL, TRUE, FALSE, 'llm_endpoint', $3, $4, $5, $6, NULL)
+            """,
+            event_type,
+            cls._tls_pin_admin_uuid(admin_user_id),
+            endpoint_id,
+            method,
+            path,
+            detail,
+        )
+
+    async def set_llm_endpoint_tls_pin(
+        self,
+        endpoint_id: str,
+        *,
+        details: Any,
+        admin_user_id: str | None,
+        method: str | None,
+        path: str | None,
+    ) -> Dict[str, Any] | None:
+        """Pin ``details`` (a ``shared.tls_pinning.CertificateDetails``) on a
+        system endpoint and write its audit row in the same transaction.
+
+        ``endpoint_certificate_retrusted`` (detail names ``previous=``) when a
+        pin already existed, else ``endpoint_certificate_trusted``. Returns
+        the updated row, or None (nothing written) when no system row matches.
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                current = await conn.fetchrow(
+                    "SELECT label, base_url, tls_pin_sha256 FROM llm_endpoints"
+                    " WHERE id = $1 AND user_id IS NULL FOR UPDATE",
+                    UUID(endpoint_id),
+                )
+                if current is None:
+                    return None
+                previous = current["tls_pin_sha256"]
+                row = await conn.fetchrow(
+                    f"""
+                    UPDATE llm_endpoints
+                    SET tls_pin_sha256 = $2, tls_pin_cert = $3,
+                        tls_pin_subject = $4, tls_pin_issuer = $5,
+                        tls_pin_not_after = $6, tls_pinned_at = CURRENT_TIMESTAMP,
+                        tls_pinned_by = $7
+                    WHERE id = $1 AND user_id IS NULL
+                    RETURNING {self._TLS_PIN_COLUMNS}
+                    """,
+                    UUID(endpoint_id),
+                    details.sha256,
+                    details.pem,
+                    details.subject,
+                    details.issuer,
+                    details.not_after,
+                    self._tls_pin_admin_uuid(admin_user_id),
+                )
+                extra: Dict[str, str] = {}
+                if previous:
+                    extra["previous"] = previous
+                extra["subject"] = details.subject
+                extra["not_after"] = details.not_after.isoformat()
+                await self._insert_tls_pin_audit(
+                    conn,
+                    event_type=(
+                        "endpoint_certificate_retrusted"
+                        if previous
+                        else "endpoint_certificate_trusted"
+                    ),
+                    endpoint_id=endpoint_id,
+                    admin_user_id=admin_user_id,
+                    method=method,
+                    path=path,
+                    detail=self._tls_pin_audit_detail(
+                        current, sha256=details.sha256, **extra
+                    ),
+                )
+                return dict(row)
+
+    async def clear_llm_endpoint_tls_pin(
+        self,
+        endpoint_id: str,
+        *,
+        admin_user_id: str | None,
+        method: str | None,
+        path: str | None,
+        event_type: str = "endpoint_certificate_pin_removed",
+    ) -> Dict[str, Any] | None:
+        """Remove a system endpoint's pin and audit it in the same
+        transaction. Returns the updated row, or None (nothing written) when
+        the endpoint has no pin or is not a system row."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                current = await conn.fetchrow(
+                    "SELECT label, base_url, tls_pin_sha256, tls_pin_subject,"
+                    " tls_pin_not_after FROM llm_endpoints"
+                    " WHERE id = $1 AND user_id IS NULL FOR UPDATE",
+                    UUID(endpoint_id),
+                )
+                if current is None or not current["tls_pin_sha256"]:
+                    return None
+                row = await conn.fetchrow(
+                    f"""
+                    UPDATE llm_endpoints
+                    SET tls_pin_sha256 = NULL, tls_pin_cert = NULL,
+                        tls_pin_subject = NULL, tls_pin_issuer = NULL,
+                        tls_pin_not_after = NULL, tls_pinned_at = NULL,
+                        tls_pinned_by = NULL
+                    WHERE id = $1 AND user_id IS NULL
+                    RETURNING {self._TLS_PIN_COLUMNS}
+                    """,
+                    UUID(endpoint_id),
+                )
+                extra: Dict[str, str] = {}
+                if current["tls_pin_subject"]:
+                    extra["subject"] = current["tls_pin_subject"]
+                if current["tls_pin_not_after"]:
+                    extra["not_after"] = current["tls_pin_not_after"].isoformat()
+                await self._insert_tls_pin_audit(
+                    conn,
+                    event_type=event_type,
+                    endpoint_id=endpoint_id,
+                    admin_user_id=admin_user_id,
+                    method=method,
+                    path=path,
+                    detail=self._tls_pin_audit_detail(
+                        current, sha256=current["tls_pin_sha256"], **extra
+                    ),
+                )
+                return dict(row)
 
     async def delete_system_llm_endpoint(self, endpoint_id: str) -> bool:
         """Delete a system endpoint (cascades to model rows)."""
@@ -58082,9 +58744,13 @@ class PostgresDB:
                 out.append(c)
         if not out:
             raise ValueError("capabilities must be non-empty")
-        if "live_voice" in out and len(out) > 1:
-            # A live voice model is bound by a phone-line connector only.
-            raise ValueError("live_voice must be the only capability of a catalog row")
+        for exclusive in ("live_voice", "image_generation"):
+            if exclusive in out and len(out) > 1:
+                # A live voice model is bound by a phone-line connector only;
+                # an image model by the generate_image tool only.
+                raise ValueError(
+                    f"{exclusive} must be the only capability of a catalog row"
+                )
         return out
 
     async def list_models(
@@ -58340,7 +59006,9 @@ class PostgresDB:
                     ule.label    AS endpoint_label,
                     ule.base_url AS endpoint_base_url,
                     ule.api_key  AS endpoint_api_key,
-                    ule.transport_kind AS endpoint_transport_kind
+                    ule.transport_kind AS endpoint_transport_kind,
+                    ule.tls_pin_cert AS endpoint_tls_pin_cert,
+                    ule.tls_pin_sha256 AS endpoint_tls_pin_sha256
                 FROM models m
                 LEFT JOIN system_api_keys ska
                     ON m.provider_kind = 'system' AND m.provider_ref = ska.provider
@@ -58596,8 +59264,16 @@ class PostgresDB:
             "fetch",
             "rerank",
             "live_voice",
+            "image_generation",
         }
     )
+
+    # Kinds whose slot stays empty without an explicit pin (no first-enabled
+    # fallback): an enabled image row spends money per call, so the agent's
+    # generate_image tool appears only after an admin or the user pins one
+    # (image_generation decision D1, 2026-11-17). Mirrors
+    # ``orchestrator.schemas.model_catalog.PIN_ONLY_CAPABILITIES``.
+    _PIN_ONLY_CAPABILITIES = frozenset({"image_generation"})
 
     async def resolve_default_for_capability(self, capability: str) -> str | None:
         """Resolve the effective default model ID for a capability.
@@ -58615,6 +59291,8 @@ class PostgresDB:
           forward compat.
         - Returns ``None`` only when no pin exists AND no enabled catalog
           row is available.
+        - A pin-only capability (``image_generation``) never falls back: no
+          valid pin means ``None``.
         """
         pinned = await self.get_default_llm_model(capability)
         if capability not in self._CATALOG_CAPABILITIES:
@@ -58625,6 +59303,8 @@ class PostgresDB:
             )
             if catalog_row is not None and catalog_row.get("enabled"):
                 return pinned
+        if capability in self._PIN_ONLY_CAPABILITIES:
+            return None
         candidates = await self.list_models_by_capability_alphabetical(capability)
         if candidates:
             return candidates[0]["model_id"]
@@ -65522,7 +66202,13 @@ class PostgresDB:
 
     async def user_can_use_vm(self, user: dict) -> bool:
         """Effective vm_workspace grant; fall back to the legacy can_use_vm column
-        during rollout / on grant-read failure (per-capability fail-mode).
+        only on grant-read failure (per-capability fail-mode).
+
+        The resolved grant decides even when no scope sets the key: it is then
+        the catalog default, granted since 2026-11-11. Before that a user with
+        no row fell through to ``can_use_vm`` (default FALSE), which would keep
+        every new user off VMs whatever the catalog said; a FALSE column cannot
+        tell "denied" from "never set", so it no longer denies.
 
         Admins short-circuit to True — grants restrict non-admins only (the PDP
         takes ``is_admin`` the same way). Without this, a direct caller that
@@ -65541,11 +66227,7 @@ class PostgresDB:
                 project_rows=scoped["project"],
                 global_rows=scoped["global"],
             )
-            if any(
-                r["key"] == "vm_workspace"
-                for r in scoped["user"] + scoped["project"] + scoped["global"]
-            ):
-                return bool(g["vm_workspace"])
+            return bool(g["vm_workspace"])
         except Exception:
             logger.exception("vm grant read failed; fall back to can_use_vm column")
         return bool(user.get("can_use_vm"))

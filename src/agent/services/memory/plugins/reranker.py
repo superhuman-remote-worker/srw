@@ -43,6 +43,13 @@ from typing import Any, List, Mapping, Optional, Tuple
 
 from agent.services.memory.registry import register_memory_plugin
 from agent.services.memory.types import AssembleRequest, Scored, TransientScorerError
+from shared.tls_pinning import (
+    CertificateChangedError,
+    PinnedCertificateRejectedError,
+    TlsPin,
+    httpx_client_kwargs,
+    pin_applies,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +63,9 @@ def _is_transient(exc: Exception) -> bool:
     """
     import httpx
 
+    # A pinned endpoint whose certificate changed fails identically on retry.
+    if isinstance(exc, (CertificateChangedError, PinnedCertificateRejectedError)):
+        return False
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
         return code >= 500 or code == 429
@@ -82,6 +92,7 @@ class RerankerScorer:
         retry_backoff: float = 1.0,
         client: Optional[Any] = None,
         served_model: Optional[str] = None,
+        tls_pin: Optional[TlsPin] = None,
     ) -> None:
         if not base_url:
             raise ValueError(
@@ -89,6 +100,11 @@ class RerankerScorer:
                 "(RERANK_BASE_URL), set memory.reranker.base_url, or provide "
                 "EMBEDDING_BASE_URL (the reranker rides the embedding endpoint)"
             )
+        if tls_pin is not None and not pin_applies(base_url):
+            raise ValueError(
+                f"a pinned certificate needs an https:// base URL, not {base_url}"
+            )
+        self.tls_pin = tls_pin
         from shared.runtime.core.transport_resolution import wire_model_id
 
         # The rerank catalog id may carry its provider's routing prefix
@@ -111,7 +127,11 @@ class RerankerScorer:
             headers = {}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
-            self._client = httpx.AsyncClient(headers=headers, timeout=self.timeout)
+            self._client = httpx.AsyncClient(
+                headers=headers,
+                timeout=self.timeout,
+                **httpx_client_kwargs(self.tls_pin, asynchronous=True),
+            )
         return self._client
 
     async def _rerank(
@@ -206,8 +226,8 @@ DEFAULT_RERANK_MODEL = "qwen3-reranker-8b"
 
 def resolve_reranker_transport(
     cfg: Any, env: Optional[Mapping[str, str]] = None
-) -> Tuple[str, Optional[str], Optional[str]]:
-    """``(model, base_url, api_key)`` for the scorer, explicit config first.
+) -> Tuple[str, Optional[str], Optional[str], Optional[TlsPin]]:
+    """``(model, base_url, api_key, tls_pin)`` for the scorer, explicit config first.
 
     Per field: ``memory.reranker.*`` (YAML / job override) beats the
     ``RERANK_*`` env the orchestrator injects from the ``rerank`` catalog pin,
@@ -219,16 +239,35 @@ def resolve_reranker_transport(
     An explicit ``memory.reranker.base_url`` is authenticated by its own
     ``memory.reranker.api_key``, or by an env key only when that key's paired
     base URL is the same host: a key follows its endpoint.
+
+    The pin follows the URL the scorer actually calls: ``RERANK_BASE_URL``
+    takes ``RERANK_TLS_PINNED_CERT``, the embedding fallback takes
+    ``EMBEDDING_TLS_PINNED_CERT``, and an explicit ``memory.reranker.base_url``
+    takes the pin of the paired prefix on the same origin, whatever the path
+    (else none: another origin is not the pinned server). A pin that is set
+    but unusable raises ``ValueError``; it is never read as "no pin".
     """
     if env is None:
         env = os.environ
     model = cfg.model or env.get("RERANK_MODEL") or DEFAULT_RERANK_MODEL
+    tls_pin: Optional[TlsPin] = None
     if cfg.base_url:
+        from shared.runtime.core.transport_resolution import (
+            endpoint_within,
+            same_endpoint,
+        )
+
         base_url = cfg.base_url
         api_key = cfg.api_key
+        # The pin is the server's identity, which is per origin: any path on
+        # a paired endpoint's origin is that server. The key below follows
+        # its endpoint by path (a shared host tenants by path).
+        for prefix in ("RERANK", "EMBEDDING"):
+            paired = env.get(f"{prefix}_BASE_URL")
+            if paired and same_endpoint(base_url, paired):
+                tls_pin = TlsPin.from_env(prefix, env)
+                break
         if not api_key:
-            from shared.runtime.core.transport_resolution import endpoint_within
-
             for prefix in ("RERANK", "EMBEDDING"):
                 paired = env.get(f"{prefix}_BASE_URL")
                 if (
@@ -241,10 +280,13 @@ def resolve_reranker_transport(
     elif env.get("RERANK_BASE_URL"):
         base_url = env["RERANK_BASE_URL"]
         api_key = cfg.api_key or env.get("RERANK_API_KEY")
+        tls_pin = TlsPin.from_env("RERANK", env)
     else:
         base_url = env.get("EMBEDDING_BASE_URL")
         api_key = cfg.api_key or env.get("EMBEDDING_API_KEY")
-    return model, base_url, api_key
+        if base_url:
+            tls_pin = TlsPin.from_env("EMBEDDING", env)
+    return model, base_url, api_key, tls_pin
 
 
 def resolve_reranker_served_model(
@@ -279,12 +321,13 @@ def _build_reranker(runtime: Any) -> RerankerScorer:
     # orchestrator injects from the `rerank` catalog pin → the embedding
     # endpoint (single-router deployments). Never the auxiliary: it may be
     # OpenRouter-direct or serve no /rerank route at all.
-    model, base_url, api_key = resolve_reranker_transport(cfg)
+    model, base_url, api_key, tls_pin = resolve_reranker_transport(cfg)
     return RerankerScorer(
         model=model,
         served_model=resolve_reranker_served_model(cfg),
         base_url=base_url,
         api_key=api_key,
+        tls_pin=tls_pin,
         top_k=cfg.top_k,
         timeout=cfg.timeout,
         retries=getattr(cfg, "retries", 2),

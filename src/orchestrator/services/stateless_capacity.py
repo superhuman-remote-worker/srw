@@ -67,7 +67,20 @@ SELECT clock_timestamp() AS observed_at,
                    ))
                )::float8
           FROM run_queue
-         WHERE {RUNNABLE_PREDICATE}) AS oldest_queued_age_s
+         WHERE {RUNNABLE_PREDICATE}) AS oldest_queued_age_s,
+       (SELECT min(GREATEST(queued_at, run_after))
+          FROM run_queue
+         WHERE {RUNNABLE_PREDICATE}
+           AND unit_kind = 'session_turn') AS oldest_session_turn_runnable_at,
+       (SELECT GREATEST(
+                   0.0,
+                   extract(epoch FROM (
+                       clock_timestamp() - min(GREATEST(queued_at, run_after))
+                   ))
+               )::float8
+          FROM run_queue
+         WHERE {RUNNABLE_PREDICATE}
+           AND unit_kind = 'session_turn') AS oldest_session_turn_age_s
 """
 
 _BUSY_PODS_SQL = f"""
@@ -123,6 +136,8 @@ class QueueDemand:
     runnable_total: int
     oldest_queued_age_s: float | None
     runnable_bg_task: int = 0
+    oldest_session_turn_runnable_at: datetime | None = None
+    oldest_session_turn_age_s: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +154,7 @@ def desired_replicas(demand: QueueDemand, params: CapacityParams) -> int:
 
 
 @asynccontextmanager
-async def _connection(source: Any) -> AsyncIterator[Any]:
+async def acquire_connection(source: Any) -> AsyncIterator[Any]:
     acquire = getattr(source, "acquire", None)
     if acquire is None:
         yield source
@@ -153,6 +168,7 @@ async def read_demand(conn: Any) -> QueueDemand:
     if row is None:
         return QueueDemand(None, 0, 0, 0, 0, None)
     age = row["oldest_queued_age_s"]
+    turn_age = row.get("oldest_session_turn_age_s")
     return QueueDemand(
         observed_at=row["observed_at"],
         busy=int(row["busy"] or 0),
@@ -161,6 +177,8 @@ async def read_demand(conn: Any) -> QueueDemand:
         runnable_bg_task=int(row.get("runnable_bg_task") or 0),
         runnable_total=int(row["runnable_total"] or 0),
         oldest_queued_age_s=float(age) if age is not None else None,
+        oldest_session_turn_runnable_at=row.get("oldest_session_turn_runnable_at"),
+        oldest_session_turn_age_s=float(turn_age) if turn_age is not None else None,
     )
 
 
@@ -244,8 +262,14 @@ async def capacity_snapshot(
 ) -> dict[str, Any]:
     """The admin payload: what the scaler sees, plus the pool it is sizing,
     plus the parked worklist (stateless_turn_resilience.md step 2)."""
+    # chat_pool_stall imports this module, so import it lazily.
+    from orchestrator.services.chat_pool_stall import (
+        chat_pool_stalled,
+        stall_threshold_s,
+    )
+
     params = params or CapacityParams.from_env()
-    async with _connection(db) as conn:
+    async with acquire_connection(db) as conn:
         demand = await read_demand(conn)
         parked_rows = await list_parked(conn, limit=parked_limit)
     inventory: ExecutorInventory | None = None
@@ -259,6 +283,7 @@ async def capacity_snapshot(
         raise
     except Exception as exc:
         logger.info("stateless capacity: executor inventory unavailable: %s", exc)
+    threshold_s = stall_threshold_s()
     return {
         "observed_at": (demand.observed_at.isoformat() if demand.observed_at else None),
         "executors": {
@@ -273,6 +298,9 @@ async def capacity_snapshot(
             "total": demand.runnable_total,
         },
         "oldest_queued_age_s": demand.oldest_queued_age_s,
+        "oldest_session_turn_age_s": demand.oldest_session_turn_age_s,
+        "chat_pool_stalled": chat_pool_stalled(demand, threshold_s=threshold_s),
+        "stall_threshold_s": threshold_s,
         "desired": desired_replicas(demand, params),
         "params": {"min_replicas": params.min_replicas, "reserve": params.reserve},
         "parked": [parked_entry(row) for row in parked_rows],

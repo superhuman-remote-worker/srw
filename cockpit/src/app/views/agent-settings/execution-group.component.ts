@@ -34,7 +34,7 @@ export type ExecutionSection = 'all' | 'task' | 'taskMore' | 'expert' | 'workspa
   imports: [FormsModule, TranslocoPipe, AppIconComponent, PinOnInteractDirective],
   template: `
     <div class="settings-group" [class.sectioned]="section() !== 'all'">
-      @if (section() === 'all') {
+      @if (section() === 'all' && showGroupLabel()) {
         <div class="group-label">{{ 'agentSettings.execution.group' | transloco }}</div>
       }
 
@@ -372,7 +372,7 @@ export type ExecutionSection = 'all' | 'task' | 'taskMore' | 'expert' | 'workspa
       height: 20px;
       border: none;
       border-radius: 50%;
-      background: rgba(255, 255, 255, 0.08);
+      background: var(--hover);
       color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;
@@ -462,6 +462,9 @@ export class ExecutionGroupComponent {
    *  narration), `taskMore` (scholar, critic, project memory), `expert`
    *  (image quality) and `workspace` (the tier row). */
   section = input<ExecutionSection>('all');
+  /** The "Execution" label above the fields. Off where the host already
+   *  titles the block (the expert editor's own section heading). */
+  showGroupLabel = input(true);
 
   /** True when this instance owns the given section's rows. */
   has(section: Exclude<ExecutionSection, 'all'>): boolean {

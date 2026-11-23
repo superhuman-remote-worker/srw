@@ -112,9 +112,10 @@ spec:
               users. Starting now would initialize an empty Gitea while the
               existing repositories stay orphaned on disk.
 
-              Either migrate the data:
-                knowledge-base/knowledge/operations/gitea_sqlite_to_postgres.md
-              or pin the old backend in your values overlay:
+              Either move the data first, as described in "Moving the
+              bundled Gitea from SQLite to Postgres":
+                https://github.com/superhuman-remote-worker/srw/blob/main/helm/README.md#moving-the-bundled-gitea-from-sqlite-to-postgres
+              or pin the old backend in your values file:
                 gitea:
                   database:
                     type: sqlite3

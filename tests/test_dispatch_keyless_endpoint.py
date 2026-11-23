@@ -196,6 +196,7 @@ class TestNoStoredKey:
             "local-rerank",
             KEYLESS_URL,
             NO_KEY_SENTINEL,
+            None,
         )
 
 

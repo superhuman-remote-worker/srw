@@ -18,6 +18,16 @@ from shared.runtime.services.auxiliary import (
 logger = logging.getLogger(__name__)
 
 
+def _curation_target(tool_context: Any) -> Optional[str]:
+    """The knowledge base curation reads and writes: this work's own
+    project's, and only when its connector is attached. A job that runs with
+    another knowledge base bound, or with none, curates nothing — the
+    context's project id alone names no knowledge base."""
+    from agent.tools.knowledge.knowledge_tools import _get_project_id
+
+    return _get_project_id(tool_context)
+
+
 async def curate_and_store_knowledge(
     auxiliary_llm: "AuxiliaryLLM",
     tool_context: Any,
@@ -47,7 +57,7 @@ async def curate_and_store_knowledge(
     try:
         kg = tool_context.knowledge_graph
         ks = tool_context.knowledge_store
-        project_id = tool_context.project_id
+        project_id = _curation_target(tool_context)
 
         # Neo4j is optional (kb_gardening G9, matching has_knowledge()): the
         # store is canonical for retrieval and the files for content. Before
@@ -125,7 +135,7 @@ async def assemble_and_converge_knowledge(
     try:
         ks = tool_context.knowledge_store
         kg = tool_context.knowledge_graph  # optional (kb_gardening G9)
-        project_id = tool_context.project_id
+        project_id = _curation_target(tool_context)
 
         if not ks or not project_id:
             return None

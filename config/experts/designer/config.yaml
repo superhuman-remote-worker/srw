@@ -38,6 +38,9 @@ spec:
 
         agent_id: designer
         display_name: Designer
+        # This expert plans in phases (shared/job_phases.py; false by default).
+        # The designer's method lives in its own phase skills (skills/).
+        phases: true
         description: |
           UI/UX design specialist. Analyzes existing interface patterns, creates
           self-contained HTML/CSS mockups using the project's design system, and
@@ -99,6 +102,7 @@ spec:
             - file_exists
             - move_file
             - copy_file
+            - compose_images
             - get_document_info
             - create_directory
           shell:

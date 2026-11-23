@@ -30,6 +30,7 @@ from orchestrator.services import (  # noqa: E402
 from fastapi import HTTPException
 
 import orchestrator.main as orch_main
+from tests._kb_context import connector_has_always_existed  # noqa: E402
 
 # R1.B05 lane P: the tier constants keep their owner; main no longer
 # re-exports them.
@@ -1827,6 +1828,106 @@ class TestSendSessionAttachPayload:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        ("connector", "implied"),
+        [
+            (None, "project_has_no_knowledge_connector"),
+            ("older-than-the-session", None),
+        ],
+        ids=["project-without-a-connector", "connector-existed-all-along"],
+    )
+    async def test_attach_adds_the_knowledge_base_a_session_was_never_offered(
+        self, connector, implied
+    ):
+        """A session's attach payload carries its project's knowledge base
+        when the project has no connector for it (nothing could be ticked),
+        and only the stored selection when the connector existed all along
+        (``implied_project_knowledge``)."""
+        selected_id = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+        project_id = "99999999-2222-4333-8444-555555555555"
+        thread = self._thread(
+            user_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            metadata={"datasource_ids": [selected_id]},
+        )
+        selected_row = {
+            "id": selected_id,
+            "type": "kb",
+            "name": "Handbook",
+            "description": None,
+            "connection_url": None,
+            "credentials": {},
+            "config": {},
+            "project_read_only": True,
+            "policy_revision": 2,
+        }
+        lookup = (
+            AsyncMock(return_value=None)
+            if connector is None
+            else connector_has_always_existed()
+        )
+
+        _FakeAsyncClient.response_status = 500
+        with (
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "get_thread",
+                AsyncMock(return_value=thread),
+            ),
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "get_datasource_by_managed_key",
+                lookup,
+            ),
+            patch.object(
+                thread_mount_rows_module,
+                "thread_project_ids",
+                AsyncMock(return_value=[project_id]),
+            ),
+            patch.object(
+                thread_project_authorization_module,
+                "revalidate_thread_project_ids",
+                AsyncMock(return_value=[project_id]),
+            ),
+            patch.object(
+                thread_datasource_authorization,
+                "revalidate_thread_datasource_selection",
+                AsyncMock(return_value=([selected_id], {selected_id: 2})),
+            ),
+            patch.object(
+                orch_main.app.state.resources.postgres_db,
+                "resolve_datasources_for_thread",
+                AsyncMock(return_value=[selected_row]),
+            ),
+            patch.object(
+                deployment_gates_module, "is_experts_db_enabled", return_value=False
+            ),
+            patch.object(httpx, "AsyncClient", _FakeAsyncClient),
+        ):
+            ok = await session_attach_binding_module.send_session_attach(
+                {"id": self.agent_id, "pod_ip": "10.0.0.1", "pod_port": 8001},
+                self.thread_id,
+                {},
+                [project_id],
+                config_name="persistent_defaults",
+                dependencies=sessions_composition.session_attach_binding_dependencies(
+                    orch_main.app.state.resources
+                ),
+            )
+
+        assert ok is True
+        lookup.assert_awaited_once_with(f"project-kb:{project_id}")
+        datasources = _FakeAsyncClient.calls[0]["json"]["datasources"]
+        assert datasources[0]["datasource_id"] == selected_id
+        added = [entry for entry in datasources if entry.get("implied")]
+        if implied is None:
+            assert added == []
+            assert len(datasources) == 1
+        else:
+            (entry,) = added
+            assert entry["implied"] == implied
+            assert entry["config"]["native_project_id"] == project_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
         "tag",
         [
             # Tagged read-only by its creator; the project links it read-write.
@@ -3568,3 +3669,16 @@ class TestEndedSessionKeepsItsVolume:
             teardown_identity=identity,
             strict=True,
         )
+
+
+@pytest.fixture(autouse=True)
+def _project_knowledge_connector_has_always_existed():
+    """These tests deliver what they select. The unconnected application
+    store cannot answer the one extra lookup the delivery makes."""
+    store = orch_main.app.state.resources.postgres_db
+    with patch.object(
+        store,
+        "get_datasource_by_managed_key",
+        connector_has_always_existed(store),
+    ):
+        yield

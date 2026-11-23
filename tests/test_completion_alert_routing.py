@@ -119,3 +119,158 @@ async def test_unrouted_alarm_is_logged_once_per_cooldown(caplog):
     assert (
         sum("not routed to an officer" in r.getMessage() for r in caplog.records) == 1
     )
+
+
+# --- a parked completion command (D4: the owner and the project's officer) ---
+# knowledge-base/knowledge/issues/workspace_report_after_automatic_pod_cleanup_parks_job_in_processing.md
+
+COMMAND_ID = "03dc2497-cad4-4481-8af0-d94fccf04ec2"
+OWNER_ID = "5d0f6a3e-1111-4000-8000-000000000001"
+
+
+def _park_alert(route="alert_only", attempt=5):
+    from orchestrator.services.completion_sweep_router import CompletionParkAlert
+
+    return CompletionParkAlert(
+        job_id=JOB_ID,
+        command_id=COMMAND_ID,
+        command_attempt=attempt,
+        route=route,
+        message=f"completion sweep routed job={JOB_ID} command={COMMAND_ID} "
+        f"attempt={attempt} route={route}",
+    )
+
+
+def _parked_alerts(*, status="processing", parked=True, officer=True, owner=True):
+    alerts, store, broadcast, kick = _alerts(officer=officer)
+    store.get_job = AsyncMock(
+        return_value={
+            "id": JOB_ID,
+            "project_id": PROJECT_ID,
+            "status": status,
+            "user_id": OWNER_ID if owner else None,
+            "description": "transcribe the lecture",
+        }
+    )
+    store.parked_completion_commands_for_jobs = AsyncMock(
+        return_value=(
+            {
+                JOB_ID: {
+                    "command_id": COMMAND_ID,
+                    "attempts": 5,
+                    "error_code": "HTTPException",
+                }
+            }
+            if parked
+            else {}
+        )
+    )
+    notifier = SimpleNamespace(record=AsyncMock(), resolve_source=AsyncMock())
+    alerts.dependencies = CompletionAlertDependencies(
+        store=store,
+        notify_all_officers=broadcast,
+        kick_officer_event_drain=kick,
+        notifier=notifier,
+    )
+    return alerts, store, broadcast, kick, notifier
+
+
+@pytest.mark.asyncio
+async def test_parked_command_tells_the_owner_and_the_projects_officer():
+    alerts, store, broadcast, kick, notifier = _parked_alerts()
+
+    await alerts.parked(_park_alert())
+
+    broadcast.assert_not_awaited()
+    record = notifier.record.await_args.kwargs
+    assert record["recipient_id"] == OWNER_ID
+    assert record["category"] == "incident"
+    assert record["dedup_key"] == f"completion_parked:{COMMAND_ID}"
+    assert record["source_kind"] == "completion_command"
+    assert record["source_id"] == COMMAND_ID
+    assert record["action_params"] == {"job_id": JOB_ID}
+    assert JOB_ID[:8] in record["subject"]
+    assert "after 5 attempts (`HTTPException`)" in record["body"]
+    assert "`processing`" in record["body"]
+    args, kwargs = store.enqueue_session_wake_event.await_args
+    assert args == (OFFICER_ID,)
+    assert kwargs["source"] == "completion_sweep"
+    assert kwargs["dedup_key"] == f"completion_sweep:{COMMAND_ID}:5"
+    assert kwargs["payload"]["job_id"] == JOB_ID
+    assert kwargs["payload"]["kind"] == "completion_parked"
+    kick.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_a_park_route_whose_command_finished_tells_nobody():
+    alerts, store, broadcast, kick, notifier = _parked_alerts(parked=False)
+
+    await alerts.parked(_park_alert(route="park_alert"))
+
+    notifier.record.assert_not_awaited()
+    store.enqueue_session_wake_event.assert_not_awaited()
+    broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_finished_job_tells_its_officer_but_not_its_owner():
+    alerts, store, _broadcast, _kick, notifier = _parked_alerts(status="completed")
+
+    await alerts.parked(_park_alert())
+
+    notifier.record.assert_not_awaited()
+    store.enqueue_session_wake_event.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_without_an_officer_the_owner_is_still_told(caplog):
+    alerts, store, broadcast, _kick, notifier = _parked_alerts(officer=False)
+
+    with caplog.at_level("WARNING"):
+        await alerts.parked(_park_alert())
+
+    notifier.record.assert_awaited_once()
+    store.enqueue_session_wake_event.assert_not_awaited()
+    broadcast.assert_not_awaited()
+    assert "not routed to an officer" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_failing_feed_never_costs_the_officer_wake():
+    alerts, store, _broadcast, _kick, notifier = _parked_alerts()
+    notifier.record.side_effect = RuntimeError("feed down")
+
+    await alerts.parked(_park_alert())
+
+    store.enqueue_session_wake_event.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_settling_a_parked_command_resolves_the_owner_incident():
+    alerts, _store, _broadcast, _kick, notifier = _parked_alerts()
+
+    await alerts.parked_settled(COMMAND_ID, "admin-1")
+
+    notifier.resolve_source.assert_awaited_once_with(
+        "completion_command", COMMAND_ID, resolved_by="user:admin-1"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state,resolved",
+    [("parked", False), ("pending", True), ("done", True), (None, True)],
+)
+async def test_the_feed_probe_reads_a_parked_command_as_still_waiting(state, resolved):
+    """No mail goes out about a command an operator has already moved on."""
+    from orchestrator.services.notification_actions import (
+        register_notification_actions,
+    )
+    from orchestrator.services.notification_catalog import source_probe
+
+    register_notification_actions(dependencies=MagicMock())
+    probe = source_probe("completion_command")
+    db = SimpleNamespace(completion_command_state=AsyncMock(return_value=state))
+
+    assert await probe(db, COMMAND_ID) is resolved
+    db.completion_command_state.assert_awaited_once_with(COMMAND_ID)

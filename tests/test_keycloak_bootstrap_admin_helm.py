@@ -521,7 +521,10 @@ def test_upgrade_notes_point_a_reserved_name_at_the_recovery_steps(
     assert "WARNING: the initial administrator's name is reserved in Gitea" in notes
     assert 'keycloak.bootstrapAdmin.username is "admin"' in notes
     assert "cannot rename that user" in notes
-    assert "docs/troubleshooting.md#the-first-administrator-has-no-git-account" in notes
+    assert (
+        "https://docs.superhuman-remote-worker.com/troubleshooting/#the-first-administrator-has-no-git-account"
+        in notes
+    )
 
 
 def test_external_git_notes_warn_on_install(notes_probe_chart, tmp_path):

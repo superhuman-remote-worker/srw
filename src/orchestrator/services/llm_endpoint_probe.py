@@ -11,6 +11,10 @@ A server with no model list (TEI) answers that probe 404; both Tests then
 judge an embedding or rerank row by :func:`probe_endpoint_capability`, one
 minimal call of that capability.
 
+Both probes take the endpoint's pinned certificate (``tls_pin``): the client
+then trusts exactly that certificate, checked in the handshake before any
+request byte. Without a pin they verify as before.
+
 The capability hint is a name-based heuristic, not authoritative — users
 are expected to override it at import time when the provider's naming
 convention doesn't line up (e.g., ``text-embedding-3-*`` → embedding, but
@@ -23,10 +27,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import re
 import httpx
 
 from shared.runtime.core.model_registry import family_of
 from shared.runtime.core.transport_resolution import wire_model_id
+from shared.tls_pinning import TlsPin, httpx_client_kwargs
 
 
 @dataclass
@@ -49,6 +55,32 @@ def _is_live_voice_id(name: str) -> bool:
     """A live (full-duplex voice) model by its name: never a chat row, so it
     is classified before the chat fallback."""
     return "gpt-live" in name or "realtime" in name
+
+
+# Image-generation model ids (text-to-image / image edit). Anchored on
+# segment boundaries so a chat model that merely mentions images is not
+# swept up; video generators stay out (no SRW workflow for them).
+_IMAGE_GENERATION_PATTERNS = (
+    re.compile(r"gpt-image"),
+    re.compile(r"chatgpt-image"),
+    re.compile(r"dall-?e"),
+    re.compile(r"(?:^|[-_/])imagen(?:$|[-_.\d])"),
+    re.compile(r"nano-banana"),
+    re.compile(r"(?:^|[-_/])image(?:$|[-_.])"),
+)
+
+
+def is_image_generation_id(model_id: str) -> bool:
+    """A text-to-image model by its id: never a chat or vision row.
+
+    Classified before the multimodal-chat and vision heuristics, so
+    ``gemini-3-pro-image`` lands as ``image_generation`` and not as
+    chat+auxiliary+vision, and ``dall-e-3`` not as ``vision``.
+    """
+    name = model_id.lower()
+    if re.search(r"(?:^|[-_/])video(?:$|[-_.])", name):
+        return False
+    return any(p.search(name) for p in _IMAGE_GENERATION_PATTERNS)
 
 
 def declares_live_voice(item: Any) -> bool:
@@ -78,6 +110,8 @@ def _capability_hint(model_id: str) -> str:
     name = model_id.lower()
     if _is_live_voice_id(name):
         return "live_voice"
+    if is_image_generation_id(name):
+        return "image_generation"
     if "whisper" in name:
         return "whisper"
     if "tts" in name or name.endswith("-speech") or "text-to-speech" in name:
@@ -132,11 +166,14 @@ async def probe_endpoint_models(
     api_key: str | None,
     *,
     timeout: float = 10.0,
+    tls_pin: TlsPin | None = None,
 ) -> ProbeResult:
     """Probe ``{base_url}/models`` and return the parsed model list.
 
     Does not raise. Transport errors land in ``ProbeResult.error`` so both
-    the test and discover handlers can surface them without wrapping.
+    the test and discover handlers can surface them without wrapping; a
+    server that does not present ``tls_pin`` is one of them, and receives
+    no request.
     """
     probe_url = base_url.rstrip("/") + "/models"
     headers: dict[str, str] = {}
@@ -144,7 +181,9 @@ async def probe_endpoint_models(
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, **httpx_client_kwargs(tls_pin, asynchronous=True)
+        ) as client:
             resp = await client.get(probe_url, headers=headers)
     except httpx.HTTPError as e:
         return ProbeResult(
@@ -288,14 +327,15 @@ async def probe_endpoint_capability(
     capability: str,
     model: str,
     timeout: float = 10.0,
+    tls_pin: TlsPin | None = None,
 ) -> ProbeResult:
     """Make one minimal ``capability`` call against ``{base_url}``.
 
     ``model`` is the row's upstream name (its served id, else its catalog id);
     a routing prefix the provider rejects is dropped as SRW's embedding and
     rerank clients drop it. Same client settings as the model-list probe
-    (timeout, default TLS verification, Bearer key only when set) and the same
-    host. Does not raise.
+    (timeout, ``tls_pin`` or else default TLS verification, Bearer key only
+    when set) and the same host. Does not raise.
     """
     path, body, result_field = _capability_probe_request(
         capability, wire_model_id(model, base_url)
@@ -306,7 +346,9 @@ async def probe_endpoint_capability(
         headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, **httpx_client_kwargs(tls_pin, asynchronous=True)
+        ) as client:
             resp = await client.post(probe_url, headers=headers, json=body)
     except httpx.HTTPError as e:
         return ProbeResult(False, None, f"{type(e).__name__}: {e}", probe_url)

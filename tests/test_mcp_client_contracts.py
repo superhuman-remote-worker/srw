@@ -142,6 +142,39 @@ async def test_job_creation_forwards_preferred_expert_kickoff_context_and_priori
 
 
 @pytest.mark.asyncio
+async def test_job_clients_send_phases_only_when_it_is_set() -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(201, json={"id": "job-1", "status": "created"})
+
+    client = AsyncCockpitClient(
+        "http://orchestrator.test", transport=httpx.MockTransport(handler)
+    )
+    try:
+        await client.create_job("one step", phases=False)
+        await client.create_project_job("project-1", "one unit", phases=False)
+        await client.create_job("long task", phases=True)
+        await client.create_project_job("project-1", "long unit", phases=True)
+        await client.create_job("any task")
+        await client.create_project_job("project-1", "any project task")
+    finally:
+        await client.close()
+
+    # False is a value, not an omission: it is sent like True.
+    assert [(path, body.get("phases")) for path, body in captured[:4]] == [
+        ("/api/jobs", False),
+        ("/api/projects/project-1/jobs", False),
+        ("/api/jobs", True),
+        ("/api/projects/project-1/jobs", True),
+    ]
+    # Omitted means the expert's own setting on the server, and an older
+    # server that does not know the field never sees it.
+    assert all("phases" not in body for _, body in captured[4:])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("ds_type", "fields"),
     [

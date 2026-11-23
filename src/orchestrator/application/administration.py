@@ -33,6 +33,7 @@ from orchestrator.routers import (
     subscription_management as subscription_management_routes,
     system_settings as system_settings_routes,
     usage_reporting as usage_reporting_routes,
+    version as version_routes,
     user_administration as user_administration_routes,
     voice as voice_routes,
 )
@@ -231,6 +232,7 @@ def usage_reporting_dependencies(
                 actor, store
             ),
             scope_project_id=access.mcp_scope_project_id,
+            completion_commands_enabled=resources.settings.completion_commands_enabled,
         ),
         require_admin=functools.partial(access_composition.require_admin, resources),
         metering_settings=resources.metering.infrastructure_metering_settings,
@@ -281,6 +283,15 @@ def identity_dependencies(
     resources: ApplicationResources,
 ) -> identity_routes.IdentityDependencies:
     return identity_routes.IdentityDependencies(
+        store=resources.postgres_db,
+        get_current_user=auth.get_current_user,
+    )
+
+
+def version_dependencies(
+    resources: ApplicationResources,
+) -> version_routes.VersionDependencies:
+    return version_routes.VersionDependencies(
         store=resources.postgres_db,
         get_current_user=auth.get_current_user,
     )

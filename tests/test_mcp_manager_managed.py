@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import builtins
 from collections import deque
+from types import SimpleNamespace
 
 import httpx
+import httpx2
 import pytest
 
 from agent.tools.mcp import manager as manager_module
@@ -159,20 +161,27 @@ def test_a_managed_server_reconnects_within_a_budget(monkeypatch):
 
 
 def test_a_tool_error_is_not_a_dead_session():
-    from langchain_core.tools import ToolException
-    from mcp.shared.exceptions import McpError
-    from mcp.types import ErrorData
+    from mcp.shared.exceptions import MCPError
+    from pydantic import TypeAdapter, ValidationError
 
-    def mcp_error(code: int) -> McpError:
-        return McpError(ErrorData(code=code, message="x"))
+    def mcp_error(code: int) -> MCPError:
+        return MCPError(code=code, message="x")
 
-    assert manager_module._tool_level(ToolException("the tool failed"))
-    # The front refusing a tool this binding may not call.
+    # A result with isError is an answer, not an exception; a JSON-RPC
+    # error is the server answering too: the front refusing a tool this
+    # binding may not call.
     assert manager_module._tool_level(mcp_error(-32602))
+    # An answer that is not valid MCP came after the tool ran; so did a
+    # request for input this client cannot give.
+    try:
+        TypeAdapter(int).validate_python("not a number")
+    except ValidationError as malformed:
+        assert manager_module._tool_level(malformed)
+    assert manager_module._tool_level(manager_module._InputRefused("asked"))
     # A terminated session (404 from a replaced pod) or a closed connection.
-    assert not manager_module._tool_level(mcp_error(32600))
+    assert not manager_module._tool_level(mcp_error(-32600))
     assert not manager_module._tool_level(mcp_error(-32000))
-    assert not manager_module._tool_level(httpx.ConnectError("refused"))
+    assert not manager_module._tool_level(httpx2.ConnectError("refused"))
     assert not manager_module._tool_level(ConnectionError("gone"))
 
 
@@ -230,16 +239,15 @@ async def test_a_remote_servers_call_is_not_raced():
 
 
 def _lease_ended_error(message: str = "lease revoked: the lease is revoked"):
-    from mcp.shared.exceptions import McpError
-    from mcp.types import ErrorData
+    from mcp.shared.exceptions import MCPError
 
-    return McpError(ErrorData(code=manager_module.LEASE_ENDED_CODE, message=message))
+    return MCPError(code=manager_module.LEASE_ENDED_CODE, message=message)
 
 
-def _http_error(status: int) -> httpx.HTTPStatusError:
-    request = httpx.Request("POST", URL)
-    return httpx.HTTPStatusError(
-        "refused", request=request, response=httpx.Response(status, request=request)
+def _http_error(status: int) -> httpx2.HTTPStatusError:
+    request = httpx2.Request("POST", URL)
+    return httpx2.HTTPStatusError(
+        "refused", request=request, response=httpx2.Response(status, request=request)
     )
 
 
@@ -261,7 +269,7 @@ def test_a_refused_lease_is_found_wherever_the_transport_put_it():
     # server with another message, a replaced pod.
     assert not lease_ended(_http_error(403))
     assert not lease_ended(_lease_ended_error("something else"))
-    assert not lease_ended(httpx.ConnectError("refused"))
+    assert not lease_ended(httpx2.ConnectError("refused"))
     assert not lease_ended(ConnectionError("gone"))
 
 
@@ -280,14 +288,13 @@ async def test_a_call_told_its_lease_ended_says_so_and_never_reconnects():
 
     manager._restart_server = restart
 
-    class Tool:
-        name = "whoami"
-
+    class Session:
         @staticmethod
-        async def coroutine(**_kwargs):
+        async def send_request(*_args, **_kwargs):
             raise _lease_ended_error()
 
-    call = manager._guarded(handle, Tool())
+    handle.session = SimpleNamespace(session=Session())
+    call = manager._guarded(handle, "whoami")
     answer = await call()
     assert manager_module.LEASE_REFUSED in answer
     assert handle.status == f"unavailable: {manager_module.LEASE_REFUSED}"

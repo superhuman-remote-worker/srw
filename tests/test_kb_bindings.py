@@ -11,6 +11,7 @@ from agent.services.knowledge.bindings import (
 from shared.runtime.services.knowledge_store import KnowledgeRecord
 from shared.runtime_actor import RUNTIME_ACTOR_HEADER, RuntimeActorContext
 from agent.tools.knowledge.knowledge_tools import create_kb_tools
+from tests._kb_context import project_kb_connector
 
 
 def _binding(
@@ -76,6 +77,7 @@ def test_binding_builder_is_native_first_and_resolves_alias_collisions():
     bindings = build_knowledge_bindings(
         project_ids=[str(project_id)],
         datasources=[
+            project_kb_connector(project_id),
             {
                 "type": "kb",
                 "datasource_id": str(first_id),
@@ -111,8 +113,10 @@ def test_runtime_actor_binds_only_to_its_exact_writable_native_project():
         thread_id=str(uuid.uuid4()),
     )
 
+    attached = [project_kb_connector(primary), project_kb_connector(secondary)]
     bindings = build_knowledge_bindings(
         project_ids=[str(primary), str(secondary)],
+        datasources=attached,
         runtime_actor=primary_actor,
     )
     assert bindings[0].runtime_actor is primary_actor
@@ -126,8 +130,10 @@ def test_runtime_actor_binds_only_to_its_exact_writable_native_project():
     )
     bindings = build_knowledge_bindings(
         project_ids=[str(primary), str(secondary)],
+        datasources=attached,
         runtime_actor=secondary_actor,
     )
+    assert len(bindings) == 2
     assert all(binding.runtime_actor is None for binding in bindings)
 
 
@@ -549,12 +555,13 @@ def test_write_refuses_an_unknown_kb_alias_and_lists_what_is_selected():
     post.assert_not_called()
 
 
-def test_write_falls_back_to_a_bare_legacy_project_id():
-    """Legacy contexts set `project_id` with nothing in `project_ids`."""
+def test_a_bare_project_id_with_nothing_attached_is_not_a_write_target():
+    """A project id alone names no knowledge base: without its connector
+    attached there is nothing to write to, and nothing is posted."""
     project_id = str(uuid.uuid4())
     context = MagicMock()
-    context.knowledge_bindings = None
-    context.project_ids = []
+    context.knowledge_bindings = []
+    context.project_ids = [project_id]
     context.project_id = project_id
     context.job_id = str(uuid.uuid4())
     context.config = {}
@@ -566,9 +573,8 @@ def test_write_falls_back_to_a_bare_legacy_project_id():
 
     result, post = _write(context)
 
-    assert post.call_args.args[0] == project_id
-    # No bound scopes, so the handle stays bare — legacy output is unchanged.
-    assert "**x**" in result
+    assert result.startswith("Error:")
+    post.assert_not_called()
 
 
 def test_write_refuses_external_target_and_lists_native_choices():

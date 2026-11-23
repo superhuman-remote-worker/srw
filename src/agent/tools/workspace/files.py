@@ -173,6 +173,37 @@ def _absolute(workspace: Any, path: str) -> str:
         return path
 
 
+def _seen_at_line_for(data: bytes, max_edge: Optional[int], is_region: bool) -> str:
+    """ "You see this at W×H" when the downscale tier shrinks the image, so the
+    model knows a closer look (``region``) shows more (image_generation WP5)."""
+    if not max_edge:
+        return ""
+    try:
+        from agent.services.image_compose import image_size
+
+        size = image_size(data)
+    except Exception:  # noqa: BLE001
+        size = None
+    if not size or max(size) <= max_edge:
+        return ""
+    width, height = size
+    scale = max_edge / max(width, height)
+    seen = f"{max(1, round(width * scale))}×{max(1, round(height * scale))}"
+    if is_region:
+        return f"You see this region at about {seen} (it is {width}×{height}).\n"
+    return (
+        f"You see this at about {seen} (the file is {width}×{height}); to look "
+        "closer, read it again with region=[left, top, right, bottom] in percent.\n"
+    )
+
+
+def _fence_description(description: str) -> str:
+    """A vision description, fenced as third-party data (WP1, FM14)."""
+    from shared.untrusted_content import fence_untrusted
+
+    return fence_untrusted(description, origin="image", strip_braces=False)
+
+
 def _get_mime_type(file_path: Path) -> str:
     """Get MIME type for a file based on extension."""
     mime_type, _ = mimetypes.guess_type(str(file_path))
@@ -257,6 +288,44 @@ def _describe_zip_archive(local_path: Path, display_name: str, size: int) -> str
     return "\n".join(lines)
 
 
+def save_workspace_file(
+    context: ToolContext, path: str, data: bytes, *, overwrite: bool = False
+) -> str:
+    """Write a file another tool fetched (bytes, any type) into the workspace.
+
+    The same path rules as ``write_file``: relative to the workspace root,
+    refused while a cloud folder is over its cache or overlay quota, and
+    undo-snapshotted. An existing file is replaced only with ``overwrite``,
+    since the bytes never passed through the agent's own reading. Returns
+    what the model is told; a failure starts with ``Error:``.
+    """
+    if not context.has_workspace():
+        return "Error: this agent has no workspace to save the file into."
+    workspace = context.workspace_manager
+    for guard in (_cloud_cache_guard_for_path, _cloud_upperdir_guard_for_path):
+        refusal = guard(context, path)
+        if refusal:
+            return refusal
+    try:
+        if not overwrite and workspace.exists(path):
+            return (
+                f"Error: {_absolute(workspace, path)} already exists; nothing was "
+                "written. Choose another path, or pass overwrite=true to replace it."
+            )
+        if context._snapshot_callback:
+            context._snapshot_callback(path)
+        workspace.write_file(path, data)
+        context.invalidate_recent_read(path)
+    except ValueError as e:
+        return f"Error: {e}"
+    except WorkspaceUnavailableError:
+        raise
+    except Exception as e:
+        logger.error("save_workspace_file error for %s: %s", path, type(e).__name__)
+        return f"Error writing file: {type(e).__name__}"
+    return f"Saved: {_absolute(workspace, path)} ({len(data):,} bytes)"
+
+
 def create_file_tools(context: ToolContext) -> List[Any]:
     """Create file operation tools with injected context.
 
@@ -273,6 +342,9 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         raise ValueError("ToolContext must have a workspace_manager for file tools")
 
     workspace = context.workspace_manager
+
+    def _seen_at_line(data: bytes, is_region: bool) -> str:
+        return _seen_at_line_for(data, context.get_config("image_max_edge"), is_region)
 
     def _file_not_found(path: str) -> str:
         resolved_path = workspace.get_path(path)
@@ -356,6 +428,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         local_path: Path,
         describe: Optional[str],
         display_name: str = "",
+        region: Optional[List[float]] = None,
     ) -> str:
         """Handle standalone image files.
 
@@ -369,12 +442,33 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             display_name: Original filename for display headers.
         """
         name = display_name or local_path.name
+        region_line = ""
+        if region is not None:
+            # A closer look: the crop is taken at the original resolution and
+            # then goes through the same downscale tier as a whole image.
+            from agent.services.image_compose import ImageComposeError, crop_region
+
+            try:
+                crop = crop_region(local_path.read_bytes(), region)
+            except ImageComposeError as e:
+                return f"Error: cannot read a region of {name}: {e}"
+            region_line = (
+                f"Region: {region[0]:g}–{region[2]:g}% across, "
+                f"{region[1]:g}–{region[3]:g}% down of "
+                f"{crop.source_width}×{crop.source_height} px → "
+                f"{crop.width}×{crop.height} px\n"
+            )
         if context.get_phase_multimodal():
             # Return image for multimodal model to see directly
             try:
-                image_data = local_path.read_bytes()
+                if region is not None:
+                    image_data = crop.data
+                    mime_type = crop.mime_type
+                else:
+                    image_data = local_path.read_bytes()
+                    mime_type = _get_mime_type(local_path)
                 base64_image = base64.b64encode(image_data).decode()
-                mime_type = _get_mime_type(local_path)
+                seen_line = _seen_at_line(image_data, region is not None)
 
                 # The tag is stripped + replaced with a marker by the
                 # graph-side post-processor (`extract_image_tags` in
@@ -385,7 +479,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 return (
                     f"[IMAGE: {name}]\n"
                     f"Type: {mime_type}\n"
-                    f"Size: {len(image_data):,} bytes\n\n"
+                    f"Size: {len(image_data):,} bytes\n"
+                    + region_line
+                    + seen_line
+                    + "\n"
                     + IMAGE_DATA_TAG_TEMPLATE.format(mime=mime_type, b64=base64_image)
                 )
             except WorkspaceUnavailableError:
@@ -403,24 +500,38 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 vision = get_vision_helper()
 
                 # Check cache first
-                cached = cache.get(local_path, query=describe)
-                if cached:
+                from agent.services.vision_helper import vision_failed
+
+                cache_query = describe
+                if region is not None:
+                    cache_query = f"{describe or ''}|region={list(region)}"
+                cached = cache.get(local_path, query=cache_query)
+                if cached and not vision_failed(cached):
                     logger.debug(f"Cache hit for image: {name}")
-                    return f"[IMAGE: {name}]\n\n{cached}"
+                    return (
+                        f"[IMAGE: {name}]\n{region_line}\n{_fence_description(cached)}"
+                    )
 
                 # Generate description
-                image_data = local_path.read_bytes()
+                if region is not None:
+                    image_data, describe_mime = crop.data, crop.mime_type
+                else:
+                    image_data = local_path.read_bytes()
+                    describe_mime = _get_mime_type(local_path)
                 description = vision.describe_image_sync(
                     image_data,
-                    mime_type=_get_mime_type(local_path),
+                    mime_type=describe_mime,
                     query=describe,
                     job_id=context.job_id,
                 )
 
-                # Cache for future use
-                cache.set(local_path, description, query=describe)
+                # Cache only a real description: a failure must be retried
+                # next time, not served from the cache.
+                if not vision_failed(description):
+                    cache.set(local_path, description, query=cache_query)
+                    description = _fence_description(description)
 
-                return f"[IMAGE: {name}]\n\n{description}"
+                return f"[IMAGE: {name}]\n{region_line}\n{description}"
 
             except ImportError as e:
                 logger.warning(f"Vision services not available: {e}")
@@ -598,10 +709,15 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 vision = get_vision_helper()
 
                 # Check cache first
+                from agent.services.vision_helper import vision_failed
+
                 cached = cache.get(full_path, page=page_num, query=describe)
-                if cached:
+                if cached and not vision_failed(cached):
                     logger.debug(f"Cache hit for page {page_num} of {full_path.name}")
-                    return f"\n[PAGE {page_num} - VISUAL CONTENT]\n{cached}"
+                    return (
+                        f"\n[PAGE {page_num} - VISUAL CONTENT]\n"
+                        f"{_fence_description(cached)}"
+                    )
 
                 # Generate description
                 description = vision.describe_document_page_sync(
@@ -611,8 +727,12 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     job_id=context.job_id,
                 )
 
-                # Cache for future use
-                cache.set(full_path, description, page=page_num, query=describe)
+                # Cache only a real description (a failure is retried).
+                from agent.services.vision_helper import vision_failed
+
+                if not vision_failed(description):
+                    cache.set(full_path, description, page=page_num, query=describe)
+                    description = _fence_description(description)
 
                 if describe:
                     return f'\n[PAGE {page_num} - VISUAL CONTENT (Query: "{describe[:50]}...")]\n{description}'
@@ -843,6 +963,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         page_start: Optional[int] = None,
         page_end: Optional[int] = None,
         describe: Optional[str] = None,
+        region: Optional[List[float]] = None,
     ) -> str:
         """Read content from a file in the workspace.
 
@@ -857,6 +978,8 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         For image files (PNG, JPG, etc.):
         - Returns image data or AI-generated description
+        - read_file("photo.jpg", region=[50, 0, 100, 50]) - the top-right
+          quarter at full resolution, to check small text, faces or hands
 
         For audio files (MP3, WAV, M4A, OGG, FLAC, etc.):
         - Returns line-numbered text transcription via Whisper
@@ -871,12 +994,14 @@ def create_file_tools(context: ToolContext) -> List[Any]:
           decode error
 
         Args:
-            path: Relative path to the file (e.g., "plan.md")
+            path: Relative path to the file (e.g., "notes.md")
             offset: For text files: starting line number (1-indexed, default: 1)
             limit: For text files: number of lines to read (default/max: 2000)
             page_start: For documents: first page/slide to read (1-indexed)
             page_end: For documents: last page/slide to read
             describe: Optional query for visual analysis (e.g., "What values are in this chart?")
+            region: For images: [left, top, right, bottom] in percent of the
+                width and height, to look closer at one part
 
         Returns:
             File content with line numbers, or error message.
@@ -906,7 +1031,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if _is_image_file(full_path):
                 with workspace.local_copy(path) as local_path:
                     result = _handle_image_file(
-                        local_path, describe, display_name=full_path.name
+                        local_path, describe, display_name=full_path.name, region=region
                     )
                 if not result.startswith("Error:"):
                     context.record_file_read(path)
@@ -1059,7 +1184,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         accidental data loss from blind overwrites.
 
         Use this to:
-        - Create new files (plan.md, research.md)
+        - Create new files (report.md, research.md)
         - Save research notes (document_analysis.md)
         - Write intermediate results (candidates/candidates.md)
         - Store processed data (chunks/chunk_001.md)
@@ -1194,7 +1319,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
            beginning of the file. The `old_string` parameter is ignored.
 
         Args:
-            path: Relative path to the file (e.g., "plan.md")
+            path: Relative path to the file (e.g., "notes.md")
             old_string: Text to find and replace (required for replace mode)
             new_string: Replacement text or content to insert
             position: Insert position - "start", "end", or None for replace mode

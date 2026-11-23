@@ -276,19 +276,12 @@ Sessions (the default) with startup-stage tracking turned off, it keeps saying
 "Checking workspace scheduling; the result is not yet confirmed." You can still
 End a Session whose image can't be pulled when it first starts. See
 [When a workspace can't start](../examples/manifests/container-workspace-templates.md#when-a-workspace-cant-start).
-To have the trial Job run your tools, give it an Expert with a shell, such as
-**Engineer**: pick it under **Agent Expert** on New Job, or pass
-`expert="engineer"` over MCP. A non-admin needs the `shell_tools` capability
-grant from an administrator to use an Expert with the shell tools. To make it
-your default, use **Duplicate** on Engineer in **Experts**, then pick the copy
-under **Settings → Defaults → New jobs**. A Project owner can set a Project's
-default Expert with `defaults.expert` in the Project manifest.
-
-The agent runs your tools through its shell, so only an Expert with a shell can
-use them. The shipped default Expert for Jobs, **General Worker**, has none; a
-Job on it can't run your tools even when the image has them. A Job's IDE
-terminal runs in a separate pod with the installation's image, so it doesn't
-have your tools either. See
+The agent runs your tools through its shell, so the trial Job needs an Expert
+with the shell tools. The shipped default Expert for Jobs, **General Worker**,
+has them, and so does **Engineer**. The `shell_tools` capability grant is on by
+default; if an administrator has restricted it, a Job can't run commands even
+when the image has your tools. A Job's IDE terminal runs in a separate pod with
+the installation's image, so it doesn't have your tools either. See
 [Known limitations](../examples/manifests/container-workspace-templates.md#known-limitations).
 
 ## When it doesn't start

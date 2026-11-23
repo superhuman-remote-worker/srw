@@ -948,13 +948,14 @@ The realm already exists, so the chart cannot rename that user. While the
 Keycloak user keeps this name, Gitea refuses to create its Git account: Git
 sign-in fails for it, and repositories cannot be shared with it. Rename the
 user in Keycloak and keep keycloak.bootstrapAdmin.username unchanged; see
-docs/troubleshooting.md#the-first-administrator-has-no-git-account
+https://docs.superhuman-remote-worker.com/troubleshooting/#the-first-administrator-has-no-git-account
 If you already renamed the user, nothing else is needed.
 {{- else }}
 SRW creates each user's account on the external Git server under their
 Keycloak username, and Gitea and Forgejo servers refuse reserved names. Before
 the first install, choose another name; on an existing realm, rename the user
-in Keycloak; see docs/troubleshooting.md#the-first-administrator-has-no-git-account
+in Keycloak; see
+https://docs.superhuman-remote-worker.com/troubleshooting/#the-first-administrator-has-no-git-account
 {{- end }}
 {{- end -}}
 {{- end -}}
@@ -1696,7 +1697,7 @@ Both warnings exist because the failure they describe is otherwise silent.
      Set databases.backup.method=objectstore and databases.backup.destinationPath,
      and install the Barman Cloud plugin — this chart cannot install it, because
      it is a raw manifest pinned to the operator's namespace. See
-     knowledge-base/knowledge/operations/cnpg_backup_runbook.md
+     https://github.com/superhuman-remote-worker/srw/blob/main/helm/README.md#the-barman-cloud-plugin--the-chart-cannot-install-this
 {{- else if and (include "srw.garageEnabled" .) (contains (printf "%s-garage" (include "srw.fullname" .)) .Values.databases.backup.endpointURL) }}
 
   ⚠  BACKUPS POINT AT THIS RELEASE'S OWN OBJECT STORE

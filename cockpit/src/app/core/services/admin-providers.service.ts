@@ -6,6 +6,7 @@ import {
   ApiKeySetRequest,
   DiscoveryResponse,
   HelmProvenanceSource,
+  ImageGenerationSettings,
   LlmEndpoint,
   LlmEndpointCreateRequest,
   LlmEndpointDiscoveryResult,
@@ -95,7 +96,8 @@ export type DefaultModelKind =
   | 'fetch'
   | 'search_fallback'
   | 'rerank'
-  | 'live_voice';
+  | 'live_voice'
+  | 'image_generation';
 
 export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'chat',
@@ -104,6 +106,7 @@ export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'embedding',
   'rerank',
   'live_voice',
+  'image_generation',
   'vision',
   'auxiliary',
   'whisper',
@@ -127,6 +130,7 @@ const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
   search_fallback: null,
   rerank: null,
   live_voice: null,
+  image_generation: null,
 };
 
 /**
@@ -175,6 +179,8 @@ export class AdminProvidersService {
   readonly defaults = signal<Record<DefaultModelKind, string | null>>({...EMPTY_DEFAULTS});
   /** Helm reconcile manifest + provenance; null until loaded or when unavailable. */
   readonly helmManaged = signal<HelmManagedOverview | null>(null);
+  /** Image generation cap + subscription threshold; null until loaded. */
+  readonly imageGenerationSettings = signal<ImageGenerationSettings | null>(null);
   readonly subscriptionAvailability = signal<SubscriptionAvailability>({
     ...EMPTY_SUBSCRIPTION_AVAILABILITY,
   });
@@ -280,6 +286,25 @@ export class AdminProvidersService {
       );
   }
 
+  /** Pin the certificate the admin was shown (`sha256` as displayed by Test). */
+  trustSystemEndpointCertificate(endpointId: string, sha256: string): Observable<LlmEndpoint> {
+    return this.http
+      .put<LlmEndpoint>(`${this.baseUrl}/admin/providers/endpoints/${endpointId}/tls-pin`, {sha256})
+      .pipe(tap(() => this.reloadAfterEndpointChange()));
+  }
+
+  removeSystemEndpointPin(endpointId: string): Observable<LlmEndpoint> {
+    return this.http
+      .delete<LlmEndpoint>(`${this.baseUrl}/admin/providers/endpoints/${endpointId}/tls-pin`)
+      .pipe(tap(() => this.reloadAfterEndpointChange()));
+  }
+
+  private reloadAfterEndpointChange(): void {
+    this.loadSystemEndpoints();
+    this.readiness.load();
+    this.modelService.load(undefined, true);
+  }
+
   deleteSystemEndpoint(endpointId: string): Observable<{status: string}> {
     return this.http
       .delete<{status: string}>(`${this.baseUrl}/admin/providers/endpoints/${endpointId}`)
@@ -338,6 +363,27 @@ export class AdminProvidersService {
           this.readiness.load();
         }),
       );
+  }
+
+  /** Read the image generation settings. A failed read leaves null, never a guess. */
+  loadImageGenerationSettings(): void {
+    this.http
+      .get<ImageGenerationSettings>(`${this.baseUrl}/admin/system-settings/image_generation`)
+      .pipe(catchError(() => of(null)))
+      .subscribe((row) => {
+        if (row) this.imageGenerationSettings.set(row);
+      });
+  }
+
+  saveImageGenerationSettings(
+    patch: Partial<Pick<ImageGenerationSettings, 'max_paid_images' | 'proxy_quota_threshold_percent'>>,
+  ): Observable<ImageGenerationSettings> {
+    return this.http
+      .put<ImageGenerationSettings>(
+        `${this.baseUrl}/admin/system-settings/image_generation`,
+        patch,
+      )
+      .pipe(tap((row) => this.imageGenerationSettings.set(row)));
   }
 
   /** Refresh which rows Helm reconciles (badges + drift on the Defaults page). */

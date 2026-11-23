@@ -68,6 +68,63 @@ describe('ApiService.createJob public wire contract', () => {
   });
 });
 
+describe('ApiService.testDatasource', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: {danger: vi.fn(), success: vi.fn()}},
+        {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+        {
+          provide: ErrorMessageService,
+          useValue: {translate: (_e: unknown, key: string) => key},
+        },
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    httpMock.verify();
+    vi.restoreAllMocks();
+  });
+
+  it('sends what the form edits and reads a refused edit as an error with its reason', async () => {
+    const edits = {
+      connection_url: 'https://mcp.example.com/mcp',
+      credentials: {transport: 'http', auth: {type: 'bearer', token: 'typed-token'}},
+    };
+    const pending = firstValueFrom(api.testDatasource('mcp-1', edits));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/datasources/mcp-1/test'));
+    expect(request.request.method).toBe('POST');
+    expect(request.request.body).toEqual(edits);
+    request.flush(
+      {detail: 'Invalid MCP transport (expected http or sse)'},
+      {status: 400, statusText: 'Bad Request'},
+    );
+    await expect(pending).resolves.toEqual({
+      status: 'error',
+      message: 'Invalid MCP transport (expected http or sse)',
+    });
+  });
+
+  it('answers null for a failure the server does not explain', async () => {
+    const pending = firstValueFrom(api.testDatasource('mcp-1'));
+    const request = httpMock.expectOne((item) => item.url.endsWith('/datasources/mcp-1/test'));
+    expect(request.request.body).toEqual({});
+    request.flush({detail: 'Connector test failed'}, {status: 500, statusText: 'Server Error'});
+    await expect(pending).resolves.toBeNull();
+  });
+});
+
 describe('ApiService.retryWorkspaceRecovery', () => {
   let api: ApiService;
   let httpMock: HttpTestingController;
@@ -1731,5 +1788,50 @@ describe('ApiService job outbox re-sync', () => {
     await pending;
     expect(toast.warning).toHaveBeenCalledWith(key);
     expect(toast.success).not.toHaveBeenCalled();
+  });
+});
+
+describe('ApiService job rename', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+  let toast: {danger: ReturnType<typeof vi.fn>};
+  let errors: {translate: ReturnType<typeof vi.fn>};
+
+  beforeEach(() => {
+    TestBed.resetTestingModule();
+    toast = {danger: vi.fn()};
+    errors = {translate: vi.fn((_error: unknown, key: string) => key)};
+    TestBed.configureTestingModule({providers: [
+      ApiService, provideHttpClient(), provideHttpClientTesting(),
+      {provide: AppToastService, useValue: toast},
+      {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+      {provide: ErrorMessageService, useValue: errors},
+    ]});
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('PATCHes the title only and hands back what the server stored', async () => {
+    const pending = firstValueFrom(api.renameJob('job-1', 'Lease  review'));
+    const req = httpMock.expectOne((r) => r.url.endsWith('/jobs/job-1'));
+    expect(req.request.method).toBe('PATCH');
+    // The task text is never part of a rename.
+    expect(req.request.body).toEqual({title: 'Lease  review'});
+    req.flush({job_id: 'job-1', title: 'Lease review'});
+
+    expect(await pending).toEqual({job_id: 'job-1', title: 'Lease review'});
+    expect(toast.danger).not.toHaveBeenCalled();
+  });
+
+  it('reports a refused rename and emits null so the caller can undo it', async () => {
+    const pending = firstValueFrom(api.renameJob('job-1', 'x'.repeat(201)));
+    httpMock
+      .expectOne((r) => r.url.endsWith('/jobs/job-1'))
+      .flush({detail: 'Title too long (max 200)'}, {status: 400, statusText: 'Bad Request'});
+
+    expect(await pending).toBeNull();
+    expect(toast.danger).toHaveBeenCalledExactlyOnceWith('errors.jobs.renameFailed');
   });
 });

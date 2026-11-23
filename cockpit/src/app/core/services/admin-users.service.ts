@@ -1,7 +1,12 @@
 import {inject, Injectable, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {catchError, Observable, of, tap} from 'rxjs';
-import {User, VmWorkspacesSetting} from '../models/api.model';
+import {
+  McpServerQuestionsChoice,
+  McpServerQuestionsSetting,
+  User,
+  VmWorkspacesSetting,
+} from '../models/api.model';
 import {environment} from '../environment';
 
 export interface AdminUserPatch {
@@ -34,6 +39,9 @@ export class AdminUsersService {
     updated_at: null,
     updated_by: null,
   });
+  /** The installation default for MCP server questions; null until read
+   *  (or when the caller may not read it: the endpoint is admin-only). */
+  readonly mcpServerQuestions = signal<McpServerQuestionsSetting | null>(null);
 
   loadUsers(): void {
     this.http
@@ -88,5 +96,29 @@ export class AdminUsersService {
         {enabled},
       )
       .pipe(tap((row) => this.vmWorkspaces.set(row)));
+  }
+
+  /** Read the MCP server-questions default. A failed read leaves what is
+   *  known (null at first), never a guess. */
+  loadMcpServerQuestions(): void {
+    this.http
+      .get<McpServerQuestionsSetting>(
+        `${this.baseUrl}/admin/system-settings/mcp_server_questions`,
+      )
+      .pipe(catchError(() => of(null)))
+      .subscribe((row) => {
+        if (row) this.mcpServerQuestions.set(row);
+      });
+  }
+
+  setMcpServerQuestionsDefault(
+    value: McpServerQuestionsChoice,
+  ): Observable<McpServerQuestionsSetting> {
+    return this.http
+      .put<McpServerQuestionsSetting>(
+        `${this.baseUrl}/admin/system-settings/mcp_server_questions`,
+        {default: value},
+      )
+      .pipe(tap((row) => this.mcpServerQuestions.set(row)));
   }
 }

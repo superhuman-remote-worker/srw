@@ -40,6 +40,16 @@ import {
   parseSubagentRecoveryResult,
 } from '../models/subagent-recovery.model';
 import { parseMarkedToolResultState, parseToolResultState } from '../models/tool-result-state.model';
+import {
+  McpQuestion,
+  McpQuestionAnswer,
+  McpQuestionUiState,
+  questionDecisionBody,
+  questionErrorDetail,
+  questionOutcome,
+  toMcpQuestion,
+  toMcpQuestions,
+} from '../models/mcp-question.model';
 import { TranslocoService } from '@jsverse/transloco';
 import { workspaceCreationMessageKey, workspaceCreationMessageParams } from '../util/workspace-creation';
 import { WorkspaceChoice } from '../models/workspace-template.model';
@@ -60,8 +70,10 @@ import { classifyResumeError, ConfigDriftItem } from './resume-error';
 import { reduce, ReducerAction } from './turn-reducer';
 import {
   attachmentDedupeKey,
+  attachmentTypeFromName,
   classifyUploadFailure,
   composeAgentContent,
+  parseAttachmentHint,
   PendingUpload,
   progressWriteDue,
 } from './upload-stage';
@@ -237,6 +249,9 @@ export interface ChatAttachment {
   /** Workspace-relative path, e.g. "uploads/photo.jpg". Absent until the
    *  upload resolves. */
   path?: string;
+  /** A dictation recording: uploaded and named to the agent, never shown as
+   *  a chip (FilePreview.dictation). */
+  dictation?: boolean;
 }
 
 /**
@@ -272,6 +287,41 @@ export interface OutboxItem {
   expectedConversationRevision?: number;
   /** Rewind moved the transcript past this send's captured revision. */
   requiresReview?: boolean;
+  /** Sent by the Cockpit itself, not typed: the continuation after a
+   *  workspace upgrade. Nobody is there to press Retry, so it retries on its
+   *  own once the connection is back. Input has no idempotency key, so the
+   *  thread's server turn count is the proof: it is read right before the
+   *  first POST, and after a POST whose outcome is unknown a higher count
+   *  means the input landed (or other input resumed the agent), so it is
+   *  never sent a second time. */
+  automatic?: AutomaticSend;
+}
+
+export interface AutomaticSend {
+  /** `total_turns` of the thread just before the first POST; null until read. */
+  turnsBefore: number | null;
+  /** A POST failed without proving the server refused it: check the turn
+   *  count before sending again. */
+  unconfirmed: boolean;
+}
+
+/** A REST workspace upgrade the user decided on, from the click until the
+ *  server took it (and, with "& continue", until the upgrade completed).
+ *  Mirrored in sessionStorage per thread, so a dropped connection, a
+ *  reconnect or a reload neither loses it nor sends it twice: it always goes
+ *  out with the same `client_request_id`, which the control inbox dedupes. */
+interface WorkspaceUpgradeIntent {
+  threadId: string;
+  tier: 'sandbox' | 'vm' | null;
+  template?: string;
+  thenContinue: boolean;
+  clientRequestId: string;
+  /** The runtime it was asked for; a different one (End, Resume) drops it. */
+  runtimeGeneration: string | null;
+  /** `pending`: not admitted yet (waiting for the turn to end, or the POST's
+   *  outcome is unknown). `admitted`: the server took it; only the
+   *  continuation is left. */
+  phase: 'pending' | 'admitted';
 }
 
 /** Info about a tool call within an assistant message. */
@@ -611,6 +661,18 @@ const LEGACY_SOCKET_VERBS = new Set([
   'deny',
 ]);
 
+/** Frames that open or close a turn: past one of them the conversation knows
+ *  whether a turn runs, so a durable snapshot's `turn_in_flight` no longer
+ *  has to stand in for it. */
+const TURN_BOUNDARY_FRAMES = new Set([
+  'turn.started',
+  'turn.completed',
+  'turn.error',
+  'turn.interrupted',
+  'turn.parked',
+  'ready',
+]);
+
 /** How long a `config.update` sent over the socket may wait for its
  *  `config.changed` ack (or matching error frame) before the pane rolls the
  *  edit back and says so. The agent applies a live update in well under a
@@ -708,6 +770,9 @@ interface SessionStateSnapshot extends Record<string, unknown> {
    */
   running_tools?: RunningToolInfo[] | null;
   pending_permissions: unknown[];
+  /** Open MCP server questions (same shape as `question.request` data).
+   *  Omitted by peers that predate them. */
+  pending_questions?: unknown[];
   /** Present on task-aware servers; omitted by older rolling-deploy peers. */
   tasks?: SessionTask[];
   /** Last known token telemetry, aggregated from the journal at
@@ -962,15 +1027,33 @@ export class PersistentChatService {
     });
 
     // A /compact (or "Summarize up to here") asked for mid-response runs once
-    // the session is idle again — see requestCompaction(). A workspace
-    // upgrade asked for mid-response waits the same way.
+    // the session is idle again — see requestCompaction().
     effect(() => {
       const busy = this.isStreaming() || this.isAwaitingTurn();
       if (busy) return;
-      untracked(() => {
-        this._flushDeferredCompaction();
-        this._flushDeferredWorkspaceUpgrade();
-      });
+      untracked(() => this._flushDeferredCompaction());
+    });
+
+    // A workspace upgrade the user decided on goes out once the turn is over
+    // AND the control plane is back: after a reconnect or a reload that is a
+    // later edge than the turn's end (snapshot, /connection, stream
+    // recovery), so every one of them re-checks.
+    effect(() => {
+      this.isStreaming();
+      this.isAwaitingTurn();
+      this.snapshotTurnInFlight();
+      this.sessionReady();
+      this.controlCapabilities();
+      this.connectionState();
+      this.workspaceUpgradeInProgress();
+      untracked(() => this._flushWorkspaceUpgradeIntent());
+    });
+
+    // The Cockpit's own continuation retries when the connection is back;
+    // nobody is there to press Retry (see OutboxItem.automatic).
+    effect(() => {
+      if (this.connectionState() !== 'connected' || !this.sessionReady()) return;
+      untracked(() => this._retryAutomaticSend());
     });
 
     // A failed stateless upgrade (C1): announce it once per thread, on load or
@@ -1265,6 +1348,19 @@ export class PersistentChatService {
   readonly pendingPermissions = signal<PermissionRequest[]>([]);
   private readonly permissionResolutionFailures = new Set<string>();
 
+  // --- MCP server questions ---
+  /** Questions an MCP server asked mid-call, still waiting on the user
+   *  (knowledge-base/knowledge/features/mcp_client_2026_07_28_elicitation.md).
+   *  Ack-driven like approvals: a card leaves on `question.resolved` (or a
+   *  snapshot that no longer lists it), never on the POST alone. */
+  readonly pendingQuestions = signal<McpQuestion[]>([]);
+  /** Each card's send state, by request id. */
+  readonly questionUi = signal<Record<string, McpQuestionUiState>>({});
+  /** The server each announced question named, by request id and tool
+   *  call: `question.resolved` carries neither, and a reload's snapshot has
+   *  already dropped the card its transcript line needs the name from. */
+  private readonly questionServers = new Map<string, string>();
+
   // --- Running-command snapshot ---
   // Set from the session.state welcome frame on (re)attach when the loop is
   // blocked in tool calls; each entry is dropped when its tool completes, and
@@ -1447,12 +1543,21 @@ export class PersistentChatService {
   /** The VM line owed for the upgrade being admitted: posted on its 202,
    *  dropped on a refusal (a refused try used to leave its line). */
   private pendingUpgradeAnnouncement: {template?: string} | null = null;
-  /** An upgrade asked for mid-response, sent when the session is idle. */
-  private deferredWorkspaceUpgrade: {
-    threadId: string;
-    tier: 'sandbox' | 'vm' | null;
-    template?: string;
-  } | null = null;
+  /** The REST upgrade the user asked for (see WorkspaceUpgradeIntent). Kept
+   *  across disconnect(): connect() swaps in the stored one of the thread it
+   *  opens. */
+  private workspaceUpgradeIntent: WorkspaceUpgradeIntent | null = null;
+  /** The intent whose "starts after the current response" line this page
+   *  life has shown (by client_request_id). */
+  private workspaceUpgradeIntentAnnounced: string | null = null;
+  /** The durable snapshot said a turn is running, and no turn frame has
+   *  arrived since. Bridges a reload: the snapshot does not reopen the turn,
+   *  the replayed turn.started does, and an upgrade must not go out between
+   *  the two. */
+  private readonly snapshotTurnInFlight = signal(false);
+  private automaticSendRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private automaticSendRetryAttempt = 0;
+  private static readonly AUTOMATIC_SEND_RETRY_DELAYS_MS = [2000, 5000, 15_000, 30_000];
 
   /** Bind an IDE response to this view, including same-thread Resume. A late
    *  ready response cannot restore the idle view of a terminal retirement. */
@@ -2378,6 +2483,7 @@ export class PersistentChatService {
     this._clearDurableControlOutbox();
     this.pendingPermissions.set([]);
     this.permissionResolutionFailures.clear();
+    this._clearQuestions();
     this.workspaceUpgradeInProgress.set(null);
     this.workspaceUpgradeSeenOnServer = false;
     this.workspaceUpgradeEndedByFrame = false;
@@ -2554,6 +2660,7 @@ export class PersistentChatService {
     const preservedReplayCursor = sameThread ? this.sseReplayCursor : undefined;
     const preserveReviewPlane = opts.preserveReviewPlane === true && previousThreadId === threadId;
     this.disconnect({ preserveReviewPlane });
+    this._restoreWorkspaceUpgradeIntent(threadId);
     const generation = this.connectGeneration;
     this.isDraftSession.set(false);
     this.connectionState.set(bindingInvalid ? 'error' : 'connecting');
@@ -4952,10 +5059,20 @@ export class PersistentChatService {
    * orchestrator committed the request. It must not synthesize owner state;
    * the serving owner writes the acknowledgement through its journal
    * allocator and the normal SSE reducer applies it.
+   *
+   * `clientRequestId` names a request that may already have been sent (a
+   * stored workspace upgrade): resending it is idempotent server-side, and a
+   * copy still in the outbox is not queued twice.
    */
-  private _sendDurableControl(control: DurableControl): boolean {
+  private _sendDurableControl(control: DurableControl, clientRequestId?: string): boolean {
     const threadId = this.threadId();
     if (!threadId || !this._controlPlaneAllowed(threadId)) return false;
+    if (
+      clientRequestId &&
+      this.durableControlOutbox.some((queued) => queued.request.client_request_id === clientRequestId)
+    ) {
+      return true;
+    }
     const runtimeGeneration = this.sessionRuntimeGeneration;
     if (!runtimeGeneration) {
       this._setDurableControlError(
@@ -4997,7 +5114,7 @@ export class PersistentChatService {
       threadId,
       request: {
         ...control,
-        client_request_id: newRequestId(),
+        client_request_id: clientRequestId ?? newRequestId(),
         session_runtime_generation: runtimeGeneration,
       },
       attempts: 0,
@@ -5075,6 +5192,9 @@ export class PersistentChatService {
       this.durableControlOutbox.shift();
     }
     const admission = body as { transport_changed?: unknown; request_id?: unknown } | null | undefined;
+    if (item.request.method === 'upgrade-to-workspace') {
+      this._workspaceUpgradeIntentAdmitted(item.threadId, item.request.client_request_id);
+    }
     if (item.request.method === 'upgrade-to-workspace' && admission?.transport_changed === true) {
       this._switchToPinnedTransport(
         item.threadId,
@@ -5108,9 +5228,33 @@ export class PersistentChatService {
     this.durableControlSubscription = null;
     this.durableControlInFlight = null;
 
+    const status = (err as { status?: unknown })?.status;
+    const intent = this.workspaceUpgradeIntent;
+    if (
+      item.request.method === 'upgrade-to-workspace' &&
+      status === 425 &&
+      intent?.threadId === item.threadId &&
+      intent.clientRequestId === item.request.client_request_id &&
+      this.threadId() === item.threadId &&
+      !this.intentionalClose &&
+      (this.isStreaming() || this.isAwaitingTurn()) &&
+      this.durableControlOutbox[0] === item
+    ) {
+      // "Completing a turn" while a turn is visibly running here (a reload
+      // that had not seen the queued input yet): the upgrade waits for that
+      // turn to end instead of spending its retries on it. The stored
+      // decision keeps its request id; the idle edge sends it again.
+      this.durableControlOutbox.shift();
+      this.durableControlAwaitingAck.delete(item.request.client_request_id);
+      this.workspaceUpgradeInProgress.set(null);
+      this.pendingUpgradeAnnouncement = null;
+      this._flushDurableControlOutbox();
+      return;
+    }
+
     const upgradeRetriesExhausted =
       item.request.method === 'upgrade-to-workspace' &&
-      (err as { status?: unknown })?.status === 425 &&
+      status === 425 &&
       item.attempts >= PersistentChatService.WORKSPACE_UPGRADE_MAX_425_ATTEMPTS;
 
     if (
@@ -5138,8 +5282,20 @@ export class PersistentChatService {
     }
     this.durableControlAwaitingAck.delete(item.request.client_request_id);
     if (item.request.method === 'upgrade-to-workspace') {
+      // A refusal (or a busy session past its retries) ends the decision.
+      // A retryable failure that only lost its tab (teardown, thread switch)
+      // keeps it, continuation included: the stored request id goes out
+      // again later.
+      const refused = upgradeRetriesExhausted || !this._isRetryableDurableControlFailure(err);
+      const kept =
+        !refused &&
+        this.workspaceUpgradeIntent?.threadId === item.threadId &&
+        this.workspaceUpgradeIntent.clientRequestId === item.request.client_request_id;
+      if (refused) {
+        this._removeWorkspaceUpgradeIntent(item.threadId, item.request.client_request_id);
+      }
       this.workspaceUpgradeInProgress.set(null);
-      this.continueAfterUpgrade.set(false);
+      if (!kept) this.continueAfterUpgrade.set(false);
       this.pendingUpgradeAnnouncement = null;
     }
     if (!this.intentionalClose && this.threadId() === item.threadId) {
@@ -5451,7 +5607,12 @@ export class PersistentChatService {
     // the composer stuck on "working" after a teardown.
     this.pendingTurnCount.set(0);
     this.deferredCompaction = null;
-    this.deferredWorkspaceUpgrade = null;
+    // The workspace-upgrade decision is NOT dropped here: it belongs to the
+    // user, not to this transport (B1 of the 11-21 canvas run — a dropped
+    // connection used to lose it while "will start after the current
+    // response" stayed on screen). connect() keeps or swaps it per thread.
+    this.snapshotTurnInFlight.set(false);
+    this._clearAutomaticSendRetry();
     if (this.controlWsReconnectTimer) {
       clearTimeout(this.controlWsReconnectTimer);
       this.controlWsReconnectTimer = null;
@@ -5532,6 +5693,7 @@ export class PersistentChatService {
     // swallow. Only a genuine thread switch (connect() cold path) clears it.
     this.pendingPermissions.set([]);
     this.permissionResolutionFailures.clear();
+    this._clearQuestions();
     this.compaction.set(null);
     // The workspace-upgrade signals are per-thread and must not bleed across
     // a switch. workspaceUpgradeInProgress especially: disconnect() closes
@@ -5930,10 +6092,15 @@ export class PersistentChatService {
    *  The displayed user message keeps the original text and shows the files
    *  as attachment chips — present from the moment the user hits send, not
    *  from the moment the bytes land.
+   *
+   *  `automatic` marks a message the Cockpit sends on its own (the
+   *  continuation after a workspace upgrade): it takes nothing from the
+   *  composer and retries by itself (OutboxItem.automatic).
    */
-  async sendMessage(content: string): Promise<boolean> {
+  async sendMessage(content: string, opts: { automatic?: boolean } = {}): Promise<boolean> {
+    const automatic = opts.automatic === true;
     const trimmed = content.trim();
-    const queued = this.pendingAttachments();
+    const queued = automatic ? [] : this.pendingAttachments();
     if (this.isDraftSession() && (
       this.draftDefaultsLoading() || this.draftDefaultsError() || this.draftDatasourceIds() === null
     )) return false;
@@ -5949,14 +6116,18 @@ export class PersistentChatService {
     // composer with no message and no error — the strand named in
     // knowledge-base/knowledge/features/session_attachment_send_flow.md §2. Refuse explicitly
     // instead, so no slash path can silently swallow queued files.
-    if (trimmed.startsWith('/') && queued.length > 0) {
+    if (trimmed.startsWith('/') && queued.some((p) => !p.dictation)) {
       this.attachmentError.set(this.transloco.translate('chat.upload.slashCommandWithAttachments'));
       return false;
     }
 
-    // Slash commands bypass attachment logic.
+    // Slash commands bypass attachment logic. A dictated command leaves only
+    // its recording behind, which no command uses and nobody can see: drop it.
     if (trimmed.startsWith('/')) {
-      if (this.handleSlashCommand(trimmed)) return true;
+      if (this.handleSlashCommand(trimmed)) {
+        for (const p of queued) this.removeAttachment(p.id);
+        return true;
+      }
     }
 
     if (!trimmed && queued.length === 0) return true;
@@ -5981,19 +6152,20 @@ export class PersistentChatService {
         total: p.size || null,
         status: 'queued' as const,
       }));
+    const dictated = new Set(queued.filter((p) => p.dictation).map((p) => p.id));
     const attachments: ChatAttachment[] = pendingFiles.map((f) => ({
       id: f.id,
       name: f.name,
       size: f.size,
       mimeType: f.mimeType,
+      ...(dictated.has(f.id) ? { dictation: true } : {}),
     }));
 
     // The user spoke, so they've resumed the agent themselves — drop any
     // queued auto-continuation rather than stacking a "continue where you
-    // left off" behind whatever they just said. Safe against the
-    // continuation's own send: workspace_upgrade.complete clears the flag
-    // before calling us.
-    this.continueAfterUpgrade.set(false);
+    // left off" behind whatever they just said: the armed flag, the stored
+    // decision's half of it, and a continuation still waiting to be sent.
+    if (!automatic) this._dropUpgradeContinuation();
 
     // ── One synchronous commit point ────────────────────────────────────
     // Bubble, queue entry and composer clearing happen together, with no
@@ -6027,10 +6199,13 @@ export class PersistentChatService {
         threadId: this.threadId() ?? '',
         attempts: 0,
         expectedConversationRevision: this.conversationRevision(),
+        ...(automatic ? { automatic: { turnsBefore: null, unconfirmed: false } } : {}),
       },
     ]);
-    this.clearAttachments();
-    this.attachmentError.set(null);
+    if (!automatic) {
+      this.clearAttachments();
+      this.attachmentError.set(null);
+    }
     // ────────────────────────────────────────────────────────────────────
     this.isWaitingForInput.set(false);
     if (this.isDraftSession()) {
@@ -6164,8 +6339,12 @@ export class PersistentChatService {
           this.error.set(this.transloco.translate('chat.rewind.staleOutbox'));
           return;
         }
-        const names = (item.attachments ?? []).filter((a) => a.path).map((a) => a.name);
-        const content = composeAgentContent(head.displayContent, names);
+        const uploaded = (item.attachments ?? []).filter((a) => a.path);
+        const content = composeAgentContent(
+          head.displayContent,
+          uploaded.filter((a) => !a.dictation).map((a) => a.name),
+          uploaded.filter((a) => a.dictation).map((a) => a.name),
+        );
         // Record what we're about to POST on the item itself, so the
         // queue can be inspected (and a retry compared) without
         // recomputing. Skipped when unchanged — a retry must not churn
@@ -6174,6 +6353,33 @@ export class PersistentChatService {
           this.outbox.update((q) =>
             q.map((i) => (i.localId === head.localId ? { ...i, content } : i)),
           );
+        }
+        if (item.automatic) {
+          // The Cockpit's own message: read the turn count it is judged by
+          // (first send), or prove a lost answer did not land (resend).
+          const verdict = await this._checkAutomaticSend(item, tidAtPost);
+          if (this.threadId() !== tidAtPost) {
+            queueMicrotask(() => void this._flushOutbox());
+            return;
+          }
+          if (verdict === 'gone') continue;
+          if (verdict === 'landed') {
+            // It landed under a lost answer, or other input resumed the
+            // agent first: either way it must not go out again. The bubble
+            // stays; the turn renders over SSE.
+            this._removeFromOutbox(item.localId);
+            this._clearAutomaticSendRetry();
+            this.outboxStalled.set(false);
+            this.error.set(null);
+            continue;
+          }
+          if (verdict === 'wait') {
+            if (this.outboxIds().has(item.localId)) {
+              this.outboxStalled.set(true);
+              this._scheduleAutomaticSendRetry();
+            }
+            return;
+          }
         }
         // Upload may outlive a CLOSED stream, End, navigation or a successor
         // connect. Keep the unaccepted item queued; no G1 send may slip into
@@ -6220,6 +6426,7 @@ export class PersistentChatService {
           // turn.started lands.
           this.pendingTurnCount.update((c) => c + 1);
           this._removeFromOutbox(head.localId);
+          if (item.automatic) this._clearAutomaticSendRetry();
           // The send that produced any stall banner just landed, so
           // the banner is now lying. Clear both.
           this.outboxStalled.set(false);
@@ -6244,6 +6451,18 @@ export class PersistentChatService {
         // Mark the queue stalled so the bubble offers retry/discard —
         // without it a failure here reads as "still sending" forever.
         this.outboxStalled.set(true);
+        if (item.automatic) {
+          // Nobody will press Retry for it. It may have landed under the
+          // lost answer, so the retry checks the turn count first.
+          this.outbox.update((queue) =>
+            queue.map((queued) =>
+              queued.localId === item.localId && queued.automatic
+                ? { ...queued, automatic: { ...queued.automatic, unconfirmed: true } }
+                : queued,
+            ),
+          );
+          this._scheduleAutomaticSendRetry();
+        }
         return;
       }
     } finally {
@@ -6254,6 +6473,115 @@ export class PersistentChatService {
 
   private _removeFromOutbox(localId: string): void {
     this.outbox.update((q) => q.filter((i) => i.localId !== localId));
+  }
+
+  /** Whether the Cockpit's own queued message may be POSTed now.
+   *
+   *  `send`: go ahead (first send, with its baseline recorded, or a resend
+   *  whose earlier POST provably did not land). `landed`: the thread's turn
+   *  count rose since the baseline, so that POST landed or other input
+   *  resumed the agent; never send it again. `wait`: the count could not be
+   *  read; retry later. `gone`: the item left the queue meanwhile. */
+  private async _checkAutomaticSend(
+    item: OutboxItem,
+    threadId: string,
+  ): Promise<'send' | 'landed' | 'wait' | 'gone'> {
+    const automatic = item.automatic;
+    if (!automatic) return 'send';
+    if (automatic.turnsBefore !== null && !automatic.unconfirmed) return 'send';
+    const turns = await this._readServerTurnCount(threadId);
+    const current = this.outbox().find((queued) => queued.localId === item.localId);
+    if (!current?.automatic || this.threadId() !== threadId) return 'gone';
+    if (turns === null) return 'wait';
+    const before = current.automatic.turnsBefore;
+    if (before === null) {
+      this.outbox.update((queue) =>
+        queue.map((queued) =>
+          queued.localId === item.localId && queued.automatic
+            ? { ...queued, automatic: { ...queued.automatic, turnsBefore: turns } }
+            : queued,
+        ),
+      );
+      return 'send';
+    }
+    return turns > before ? 'landed' : 'send';
+  }
+
+  /** The thread's `total_turns`: every accepted input raises it (both lanes
+   *  persist the human row with the next turn number at accept time), and
+   *  nothing else does. Null when it could not be read. */
+  private async _readServerTurnCount(threadId: string): Promise<number | null> {
+    try {
+      const thread = await firstValueFrom(
+        this.http
+          .get<{ total_turns?: unknown }>(`${environment.apiUrl}/persistent/threads/${threadId}`)
+          .pipe(timeout({ first: THREAD_META_RESPONSE_TIMEOUT_MS })),
+      );
+      const turns = thread?.total_turns;
+      return typeof turns === 'number' && Number.isInteger(turns) && turns >= 0 ? turns : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Try the Cockpit's own message again later. Bounded backoff; the
+   *  connection-back edge (see the constructor) retries sooner. */
+  private _scheduleAutomaticSendRetry(): void {
+    if (this.automaticSendRetryTimer) return;
+    const delays = PersistentChatService.AUTOMATIC_SEND_RETRY_DELAYS_MS;
+    const delay = delays[Math.min(this.automaticSendRetryAttempt, delays.length - 1)];
+    this.automaticSendRetryAttempt += 1;
+    const threadId = this.threadId();
+    this.automaticSendRetryTimer = setTimeout(() => {
+      this.automaticSendRetryTimer = null;
+      if (this.threadId() !== threadId || this.intentionalClose) return;
+      this._retryAutomaticSend();
+    }, delay);
+  }
+
+  private _clearAutomaticSendRetry(): void {
+    if (this.automaticSendRetryTimer) {
+      clearTimeout(this.automaticSendRetryTimer);
+      this.automaticSendRetryTimer = null;
+    }
+    this.automaticSendRetryAttempt = 0;
+  }
+
+  /** Flush when the Cockpit's own message heads the queue. A user's stalled
+   *  message keeps waiting for its Retry: without an idempotency key only
+   *  the automatic one can prove it is not a double. */
+  private _retryAutomaticSend(): void {
+    const head = this.outbox()[0];
+    if (!head?.automatic || head.threadId !== this.threadId()) return;
+    if (this.postingLocalIds.has(head.localId)) return;
+    void this._flushOutbox();
+  }
+
+  /** The user spoke: the agent is resumed by their message, so no automatic
+   *  continuation may follow it. Clears the armed flag, the stored
+   *  decision's continuation, and a continuation still waiting in the queue
+   *  (one already on the wire is left to settle). */
+  private _dropUpgradeContinuation(): void {
+    this.continueAfterUpgrade.set(false);
+    const intent = this.workspaceUpgradeIntent;
+    if (intent && intent.threadId === this.threadId()) {
+      if (intent.phase === 'admitted') {
+        this._removeWorkspaceUpgradeIntent(intent.threadId, intent.clientRequestId);
+      } else if (intent.thenContinue) {
+        this._storeWorkspaceUpgradeIntent({ ...intent, thenContinue: false });
+      }
+    }
+    const waiting = this.outbox().filter(
+      (item) =>
+        item.automatic &&
+        !this.postingLocalIds.has(item.localId) &&
+        !this.uploadingLocalIds.has(item.localId),
+    );
+    for (const item of waiting) {
+      this._removeFromOutbox(item.localId);
+      this.dispatch({ type: 'remove_turn', id: item.localId });
+    }
+    if (waiting.length > 0) this._clearAutomaticSendRetry();
   }
 
   /**
@@ -6440,7 +6768,11 @@ export class PersistentChatService {
   ): void {
     const item = this.outboxItem(localId);
     if (!item) return; // drained under us (thread gone / switched)
-    const next = (item.attachments ?? []).flatMap((a) => (a.id === fileId ? resolved : [a]));
+    // The server's answer knows nothing of dictation: carry the flag over,
+    // or a recording would surface as a chip once its upload resolved.
+    const next = (item.attachments ?? []).flatMap((a) =>
+      a.id === fileId ? resolved.map((r) => (a.dictation ? { ...r, dictation: true } : r)) : [a],
+    );
     this.outbox.update((q) =>
       q.map((i) => (i.localId === localId ? { ...i, attachments: next } : i)),
     );
@@ -6923,6 +7255,120 @@ export class PersistentChatService {
     ) {
       this.error.set(null);
     }
+  }
+
+  // ── MCP server questions ───────────────────────────────────────────
+
+  /**
+   * Answer an MCP server's question: Accept or Submit (`approve`, with the
+   * form's content, and `alwaysAccept` for "Always accept in this
+   * session"), Decline (`deny`) or Dismiss (`cancel`). The card stays until
+   * `question.resolved` retires it. A 404/409 means it is already gone or
+   * decided; a 422 means the answer does not fit the form, and its detail
+   * shows on the card, which stays open. Never rejects.
+   */
+  answerQuestion(question: McpQuestion, answer: McpQuestionAnswer): Promise<void> {
+    const threadId = this.threadId();
+    if (!threadId) return Promise.resolve();
+    const key = question.approvalId;
+    if (this.questionUi()[key]?.busy) return Promise.resolve();
+    this._setQuestionUi(key, {busy: true, sent: false, error: null});
+    const url = `${environment.apiUrl}/persistent/threads/${threadId}/approve/${key}`;
+    return new Promise<void>((resolve) => {
+      this.http.post(url, questionDecisionBody(answer)).subscribe({
+        next: () => {
+          if (this.threadId() === threadId) this._setQuestionUi(key, {sent: true});
+        },
+        complete: () => resolve(),
+        error: (err: unknown) => {
+          resolve();
+          if (this.threadId() !== threadId) return;
+          const status = (err as {status?: number})?.status;
+          if (status === 404 || status === 409) {
+            this._systemMessage(
+              this.transloco.translate(
+                status === 409 ? 'chat.question.alreadyAnswered' : 'chat.question.gone',
+              ),
+            );
+            this._setPendingQuestions(
+              this.pendingQuestions().filter((q) => q.approvalId !== key),
+            );
+            return;
+          }
+          // Still open: a card a question.resolved already retired stays gone.
+          if (!this.pendingQuestions().some((q) => q.approvalId === key)) return;
+          const detail =
+            status === 422 ? questionErrorDetail((err as {error?: unknown})?.error) : null;
+          this._setQuestionUi(key, {
+            error:
+              detail ??
+              this.transloco.translate(
+                status === 422 ? 'chat.question.invalidAnswer' : 'chat.question.sendFailed',
+                {server: question.server},
+              ),
+          });
+        },
+      });
+    });
+  }
+
+  /** Replace the open questions, dropping the send state of any that left. */
+  private _setPendingQuestions(questions: McpQuestion[]): void {
+    this.pendingQuestions.set(questions);
+    const open = new Set(questions.map((q) => q.approvalId));
+    const ui = this.questionUi();
+    if (Object.keys(ui).some((key) => !open.has(key))) {
+      this.questionUi.set(
+        Object.fromEntries(Object.entries(ui).filter(([key]) => open.has(key))),
+      );
+    }
+  }
+
+  private _setQuestionUi(key: string, state: McpQuestionUiState): void {
+    this.questionUi.update((ui) => ({...ui, [key]: state}));
+  }
+
+  private _rememberQuestionServer(question: McpQuestion): void {
+    if (!question.server) return;
+    this.questionServers.set(question.approvalId, question.server);
+    this.questionServers.set(`call:${question.id}`, question.server);
+  }
+
+  private _clearQuestions(): void {
+    this.pendingQuestions.set([]);
+    this.questionUi.set({});
+    this.questionServers.clear();
+  }
+
+  /** One transcript line for a settled question: under its tool call's
+   *  card, or as a system line when no card holds that call (a turn that
+   *  REST history has not replayed). */
+  private _recordQuestionOutcome(
+    toolUseId: string,
+    server: string,
+    outcome: ReturnType<typeof questionOutcome>,
+    timestamp: number,
+  ): void {
+    if (!toolUseId) return;
+    const held = this.conversation().turns.some(
+      (turn) =>
+        turn.kind === 'assistant' &&
+        turn.events.some((e) => e.kind === 'tool_call' && e.id === toolUseId),
+    );
+    if (held) {
+      this.dispatch({type: 'question_decision', toolUseId, server, outcome, timestamp});
+      return;
+    }
+    this.dispatch({
+      type: 'system_message',
+      // Stable per call, so a replayed resolution replaces its line.
+      id: `question:${toolUseId}`,
+      content: this.transloco.translate(
+        `chat.question.${server ? 'outcome' : 'outcomeGeneric'}.${outcome}`,
+        {server},
+      ),
+      timestamp,
+    });
   }
 
   /** Interrupt the current turn — REST POST. */
@@ -7701,6 +8147,7 @@ export class PersistentChatService {
     this.workspaceUpgradeInProgress.set(null);
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(false);
+    this._removeWorkspaceUpgradeIntent(threadId);
     this._systemMessage(this.workspaceUpgradeFailureText());
   }
 
@@ -7729,18 +8176,32 @@ export class PersistentChatService {
     }
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(opts.thenContinue === true);
-    if (this.isStreaming() || this.isAwaitingTurn()) {
-      const alreadyDeferred = this.deferredWorkspaceUpgrade?.threadId === threadId;
-      this.deferredWorkspaceUpgrade = {threadId, tier, template: opts.template};
-      if (!alreadyDeferred) {
-        this._systemMessage(this.transloco.translate('chat.control.upgradeDeferred'));
-      }
-      return;
-    }
-    this._dispatchDurableWorkspaceUpgrade(tier, opts.template);
+    // The decision is stored before anything is sent, under one request id
+    // that every later send reuses: a second click for the same target, a
+    // reconnect, a reload. The control inbox admits a request id once.
+    const previous = this.workspaceUpgradeIntent;
+    const sameTarget =
+      previous?.threadId === threadId &&
+      previous.phase === 'pending' &&
+      previous.tier === tier &&
+      (previous.template ?? null) === (opts.template ?? null);
+    this._storeWorkspaceUpgradeIntent({
+      threadId,
+      tier,
+      ...(opts.template ? { template: opts.template } : {}),
+      thenContinue: opts.thenContinue === true,
+      clientRequestId: sameTarget ? previous!.clientRequestId : newRequestId(),
+      runtimeGeneration: this.sessionRuntimeGeneration,
+      phase: 'pending',
+    });
+    this._flushWorkspaceUpgradeIntent();
   }
 
-  private _dispatchDurableWorkspaceUpgrade(tier: 'sandbox' | 'vm' | null, template?: string): void {
+  private _dispatchDurableWorkspaceUpgrade(
+    tier: 'sandbox' | 'vm' | null,
+    template?: string,
+    clientRequestId?: string,
+  ): void {
     const control: DurableControl = {method: 'upgrade-to-workspace'};
     if (tier) control.target_tier = tier;
     if (template) control.template = template;
@@ -7758,7 +8219,7 @@ export class PersistentChatService {
       this.workspaceUpgradeInProgress.set({tier: 'sandbox'});
       this.pendingUpgradeAnnouncement = {};
     }
-    if (!this._sendDurableControl(control)) {
+    if (!this._sendDurableControl(control, clientRequestId)) {
       this.workspaceUpgradeInProgress.set(inProgress);
       this.pendingUpgradeAnnouncement = announcement;
     }
@@ -7773,14 +8234,141 @@ export class PersistentChatService {
     }
   }
 
-  private _flushDeferredWorkspaceUpgrade(): void {
-    const deferred = this.deferredWorkspaceUpgrade;
-    if (!deferred) return;
-    this.deferredWorkspaceUpgrade = null;
-    if (deferred.threadId !== this.threadId() || !this._controlPlaneAllowed(deferred.threadId)) {
+  /** Send the stored upgrade decision once it can go: this thread, a live
+   *  control plane with its runtime and transport known, and no turn running
+   *  (the server takes an upgrade only between turns). Until then it waits
+   *  and says so once. Called on every edge that can unblock it. */
+  private _flushWorkspaceUpgradeIntent(): void {
+    const intent = this.workspaceUpgradeIntent;
+    const threadId = this.threadId();
+    if (!intent || intent.phase !== 'pending' || !threadId || intent.threadId !== threadId) return;
+    if (!this._controlPlaneAllowed(threadId) || !this.sessionReady()) return;
+    if (this.isStreaming() || this.isAwaitingTurn() || this.snapshotTurnInFlight()) {
+      if (this.workspaceUpgradeIntentAnnounced !== intent.clientRequestId) {
+        this.workspaceUpgradeIntentAnnounced = intent.clientRequestId;
+        this._systemMessage(this.transloco.translate('chat.control.upgradeDeferred'));
+      }
       return;
     }
-    this._dispatchDurableWorkspaceUpgrade(deferred.tier, deferred.template);
+    // Already on its way, or the server is running an upgrade (this one,
+    // admitted under a lost answer, or another tab's); its end settles it.
+    if (this.workspaceUpgradeInProgress()) return;
+    const runtimeGeneration = this.sessionRuntimeGeneration;
+    if (!runtimeGeneration) return;
+    const declared = this.controlCapabilities();
+    if (declared?.threadId !== threadId && this.controlSocket === 'unknown') return;
+    if (intent.runtimeGeneration && intent.runtimeGeneration !== runtimeGeneration) {
+      // Asked of a runtime that is gone (End, then Resume): not this one's.
+      this._removeWorkspaceUpgradeIntent(threadId, intent.clientRequestId);
+      return;
+    }
+    const wanted = intent.tier ?? (intent.template ? null : 'sandbox');
+    if (
+      this.controlTransport('upgrade-to-workspace') !== 'rest' ||
+      (wanted && !this.upgradeTargetAvailable(wanted))
+    ) {
+      // Nothing left to upgrade on this lane (it happened under a lost
+      // answer, or in another tab). An armed continuation stays armed for
+      // the completion frame that may still replay.
+      console.info('[persistent-chat] stored workspace upgrade no longer applies; dropped');
+      this._removeWorkspaceUpgradeIntent(threadId, intent.clientRequestId);
+      return;
+    }
+    this.continueAfterUpgrade.set(intent.thenContinue);
+    this._dispatchDurableWorkspaceUpgrade(intent.tier, intent.template, intent.clientRequestId);
+  }
+
+  private _workspaceUpgradeIntentKey(threadId: string): string {
+    return `srw.workspace-upgrade.intent.${threadId}`;
+  }
+
+  /** Remember the decision in this tab (memory and sessionStorage). */
+  private _storeWorkspaceUpgradeIntent(intent: WorkspaceUpgradeIntent): void {
+    this.workspaceUpgradeIntent = intent;
+    try {
+      sessionStorage.setItem(
+        this._workspaceUpgradeIntentKey(intent.threadId),
+        JSON.stringify(intent),
+      );
+    } catch {
+      // Storage off (private mode): the decision still survives reconnects.
+    }
+  }
+
+  private _readWorkspaceUpgradeIntent(threadId: string): WorkspaceUpgradeIntent | null {
+    try {
+      const raw = sessionStorage.getItem(this._workspaceUpgradeIntentKey(threadId));
+      if (!raw) return null;
+      const intent = JSON.parse(raw) as Partial<WorkspaceUpgradeIntent> | null;
+      if (
+        !intent ||
+        intent.threadId !== threadId ||
+        typeof intent.clientRequestId !== 'string' ||
+        !intent.clientRequestId ||
+        (intent.phase !== 'pending' && intent.phase !== 'admitted') ||
+        (intent.tier !== 'sandbox' && intent.tier !== 'vm' && intent.tier !== null)
+      ) {
+        return null;
+      }
+      return {
+        threadId,
+        tier: intent.tier,
+        ...(typeof intent.template === 'string' && intent.template
+          ? { template: intent.template }
+          : {}),
+        thenContinue: intent.thenContinue === true,
+        clientRequestId: intent.clientRequestId,
+        runtimeGeneration:
+          typeof intent.runtimeGeneration === 'string' ? intent.runtimeGeneration : null,
+        phase: intent.phase,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Forget the decision `clientRequestId` of `threadId` (only that one). */
+  private _removeWorkspaceUpgradeIntent(threadId: string, clientRequestId?: string): void {
+    const intent = this.workspaceUpgradeIntent;
+    if (
+      intent?.threadId === threadId &&
+      (clientRequestId === undefined || intent.clientRequestId === clientRequestId)
+    ) {
+      this.workspaceUpgradeIntent = null;
+      this.workspaceUpgradeIntentAnnounced = null;
+    }
+    try {
+      const stored = this._readWorkspaceUpgradeIntent(threadId);
+      if (stored && (clientRequestId === undefined || stored.clientRequestId === clientRequestId)) {
+        sessionStorage.removeItem(this._workspaceUpgradeIntentKey(threadId));
+      }
+    } catch {
+      // Best effort only.
+    }
+  }
+
+  /** The server took the request (202): nothing is left to send. A
+   *  continuation still waits for the completion frame, so with one the
+   *  decision stays (a reconnect or reload re-arms it). */
+  private _workspaceUpgradeIntentAdmitted(threadId: string, clientRequestId: string): void {
+    const intent = this.workspaceUpgradeIntent;
+    if (intent?.threadId !== threadId || intent.clientRequestId !== clientRequestId) return;
+    if (intent.thenContinue && this.continueAfterUpgrade()) {
+      this._storeWorkspaceUpgradeIntent({ ...intent, phase: 'admitted' });
+    } else {
+      this._removeWorkspaceUpgradeIntent(threadId, clientRequestId);
+    }
+  }
+
+  /** connect(): keep this thread's decision across a reconnect, or take the
+   *  one stored for it (a reload, coming back to the thread), and re-arm its
+   *  continuation, which disconnect() cleared. */
+  private _restoreWorkspaceUpgradeIntent(threadId: string): void {
+    if (this.workspaceUpgradeIntent?.threadId !== threadId) {
+      this.workspaceUpgradeIntent = this._readWorkspaceUpgradeIntent(threadId);
+      this.workspaceUpgradeIntentAnnounced = null;
+    }
+    if (this.workspaceUpgradeIntent?.thenContinue) this.continueAfterUpgrade.set(true);
   }
 
   /** Decline a live upgrade offer. Local only — the agent isn't told anything
@@ -7822,6 +8410,10 @@ export class PersistentChatService {
     if (data.method !== 'token' && data.method !== 'thinking') {
       this._flushDeltas();
     }
+
+    // A turn frame takes over from the snapshot's "a turn is running": the
+    // conversation's own turn state is the authority from here on.
+    if (TURN_BOUNDARY_FRAMES.has(data.method)) this.snapshotTurnInFlight.set(false);
 
     // Agent-liveness tracking (session_silent_failure_audit.md #8):
     // "Connected" only proves the orchestrator SSE is up. Every frame
@@ -7888,6 +8480,11 @@ export class PersistentChatService {
         // handler above only ever *reopens*. Close it now: the replay floor
         // sits at the journal's tail, so nothing that follows reopens it,
         // and a genuinely new turn arrives as a fresh turn.started.
+        if (durableSnapshot && typeof params['turn_in_flight'] === 'boolean') {
+          // Until a turn frame arrives, the snapshot is what says a turn is
+          // running (a reload reopens it only on the replayed turn.started).
+          this.snapshotTurnInFlight.set(params['turn_in_flight'] === true);
+        }
         if (
           durableSnapshot &&
           params['turn_in_flight'] === false &&
@@ -7933,6 +8530,15 @@ export class PersistentChatService {
               });
             }
           }
+        }
+        // Open MCP server questions, beside (never inside) the pending
+        // approvals. Same discipline: presence is authoritative, an
+        // explicit [] included, and an older peer that omits the key
+        // leaves the live list alone.
+        if ('pending_questions' in params) {
+          const questions = toMcpQuestions(params['pending_questions']);
+          for (const question of questions) this._rememberQuestionServer(question);
+          this._setPendingQuestions(questions);
         }
         // Tasks are durable state, not replay state: a task update may
         // predate replay_cursor. Presence is authoritative (including
@@ -8171,6 +8777,53 @@ export class PersistentChatService {
         break;
       }
 
+      case 'question.request': {
+        // An MCP server asks the user something while one of its calls
+        // runs. The card lists it; the tool call keeps running (it is
+        // waiting on the server), so the transcript is not touched until
+        // the question settles.
+        const question = toMcpQuestion(params);
+        if (!question) break;
+        this._rememberQuestionServer(question);
+        if (!coveredBySnapshot) {
+          // A call holds one open question: a re-announced one (a new
+          // request id for the same call) replaces the card, the way a
+          // re-announced approval converges on its newest id.
+          this._setPendingQuestions([
+            ...this.pendingQuestions().filter(
+              (q) => q.id !== question.id && q.approvalId !== question.approvalId,
+            ),
+            question,
+          ]);
+        }
+        break;
+      }
+
+      case 'question.resolved': {
+        const resolvedId = (params['id'] as string) || '';
+        const approvalId = (params['approval_id'] as string) || '';
+        const card = this.pendingQuestions().find((q) =>
+          approvalId ? q.approvalId === approvalId : q.id === resolvedId,
+        );
+        if (!coveredBySnapshot && (approvalId || resolvedId)) {
+          // Only the settled request leaves: a later question on the same
+          // call has an id of its own.
+          this._setPendingQuestions(
+            this.pendingQuestions().filter((q) =>
+              approvalId ? q.approvalId !== approvalId : q.id !== resolvedId,
+            ),
+          );
+        }
+        // '' when no frame named it: the line then says "the MCP server".
+        const server =
+          card?.server ||
+          (approvalId && this.questionServers.get(approvalId)) ||
+          (resolvedId && this.questionServers.get(`call:${resolvedId}`)) ||
+          '';
+        this._recordQuestionOutcome(resolvedId, server, questionOutcome(params['decision']), now);
+        break;
+      }
+
       case 'citation.created':
       case 'citation.updated': {
         // A cite tool wrote a row (before it returned, so before the agent
@@ -8216,6 +8869,13 @@ export class PersistentChatService {
           : !coveredBySnapshot
             ? this.conversation().activeAssistantTurnId
             : null;
+        // A park changed the queue block, and nothing else re-reads it while
+        // parked: read it now so the Continue/Stop card shows without a
+        // reload. A park journals no target turn, so do this before the
+        // early exit for frames that name no turn to close.
+        if (data.method === 'turn.parked' && !coveredBySnapshot) {
+          void this._pollQueueState();
+        }
         if (!targetId) break;
 
         const closedActive = this._interruptTurnIfSafe(targetId, now, coveredBySnapshot);
@@ -8386,6 +9046,8 @@ export class PersistentChatService {
         if (rejectedMethod === 'upgrade-to-workspace') {
           this.workspaceUpgradeInProgress.set(null);
           this.continueAfterUpgrade.set(false);
+          const tid = this.threadId();
+          if (tid) this._removeWorkspaceUpgradeIntent(tid);
         }
         const messageKey =
           CONTROL_REJECTION_KEYS[code] ??
@@ -8773,6 +9435,8 @@ export class PersistentChatService {
         if (tier) this.workspaceTier.set(tier);
         this.workspaceUpgradeInProgress.set(null);
         this.pendingWorkspaceOffer.set(null);
+        // The new workspace may host the shared browser the old one could not.
+        this.canvas.refreshBrowserCapability();
         this._systemMessage(
           [
             this.transloco.translate('chat.workspaceUpgrade.ready'),
@@ -8800,13 +9464,19 @@ export class PersistentChatService {
         // can't cancel this very send.
         const shouldContinue = this.continueAfterUpgrade();
         this.continueAfterUpgrade.set(false);
+        // The upgrade is done: the stored decision has nothing left to do.
+        const completedThread = this.threadId();
+        if (completedThread) this._removeWorkspaceUpgradeIntent(completedThread);
         if (shouldContinue) {
           // Safe to send now: the agent re-derives its toolset when it
           // dequeues (persistent_graph "get_current_tools" at turn
           // start), and resetup_tools_for_backend already ran before
           // this frame — so the continuation cannot pick up a stale
-          // toolset even if the agent is still mid-turn.
-          void this.sendMessage(this.transloco.translate('chat.workspaceOffer.continueMessage'));
+          // toolset even if the agent is still mid-turn. Automatic: it
+          // retries by itself and is never sent twice (OutboxItem.automatic).
+          void this.sendMessage(this.transloco.translate('chat.workspaceOffer.continueMessage'), {
+            automatic: true,
+          });
         }
         break;
       }
@@ -8819,6 +9489,8 @@ export class PersistentChatService {
           // one keeps its progress and its auto-continue.
           this.workspaceUpgradeInProgress.set(null);
           this.continueAfterUpgrade.set(false);
+          const failedThread = this.threadId();
+          if (failedThread) this._removeWorkspaceUpgradeIntent(failedThread);
         }
         // Don't fall back to re-offering: the reason is stale and the
         // pane still has the button.
@@ -9403,12 +10075,27 @@ export function historyToTurns(messages: HistoryMessage[]): Turn[] {
     if (!isUser && !isAssistant && !isTool) continue;
 
     if (isUser) {
+      // The stored content carries the attachment hint the agent read; the
+      // bubble shows the user's text and the files as chips again, as it
+      // did before the reload (image_generation.md WP5).
+      const {text, names} = parseAttachmentHint(m.content || '');
       const u: UserTurn = {
         kind: 'user',
         id: m.id,
-        content: m.content || '',
+        content: text,
         timestamp: ts,
         historical: true,
+        ...(names.length
+          ? {
+              attachments: names.map((name, index) => ({
+                id: `${m.id}:attachment:${index}`,
+                name: name.split('/').pop() || name,
+                size: 0,
+                mimeType: attachmentTypeFromName(name),
+                path: `uploads/${name}`,
+              })),
+            }
+          : {}),
       };
       turns.push(u);
       continue;

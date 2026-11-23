@@ -31,6 +31,7 @@ from orchestrator.services.pinned_agent_authority import (
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_pinned_thread_retirement_cleanup_permit,
+    acquire_vm_cleanup_permit,
     vm_cleanup_kwargs,
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
@@ -71,6 +72,45 @@ class PinnedRetirementOperations:
 
     dependencies: PinnedRetirementDependencies
 
+    async def _idle_release_owns_vm_stop(
+        self, thread_id: str, retirement: Mapping[str, Any]
+    ) -> bool:
+        """Whether this soft retirement is a VM Session going to sleep.
+
+        Idle admission installs the retirement (settle ``suspended``) together
+        with an open ``pinned_thread`` idle operation bound to the same
+        generation and token. Its VM stop keeps the root disk for the wake and
+        is accounted by the idle lifecycle, like a pinned Job's, so it is
+        admitted under the idle-release cleanup source and not the End cleanup
+        (which releases the VM's resources and accepts only an ``ended``
+        retirement).
+        """
+
+        context = retirement.get("context")
+        if (
+            bool(retirement.get("permanent"))
+            or not isinstance(context, Mapping)
+            or str(context.get("settle_status") or "") != "suspended"
+        ):
+            return False
+        generation = str(retirement.get("generation") or "")
+        token = str(retirement.get("token") or "")
+        if not generation or not token:
+            return False
+        return (
+            await self.dependencies.store.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_idle_operations "
+                "WHERE owner_kind='thread' AND owner_id=$1::uuid "
+                "AND release_kind='pinned_thread' "
+                "AND thread_runtime_generation=$2::uuid "
+                "AND thread_retirement_token=$3::uuid AND closed_at IS NULL)",
+                thread_id,
+                generation,
+                token,
+            )
+            is True
+        )
+
     async def _admit_vm_cleanup(
         self,
         thread_id: str,
@@ -79,6 +119,25 @@ class PinnedRetirementOperations:
         purge_disk: bool,
         retirement: Mapping[str, Any],
     ) -> Any | None:
+        if not purge_disk and await self._idle_release_owns_vm_stop(
+            thread_id, retirement
+        ):
+            idle_permit = await acquire_vm_cleanup_permit(
+                self.dependencies.recovery_store,
+                owner_kind="thread",
+                owner_id=thread_id,
+                identity=identity,
+                source="vm_idle_release",
+                purge_disk=False,
+            )
+            if not idle_permit.allowed:
+                self.dependencies.logger.warning(
+                    "Idle VM stop of thread %s refused: %s",
+                    thread_id,
+                    idle_permit.reason,
+                )
+                return None
+            return idle_permit
         if purge_disk:
             from orchestrator.services.vm_thread_retained_disk_purge import (
                 acquire_retained_disk_purge,

@@ -57,7 +57,7 @@ tool_examples:
         git_diff()                                                          # uncommitted changes
         git_diff(ref1="HEAD~5")                                             # last 5 commits vs working dir
         git_diff(ref1="phase-1-tactical-complete", ref2="HEAD")             # between tag and HEAD
-        git_diff(file_path="plan.md")                                  # uncommitted changes in one file
+        git_diff(file_path="report.md")                                # uncommitted changes in one file
         git_diff(ref1="main", ref2="HEAD", repo="WidgetShop")          # inside an ATTACHED repository
 
   git_status: |-
@@ -78,7 +78,7 @@ tool_examples:
           + updated.md
 
         Modified (1):
-          M plan.md
+          M report.md
 
   git_tags: |-
     Examples:
@@ -122,7 +122,7 @@ tool_examples:
   edit_file: |-
     Examples:
         # Replace mode (default)
-        edit_file(path="plan.md", old_string="## Draft", new_string="## Final")
+        edit_file(path="report.md", old_string="## Draft", new_string="## Final")
 
         # Append mode — add to end of file
         edit_file(path="notes.md", new_string="\n## New Section", position="end")
@@ -132,7 +132,7 @@ tool_examples:
 
   move_file: |-
     Examples:
-        move_file(source="todos.yaml", dest="archive/todos_phase_1.yaml")    # move to subdir
+        move_file(source="draft.md", dest="archive/draft_v1.md")    # move to subdir
         move_file(source="draft.md", dest="final.md")                        # rename in place
 
   read_file: |-
@@ -287,6 +287,23 @@ nudges:
   tool_not_found_suffix: |-
     If your current todo requires this tool, mark it as blocked using the `todo_complete` tool with a note explaining which tool is needed, and proceed with the next todo.
 
+  # The three nudges above, for a job whose tools do not include `todo_complete`
+  # (its one to-do is closed by `job_complete`). The caller picks the key from
+  # the job's loaded tools; these texts never name `todo_complete`.
+  # Sites: src/agent/graph.py execute (reply without a tool call, to-do pending)
+  todo_action_job_complete: |-
+    Your last reply contained no tool call. If the task is done, call the `job_complete` tool now. If it cannot be done, call `job_complete` and say so in the summary. Otherwise continue with a tool call.
+    Use the tool-call format defined in your system prompt — do not type the call as plain text.
+
+  # Sites: src/agent/graph.py audited_tools (loop-warning suffix)
+  loop_warning_suffix_job_complete: |-
+    [LOOP WARNING] You have called this tool with the same arguments multiple times. You may be stuck in a loop.
+    Consider a different approach: try different arguments or use a different tool. If the task cannot be done, call `job_complete` and say so in the summary.
+
+  # Sites: src/agent/graph.py audited_tools (tool-not-found suffix)
+  tool_not_found_suffix_job_complete: |-
+    If the task cannot be done without this tool, call `job_complete` and say in the summary which tool was missing. Otherwise continue with the tools you have.
+
   # Sites: src/agent/core/phase.py on_strategic_phase_complete()
   # Placeholders: {phase_number}, {phase_name}, {todo_count}
   phase_transition_strategic_to_tactical: |-
@@ -322,6 +339,12 @@ nudges:
   # to advance the task list; the bound tool schema defines what exists.
   todo_list_footer: |-
     Mark each finished task by invoking the `todo_complete` tool with its todo id. This task list is a status reminder, not a tool list — it does not limit which tools you can call; every tool bound in this request stays available.
+    Invoke tools via the tool-call format defined in your system prompt.
+
+  # The footer for a job whose tools do not include `todo_complete`: its task
+  # is closed by `job_complete`. Same rule as above: no tool enumeration.
+  todo_list_footer_job_complete: |-
+    When the task is done, invoke the `job_complete` tool. This task list is a status reminder, not a tool list — it does not limit which tools you can call; every tool bound in this request stays available.
     Invoke tools via the tool-call format defined in your system prompt.
 
   # ----- src/shared/runtime/services/recall_store.py -----

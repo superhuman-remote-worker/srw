@@ -49,6 +49,9 @@ export const CAPACITY_REFRESH_MS = 10_000;
         }
 
         @if (capacity(); as c) {
+          @if (c.chat_pool_stalled) {
+            <p class="load-failed" role="alert" data-testid="capacity-stalled">{{ 'admin.capacity.stalled' | transloco: {count: c.queued.session_turn, age: fmtAge(c.oldest_session_turn_age_s)} }}</p>
+          }
           <section class="kpi-row" data-testid="capacity-kpis">
             <div class="kpi-card">
               <span class="kpi-label">{{ 'admin.capacity.executors' | transloco }}</span>

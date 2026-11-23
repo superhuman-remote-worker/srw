@@ -143,6 +143,9 @@ class UniversalAgentState(TypedDict):
         error: Error information if something went wrong
         should_stop: Flag to signal workflow termination
         consecutive_llm_errors: Count of consecutive LLM failures
+        llm_call_baseline: ``iteration`` the optional model-call cap counts from
+        plain_reply_streak: Replies in a row without a tool call while a todo
+            was pending (for the optional plain-reply limit)
         client_report_id: Random idempotency key minted once for a genuine stop
         completion_report_payload: Exact four-field completion operation payload
 
@@ -213,6 +216,18 @@ class UniversalAgentState(TypedDict):
     error: Optional[Dict[str, Any]]
     should_stop: bool
     consecutive_llm_errors: int
+
+    # The two optional limits of a job (limits.max_llm_calls_per_job,
+    # limits.max_plain_replies_in_a_row; both off by default). Both are
+    # checkpointed so they hold across batch rotations and rebuilt graphs, and
+    # both are absent from older checkpoints (read with a default of 0).
+    # ``llm_call_baseline``: the ``iteration`` the model-call count starts
+    # from; moved to the current ``iteration`` by a limit's stop and by a
+    # resume with feedback, so each round of work gets the full budget.
+    llm_call_baseline: int
+    # Replies without a tool call in a row while a todo was pending (the
+    # condition of the todo reminder); 0 after a reply with a tool call.
+    plain_reply_streak: int
 
     # Completion report retry envelope. A graph node writes both immediately
     # before END, so a successor re-reporting the durable checkpoint reuses the
@@ -350,6 +365,8 @@ def create_initial_state(
         error=None,
         should_stop=False,
         consecutive_llm_errors=0,
+        llm_call_baseline=0,
+        plain_reply_streak=0,
         client_report_id=None,
         completion_report_payload=None,
         # Worker batch budget (default-unarmed)

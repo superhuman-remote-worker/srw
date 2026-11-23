@@ -1,0 +1,167 @@
+/* House style for printed reports. Chromium prints it as is: page size,
+   margins, footer and page numbers all come from this file.
+   Change the tokens below to restyle; keep one accent colour. */
+
+:root {
+  --ink: #1b2230;
+  --muted: #5d6677;
+  --faint: #8a92a3;
+  --rule: #dfe3ea;
+  --tint: #f4f6f9;
+  --accent: #2456c9;
+  --accent-tint: #eaf0fc;
+  --highlight: #d9822b;
+  --good: #2f8f5b;
+  --bad: #c43d3d;
+  --font: "Noto Sans", "DejaVu Sans", sans-serif;
+  --font-serif: "Noto Serif", "DejaVu Serif", serif;
+}
+
+@page {
+  size: A4;
+  margin: 18mm 17mm 20mm 17mm;
+  @bottom-right {
+    content: counter(page) " / " counter(pages);
+    font: 8pt var(--font);
+    color: #8a92a3;
+  }
+}
+@page landscape { size: A4 landscape; }
+
+* { box-sizing: border-box; }
+
+html {
+  font-family: var(--font);
+  font-size: 10.5pt;
+  line-height: 1.45;
+  color: var(--ink);
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+body { margin: 0; }
+body.serif { font-family: var(--font-serif); }
+
+/* ---- title block -------------------------------------------------------- */
+.title-block { margin: 0 0 7mm; }
+.kicker { color: var(--muted); font-size: 9pt; margin: 0 0 2mm; }
+h1 {
+  font-size: 24pt;
+  line-height: 1.15;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 0 0 2mm;
+}
+.subtitle { font-size: 12pt; color: var(--muted); margin: 0; }
+.title-block::after {
+  content: "";
+  display: block;
+  width: 36mm;
+  height: 1.2mm;
+  background: var(--accent);
+  margin-top: 5mm;
+}
+
+/* ---- headings and text -------------------------------------------------- */
+h2 {
+  font-size: 14pt;
+  font-weight: 650;
+  margin: 7mm 0 2.5mm;
+  padding-top: 2.5mm;
+  border-top: 0.4mm solid var(--rule);
+  break-after: avoid;
+}
+h3 {
+  font-size: 11.5pt;
+  font-weight: 650;
+  margin: 6mm 0 2mm;
+  break-after: avoid;
+}
+p { margin: 0 0 2.5mm; orphans: 3; widows: 3; }
+.lead { font-size: 12.5pt; line-height: 1.4; }
+.muted { color: var(--muted); }
+.small { font-size: 8.5pt; }
+strong { font-weight: 650; }
+ul, ol { margin: 0 0 3mm; padding-left: 5mm; }
+li { margin-bottom: 1mm; }
+a { color: var(--accent); text-decoration: none; }
+
+/* ---- summary box ---------------------------------------------------------- */
+.summary {
+  background: var(--accent-tint);
+  border-left: 1mm solid var(--accent);
+  padding: 4mm 5mm;
+  margin: 0 0 6mm;
+  break-inside: avoid;
+}
+.summary h2 { border: 0; margin: 0 0 2mm; padding: 0; font-size: 11pt; }
+.summary p:last-child, .summary ul:last-child { margin-bottom: 0; }
+
+/* ---- KPI tiles ------------------------------------------------------------ */
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(32mm, 1fr));
+  gap: 4mm;
+  margin: 0 0 6mm;
+  break-inside: avoid;
+}
+.kpi { border-top: 0.6mm solid var(--ink); padding-top: 2mm; }
+.kpi .label { color: var(--muted); font-size: 8.5pt; }
+.kpi .value {
+  font-size: 19pt;
+  font-weight: 650;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+}
+.kpi .delta { font-size: 8.5pt; color: var(--muted); }
+.up { color: var(--good); }
+.down { color: var(--bad); }
+.kpi.highlight { border-top-color: var(--highlight); }
+
+/* ---- figures -------------------------------------------------------------- */
+figure { margin: 3mm 0 5mm; break-inside: avoid; }
+figure img, figure svg { display: block; width: 100%; height: auto; }
+figcaption { font-size: 8.5pt; color: var(--muted); margin-top: 2mm; }
+
+/* ---- tables --------------------------------------------------------------- */
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 9.5pt;
+  font-variant-numeric: tabular-nums;
+  margin: 2mm 0 6mm;
+}
+table.data thead { display: table-header-group; }
+table.data th {
+  text-align: left;
+  font-weight: 650;
+  border-bottom: 0.4mm solid var(--ink);
+  padding: 1.5mm 2mm;
+  vertical-align: bottom;
+}
+table.data td {
+  border-bottom: 0.2mm solid var(--rule);
+  padding: 1.4mm 2mm;
+  vertical-align: top;
+}
+table.data .num { text-align: right; white-space: nowrap; }
+table.data tr { break-inside: avoid; }
+table.data tfoot td { font-weight: 650; border-top: 0.4mm solid var(--ink); border-bottom: 0; }
+table.data tr.highlight td { background: #fdf1e5; }
+table.data tr.highlight td:first-child { border-left: 0.8mm solid var(--highlight); }
+table.compact td, table.compact th { padding: 0.9mm 1.5mm; font-size: 8.5pt; }
+
+/* ---- callouts, sources, layout helpers ------------------------------------ */
+.callout {
+  border: 0.3mm solid var(--rule);
+  background: var(--tint);
+  padding: 3mm 4mm;
+  margin: 3mm 0 5mm;
+  break-inside: avoid;
+}
+.sources { font-size: 8.5pt; color: var(--muted); }
+.sources ol { padding-left: 4.5mm; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 7mm; }
+.cols-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5mm; }
+.page-break { break-before: page; }
+.keep { break-inside: avoid; }
+.landscape { page: landscape; }

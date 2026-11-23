@@ -164,13 +164,12 @@ async def backfill_main_cloud_instance_authority(
     cannot grant membership, share, or have their folder deleted, because we
     cannot say *which* installation to act on.
 
-    This is deliberately NOT a SQL migration. The design
-    (knowledge-base/knowledge/features/protected_session_lifecycle_and_mount_readiness.md)
-    requires "an operator-attested single-installation mapping plus a verified
-    remote proof", and a migration running inside psql at startup can obtain
-    neither. Stamping without that proof would launder a guess into recorded
-    authority — silently, permanently, and unquestioned by everything
-    downstream. A loud refusal is recoverable; a wrong instance UUID is not.
+    This is deliberately NOT a SQL migration. The design requires "an
+    operator-attested single-installation mapping plus a verified remote
+    proof", and a migration running inside psql at startup can obtain neither.
+    Stamping without that proof would launder a guess into recorded authority —
+    silently, permanently, and unquestioned by everything downstream. A loud
+    refusal is recoverable; a wrong instance UUID is not.
 
     So the safety argument here is:
 
@@ -185,6 +184,8 @@ async def backfill_main_cloud_instance_authority(
     3. a provider we cannot re-attest right now (not the active backend) is
        never stamped, because nothing proves where its rows live.
     """
+    # Design: knowledge-base/knowledge/features/
+    # protected_session_lifecycle_and_mount_readiness.md.
     await dependencies.require_admin(request)
     return await main_cloud_settings.backfill_main_cloud_instance_authority(
         apply=apply, dependencies=dependencies.operations

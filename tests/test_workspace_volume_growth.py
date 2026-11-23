@@ -322,7 +322,16 @@ def test_disk_full_hold_line_shows_the_usage():
             }
         }
     }
+    # A hold written before the kept-and-gone facts says only what is always true.
     assert _operator_pause_hold_lines(job) == [
-        "Workspace disk full hold (10 GiB of 10 GiB used, 0 B free): workspace "
-        "and checkpoints retained until an explicit Resume or Cancel"
+        "Workspace disk full hold (10 GiB of 10 GiB used, 0 B free): held until "
+        "an explicit Resume or Cancel. The job's saved progress is kept."
+    ]
+    job["context"]["_operator_pause_hold"]["attention"].update(
+        runtime_replaced=False, volume_kept=True
+    )
+    assert _operator_pause_hold_lines(job) == [
+        "Workspace disk full hold (10 GiB of 10 GiB used, 0 B free): held until "
+        "an explicit Resume or Cancel. The workspace is still up and nothing was "
+        "removed; its processes and /tmp last until it is released."
     ]

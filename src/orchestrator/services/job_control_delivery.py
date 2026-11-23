@@ -31,6 +31,9 @@ from orchestrator.services.config_resolver import (
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAuthorityError
 from orchestrator.services.datasource_policy import SHELL_WORKSPACE_DETAIL
 from orchestrator.services.grant_enforcement import GrantDenied
+from orchestrator.services.implied_project_knowledge import (
+    with_implied_project_knowledge,
+)
 from orchestrator.services.job_start_bundle import JobStartRefusal
 from orchestrator.services.model_availability import WHERE_JOB, ModelUnavailable
 from orchestrator.services.managed_repository_authority import (
@@ -675,6 +678,14 @@ async def resume_job_on_agent(
             job_context = json.loads(job_context)
         dependencies.apply_cloud_storage_override(resolved_ds, job_context)
         datasources_payload = dependencies.build_datasources_payload(resolved_ds)
+        # As at first dispatch: a job never offered its project's
+        # knowledge-base connector keeps the knowledge base.
+        datasources_payload = await with_implied_project_knowledge(
+            datasources_payload,
+            store=dependencies.store,
+            project_ids=[job.get("project_id")],
+            created_at=job.get("created_at"),
+        )
         try:
             repositories_payload = await dependencies.job_project_repositories(
                 str(job["project_id"]) if job.get("project_id") else None

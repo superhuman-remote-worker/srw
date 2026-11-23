@@ -224,6 +224,22 @@ def platform_owned_sql(alias: str | None = None) -> str:
     )
 
 
+def connector_description_for_agent_sql(alias: str, note: str) -> str:
+    """What an agent's README says about a connector, as a SQL expression.
+
+    ``note`` is the project's note on the link (an expression, possibly
+    NULL). It wins; without one, the connector's own description, except
+    for a connector SRW keeps (:func:`platform_owned_sql`): its description
+    is SRW's wording of what the connector's README entry says already, so
+    it would only repeat it.
+    """
+    return (
+        f"CASE WHEN NULLIF(btrim({note}), '') IS NOT NULL THEN {note} "
+        f"WHEN {platform_owned_sql(alias)} THEN NULL "
+        f"ELSE {alias}.description END"
+    )
+
+
 def native_project_sql(alias: str | None = None) -> str:
     """:func:`native_project` as a SQL expression over a ``datasources`` row:
     the project id as text, or NULL.
@@ -337,6 +353,7 @@ __all__ = [
     "native_user",
     "native_user_sql",
     "platform_owned",
+    "connector_description_for_agent_sql",
     "platform_owned_sql",
     "project_cloud_key",
     "project_kb_key",

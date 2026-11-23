@@ -13,7 +13,8 @@ it bypassed.
 
 Everything here is pure exception inspection — ``status_code`` attributes,
 class-name matching, and regex over stringified provider bodies. No graph
-state, no config, no I/O, and no imports beyond the standard library. That
+state, no config, no I/O, and no imports beyond the standard library plus
+``shared.tls_pinning`` (httpx only; it imports nothing from the runtime). That
 purity is load-bearing: the subagent child driver (``src/subagents``) and the
 persistent loop are unit-tested with a fake LLM and no SSH, and neither can
 reach triage that lives inside the graph. This code
@@ -43,6 +44,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypeVar
 from urllib.parse import urlsplit
+
+from shared.tls_pinning import pin_failure_in
 
 logger = logging.getLogger(__name__)
 
@@ -435,7 +438,13 @@ def _summarize_llm_error(error: Exception, model: Optional[str] = None) -> str:
     shows raw markup as the failure reason. Compose a legible summary instead;
     every other exception passes through unchanged. The raw text still goes to
     the audit trail for forensics.
+
+    A certificate-pin failure (the SDK reports it as "Connection error.")
+    returns its own whole sentence: it names the host and what the admin does.
     """
+    pin_failure = pin_failure_in(error)
+    if pin_failure is not None:
+        return str(pin_failure)
     status = _infra_edge_status(error)
     if status is None:
         return str(error)
@@ -477,6 +486,9 @@ def _describe_llm_rejection(error: Exception, model: Optional[str] = None) -> st
     back to :func:`_summarize_llm_error` when no status error in the chain
     carries an API error object (an edge page, a stringified error).
     """
+    pin_failure = pin_failure_in(error)
+    if pin_failure is not None:
+        return str(pin_failure)
     rejection = _api_rejection(error)
     if rejection is None:
         return _summarize_llm_error(error, model)
@@ -643,6 +655,11 @@ def _classify_llm_error(error: Exception) -> str:
     * ``transient``  — retry with the existing backoff schedule.
     """
     _PERMANENT_STATUS = {400, 401, 403, 404}
+
+    # A failed certificate pin (changed, or rejected despite matching) is
+    # deterministic until an admin acts: no retry, however the SDK wrapped it.
+    if pin_failure_in(error) is not None:
+        return "permanent"
 
     current: Optional[BaseException] = error
     seen: set[int] = set()

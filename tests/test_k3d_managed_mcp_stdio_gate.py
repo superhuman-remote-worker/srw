@@ -156,7 +156,10 @@ def test_the_process_script_reads_a_process_but_never_its_environment():
         assert found["program"].startswith("sleep 30")
         assert found["parent"] == str(os.getpid())
         assert found["uid"] == str(os.getuid())
-        assert found["state"] in ("S", "R")
+        # A live process: a just-started one on a busy host can still be in
+        # disk sleep (D) while its program loads; the gate counts every state
+        # but a zombie as alive.
+        assert found["state"] in ("S", "R", "D")
         assert "environ" not in gate._PROCESS_SCRIPT
     finally:
         child.kill()

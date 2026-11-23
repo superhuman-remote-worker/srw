@@ -137,9 +137,12 @@ def test_the_expected_details_are_the_products():
     assert gate.MCP_REMOTE_DRIVER == MCP_REMOTE_DRIVER
     # The second account's session asks for no more than an ungranted user's
     # ceiling, so the gate needs no permission_mode grant for it.
+    from shared.permission_modes import PERMISSION_MODES
     from shared.runtime.core.capability_grants import CATALOG
 
-    assert gate.SESSION_PERMISSION_MODE == CATALOG["permission_mode"]["default"]
+    assert PERMISSION_MODES.index(gate.SESSION_PERMISSION_MODE) <= (
+        PERMISSION_MODES.index(CATALOG["permission_mode"]["default"])
+    )
 
 
 def test_every_secret_is_scrubbed():

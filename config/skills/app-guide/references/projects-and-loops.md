@@ -53,8 +53,8 @@ The project page has tabs:
 
 There is no read-only switch in Settings. What agents may do in the project's
 cloud folder is the folder's **Default access** on the **Connectors** tab under
-**Cloud folders**: **Read-only**, **Protected**, or **Read-write**, as far as
-the cloud offers each. A session can choose another level when it is created,
+**Kept by SRW**: **Read-only**, **Protected**, or **Read-write**, as far as the
+cloud offers each. A session can choose another level when it is created,
 within what your role allows. **Protected** stages a session's writes for the
 user's review and has its own focused guide. A personal project has no folder
 of its own: its cloud is the owner's **My cloud**, and adding a member shares

@@ -1,0 +1,48 @@
+# House chart style (matplotlib). plt.style.use("skills/charts/assets/srw.mplstyle")
+# Same palette as the pdf-report and slides templates.
+
+font.family: sans-serif
+font.sans-serif: Noto Sans, DejaVu Sans, Liberation Sans
+font.size: 10
+text.color: 1b2230
+
+axes.titlesize: 12
+axes.titleweight: semibold
+axes.titlelocation: left
+axes.titlepad: 12
+axes.titlecolor: 1b2230
+axes.labelsize: 9.5
+axes.labelcolor: 5d6677
+axes.edgecolor: 8a92a3
+axes.linewidth: 0.8
+axes.spines.top: False
+axes.spines.right: False
+axes.grid: True
+axes.grid.axis: y
+axes.axisbelow: True
+axes.prop_cycle: cycler('color', ['2456c9', 'd9822b', '2f8f5b', '8e5cc4', 'c43d3d', '5d6677'])
+
+grid.color: e6e9ef
+grid.linewidth: 0.8
+
+xtick.color: 5d6677
+ytick.color: 5d6677
+xtick.labelsize: 9
+ytick.labelsize: 9
+xtick.major.size: 0
+ytick.major.size: 0
+
+legend.frameon: False
+legend.fontsize: 9
+
+lines.linewidth: 2.2
+lines.solid_capstyle: round
+patch.linewidth: 0
+
+figure.figsize: 7.0, 3.6
+figure.dpi: 100
+savefig.dpi: 200
+savefig.bbox: tight
+savefig.pad_inches: 0.15
+# Keep text as text in SVG: smaller files, crisp in the PDF, searchable.
+svg.fonttype: none

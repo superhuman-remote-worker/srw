@@ -42,6 +42,7 @@ from orchestrator.services import (
     container_provisioner as container_provisioner_module,
     default_experts,
     deployment_gates,
+    dispatch_credentials,
     docker_provisioner as docker_provisioner_module,
     grant_enforcement,
     job_admission,
@@ -51,6 +52,7 @@ from orchestrator.services import (
     job_dispatcher,
     job_evidence as job_evidence_operations,
     job_inspection as job_inspection_operations,
+    job_naming,
     job_projection,
     job_queries,
     job_reads,
@@ -119,6 +121,9 @@ def job_dispatch_dependencies(
         workspace_suspension=workspace_suspension.workspace_suspension_service,
         auto_assign_enabled=resources.settings.auto_assign_enabled,
         stateless_worker_enabled=resources.settings.stateless_worker_enabled,
+        preflight_timeout_seconds=(
+            resources.settings.dispatch_preflight_timeout_seconds
+        ),
         manifest_execution_service=functools.partial(
             catalogue_composition.manifest_execution_service, resources
         ),
@@ -255,6 +260,7 @@ def job_inspection_dependencies(
             user_visible_project_ids=access.user_visible_project_ids,
             mcp_scope_project_id=access.mcp_scope_project_id,
             active_job_statuses=job_inspection_operations.ME_ACTIVE_JOB_STATUSES,
+            completion_commands_enabled=resources.settings.completion_commands_enabled,
         ),
         require_approved_user=auth.require_approved_user,
         require_job_access=access.require_job_access,
@@ -620,6 +626,27 @@ def job_admission_creation_dependencies(
             job_dispatcher.trigger_dispatch, job_dispatch_dependencies, resources
         ),
         stamp_cloud_connectors=stamp_cloud_connectors,
+        name_job=functools.partial(
+            job_naming.schedule_job_naming,
+            tasks=resources.job_naming_tasks,
+            dependencies=functools.partial(job_naming_dependencies, resources),
+        ),
+    )
+
+
+def job_naming_dependencies(
+    resources: ApplicationResources,
+) -> job_naming.JobNamingDependencies:
+    """Built per naming call. The route is dispatch's own injector, so a job
+    is named by the auxiliary model its own dispatch would be given."""
+    return job_naming.JobNamingDependencies(
+        store=resources.postgres_db,
+        inject_model_credentials=bound(
+            dispatch_credentials.inject_model_credentials,
+            preparation_composition.dispatch_credential_dependencies,
+            resources,
+        ),
+        ledger=resources.usage_ledger,
     )
 
 
@@ -643,7 +670,15 @@ def job_admission_dependencies(
         creation=functools.partial(job_admission_creation_dependencies, resources),
         redact_result=redact_job_config_override,
         live=functools.partial(_live_admission_dependencies, resources),
+        load_expert=functools.partial(_load_expert, resources),
     )
+
+
+async def _load_expert(
+    resources: ApplicationResources, expert_id: str
+) -> dict[str, Any] | None:
+    """A stored expert by id, read from the store at call time."""
+    return await resources.postgres_db.get_expert_by_id(expert_id)
 
 
 def _live_admission_dependencies(resources: ApplicationResources):

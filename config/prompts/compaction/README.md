@@ -8,6 +8,7 @@ family matrix picks the recipe (`settings.compaction`).
 |---|---|---|
 | `codex` | OpenAI Codex, `codex-rs/prompts/templates/compact/prompt.md` at `a6baf8867cb4` (Apache-2.0, see `THIRD_PARTY_LICENSES.md`) | Added "Do not call any tools. Reply with the summary only." |
 | `claude` | Anthropic, "Prompting Claude Fable 5.1": the summarization instruction for client-side compaction (platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-fable-5-1) | Added "Do not call any tools." The reply's `<summary>` block is the summary |
+| `deepseek` | DeepSeek Harness, `packages/compaction/compaction-basic/src/summarizer.ts` at `39163dd30f70` (MIT, `LICENSE` in this directory; text unchanged since `639ed015`) | The last rule names SRW's hand-back ("a summary of earlier compacted turns") instead of DeepSeek's `<compacted-summary>` block, which SRW does not use. A reply without a Markdown heading is not a summary |
 
 The fork keeps the tools in the request so it stays a cache hit; the added
 line is why.

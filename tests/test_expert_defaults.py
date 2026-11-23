@@ -600,7 +600,9 @@ class TestBundledWorkspacePreferences:
     # Deliberately takes no position: its shell exists for the rare LaTeX
     # build, so it follows the account default and asks for an upgrade when
     # a command is actually needed.
-    FOLLOWS_ACCOUNT_DEFAULT = ("scholar",)
+    # Upgrade-on-demand experts: they start on the account's default tier
+    # (usually `virtual`) and ask for a shell workspace when the work needs one.
+    FOLLOWS_ACCOUNT_DEFAULT = ("scholar", "assistant")
 
     @pytest.fixture
     def virtual_default_user(self, monkeypatch):

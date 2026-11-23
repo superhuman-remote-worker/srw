@@ -63,6 +63,95 @@ function create(data: Record<string, unknown> = {}) {
   return fixture;
 }
 
+describe('ExpertEditorComponent page shell', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getExpertSource.mockReturnValue(of(structuredClone(SOURCE)));
+  });
+
+  it('offers Cancel and Save in the header on an editable expert, and titles the page with its name', () => {
+    const fixture = create();
+    fixture.detectChanges();
+    const el = fixture.nativeElement as HTMLElement;
+
+    expect(fixture.componentInstance.heading()).toBe('Design Studio (copy)');
+    const buttons = Array.from(el.querySelectorAll('[editorActions] app-button')).map((b) => b.textContent?.trim());
+    expect(buttons).toEqual(['Cancel', 'Save']);
+    expect(el.querySelector('footer')).toBeNull();
+  });
+
+  it('shows a save error in the header, which stays in view, not at the foot of the form', () => {
+    const fixture = create();
+    const editor = fixture.componentInstance;
+    editor.form.configText = '{nope';
+    editor.save();
+    fixture.detectChanges();
+
+    const alert = (fixture.nativeElement as HTMLElement).querySelector('app-editor-header [editorAlert]');
+    expect(alert?.textContent).toContain('Config:');
+    expect(alert?.getAttribute('role')).toBe('alert');
+    expect(api.updateExpert).not.toHaveBeenCalled();
+  });
+
+  it('keeps every section mounted while it is closed, so save still reads its controls', () => {
+    const fixture = create();
+    fixture.detectChanges();
+    const el = fixture.nativeElement as HTMLElement;
+
+    // Six sections, one of them open; the groups sit inside the closed ones.
+    expect(el.querySelectorAll('app-expander').length).toBe(6);
+    for (const tag of ['app-tools-group', 'app-subagents-editor', 'app-execution-group', 'app-advanced-accordion']) {
+      expect(el.querySelector(`app-expander ${tag}`), tag).not.toBeNull();
+    }
+  });
+
+  it('marks expert instructions as deprecated and points to Skills', () => {
+    api.getExpertSource.mockReturnValue(of({...structuredClone(SOURCE), expert_type: 'worker', tags: ['worker']}));
+    const fixture = create();
+    fixture.detectChanges();
+    const note = (fixture.nativeElement as HTMLElement).querySelector('.deprecation');
+
+    expect(note?.textContent).toContain('Deprecated');
+    expect(note?.textContent).toContain('will be removed in a later release');
+    expect(note?.textContent).not.toContain("Sessions don't read");
+    expect(note?.querySelector('a')?.getAttribute('routerLink')).toBe('/skills');
+  });
+
+  it('tells a session expert that sessions never read its instructions', () => {
+    const fixture = create(); // SOURCE is a session expert
+    fixture.detectChanges();
+    const note = (fixture.nativeElement as HTMLElement).querySelector('.deprecation');
+
+    expect(note?.textContent).toContain("Sessions don't read these instructions");
+  });
+
+  it('summarises the prompts for the closed section', () => {
+    const editor = create().componentInstance;
+
+    expect(editor.personaSummary()).toBe('Persona, 2 words');
+    editor.form.instructions = 'Always write the test first.';
+    editor.form.summarization = 'Keep decisions.';
+    expect(editor.personaSummary()).toBe('Persona, 2 words · instructions, 5 words · own summarization prompt');
+    editor.form.persona = '';
+    editor.form.instructions = '';
+    editor.form.summarization = '';
+    expect(editor.personaSummary()).toBe('Not written yet');
+  });
+
+  it('counts the keys only the JSON field carries as settings the expert sets', () => {
+    const editor = create().componentInstance;
+
+    // SOURCE: instruction_files is not owned by a control, so it is in the JSON field.
+    expect(editor.advancedSummary()).toBe('1 set by this expert');
+    editor.form.configText = '';
+    expect(editor.advancedSummary()).toBe('Framework defaults');
+  });
+});
+
 describe('ExpertEditorComponent loading a stored expert', () => {
   beforeAll(async () => {
     await ɵresolveComponentResources(() => Promise.resolve(''));
@@ -107,10 +196,13 @@ describe('ExpertEditorComponent loading a stored expert', () => {
     const el = fixture.nativeElement as HTMLElement;
     const editor = fixture.componentInstance;
 
-    expect(el.querySelector('h1')?.textContent?.trim()).toBe('View');
+    // The page is titled with the expert's own name; the header's back link
+    // is the way out, so the only action is the one that makes it editable.
+    expect(editor.heading()).toBe('Design Studio (copy)');
+    expect(el.querySelector('[editorBadges]')?.textContent).toContain('Read-only');
     expect(editor.form.persona).toBe('<role>Design collaborator</role>');
-    const buttons = Array.from(el.querySelectorAll('footer app-button')).map((b) => b.textContent?.trim());
-    expect(buttons).toEqual(['Back', 'Duplicate to edit']);
+    const buttons = Array.from(el.querySelectorAll('[editorActions] app-button')).map((b) => b.textContent?.trim());
+    expect(buttons).toEqual(['Duplicate to edit']);
 
     editor.save();
     expect(api.updateExpert).not.toHaveBeenCalled();
@@ -120,5 +212,129 @@ describe('ExpertEditorComponent loading a stored expert', () => {
     expect(router.navigate).toHaveBeenCalledWith(['/experts', 'new-copy', 'edit'], {
       state: {dropped: ['shell_tools'], duplicated: true},
     });
+  });
+});
+
+describe('ExpertEditorComponent "Plans in phases"', () => {
+  const WORKER = {
+    ...SOURCE,
+    name: 'reviewer',
+    display_name: 'Reviewer',
+    expert_type: 'worker',
+    tags: ['worker'],
+    config: {llm: {reasoning_level: 'high'}, instruction_files: []},
+  };
+
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.updateExpert.mockReturnValue(of({}));
+  });
+
+  function load(config: Record<string, unknown>, expertType = 'worker', data: Record<string, unknown> = {}) {
+    api.getExpertSource.mockReturnValue(of(structuredClone({...WORKER, expert_type: expertType, config})));
+    const fixture = create(data);
+    fixture.detectChanges();
+    const el = fixture.nativeElement as HTMLElement;
+    return {
+      fixture,
+      editor: fixture.componentInstance,
+      toggle: () => el.querySelector('[data-testid="expert-phases"]') as (HTMLElement & {checked: boolean; disabled: boolean}) | null,
+      savedConfig: () => {
+        fixture.componentInstance.save();
+        return api.updateExpert.mock.calls.at(-1)![1].config as Record<string, unknown>;
+      },
+    };
+  }
+
+  it('shows the toggle off, labelled and explained, for a worker expert without the key', () => {
+    const {toggle} = load(WORKER.config);
+    const el = toggle();
+    expect(el).not.toBeNull();
+    expect(el!.checked).toBe(false);
+    expect(el!.disabled).toBe(false);
+    expect(el!.textContent?.trim()).toBe('Plans in phases');
+    expect((el!.closest('.phases-field') as unknown as {hint: string}).hint).toBe(en.experts.editor.phasesHint);
+    expect(en.experts.editor.phasesHint).toContain('Applies to jobs, not to sessions.');
+  });
+
+  it('reads phases: true as on, and keeps the key out of the JSON field', () => {
+    const {editor, toggle} = load({...WORKER.config, phases: true});
+    expect(editor.phases()).toBe(true);
+    expect(toggle()!.checked).toBe(true);
+    expect(editor.form.configText).not.toContain('phases');
+    expect(editor.form.configText).toContain('instruction_files');
+  });
+
+  it('reads the server\'s "on" as on and false as off', () => {
+    expect(load({phases: 'on'}).editor.phases()).toBe(true);
+    TestBed.resetTestingModule();
+    expect(load({phases: false}).editor.phases()).toBe(false);
+  });
+
+  it('saves no key while off for an expert that has none', () => {
+    const {savedConfig} = load(WORKER.config);
+    const config = savedConfig();
+    expect(config).not.toHaveProperty('phases');
+    expect(config['instruction_files']).toEqual([]);
+  });
+
+  it('saves phases: true when turned on, and keeps every other key', () => {
+    const {editor, fixture, toggle, savedConfig} = load(WORKER.config);
+    editor.phases.set(true);
+    fixture.detectChanges();
+    expect(toggle()!.checked).toBe(true);
+    const config = savedConfig();
+    expect(config['phases']).toBe(true);
+    expect(config['llm']).toEqual({reasoning_level: 'high'});
+    expect(config['instruction_files']).toEqual([]);
+  });
+
+  it('round-trips a stored value it was not asked to change', () => {
+    expect(load({phases: true}).savedConfig()['phases']).toBe(true);
+    TestBed.resetTestingModule();
+    expect(load({phases: false}).savedConfig()['phases']).toBe(false);
+  });
+
+  it('turning a stored phases off writes false', () => {
+    const {editor, savedConfig} = load({...WORKER.config, phases: true});
+    editor.phases.set(false);
+    expect(savedConfig()['phases']).toBe(false);
+  });
+
+  it('a phases key typed into the JSON field is saved', () => {
+    const {editor, savedConfig} = load(WORKER.config);
+    editor.form.configText = '{"instruction_files": [], "phases": true}';
+    expect(savedConfig()['phases']).toBe(true);
+  });
+
+  it('names the setting in the closed section\'s summary while on', () => {
+    const {editor} = load(WORKER.config);
+    // The execution group is not mounted here (its children are stubs); the
+    // summary reads only these from it.
+    const exec = {
+      autonomy: () => null, resolvedAutonomy: () => 'review', tierLabel: () => 'Sandbox',
+      effectiveBackend: () => 'sandbox', scholar: () => false, resolvedScholar: () => false,
+      effectiveCritic: () => false,
+    };
+    Object.defineProperty(editor, 'execGroup', {value: () => exec});
+    expect(editor.defaultsSummary()).not.toContain(en.experts.editor.summary.phases);
+    editor.phases.set(true);
+    expect(editor.defaultsSummary()).toContain(` · ${en.experts.editor.summary.phases}`);
+  });
+
+  it('is disabled on the read-only view', () => {
+    const {toggle} = load({phases: true}, 'worker', {readOnly: true});
+    expect(toggle()!.disabled).toBe(true);
+    expect(toggle()!.checked).toBe(true);
+  });
+
+  it('offers no toggle on a session expert, and keeps its stored value', () => {
+    const {toggle, savedConfig} = load({...WORKER.config, phases: true}, 'session');
+    expect(toggle()).toBeNull();
+    expect(savedConfig()['phases']).toBe(true);
   });
 });

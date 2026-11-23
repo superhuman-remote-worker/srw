@@ -781,6 +781,20 @@ class TestTodoManagerBuildCommitMessage:
         assert "todo_3:" in message
         assert "Extract requirements from document" in message
 
+    def test_build_commit_message_without_todo_steps(self, todo_manager):
+        """A job without todo_complete works through one task: no phase label."""
+        todo_manager.is_strategic_phase = True
+        todo_manager._phase_number = 0
+        todo_manager.todo_tool_bound = False
+
+        todo = TodoItem(id="todo_1", content="Do the task in the brief.")
+        message = todo_manager._build_commit_message(todo)
+
+        assert message.splitlines()[0] == "[Task] Do the task in the brief."
+        assert "Phase" not in message
+        assert "Strategic" not in message
+        assert "Completed:" in message
+
     def test_build_commit_message_with_notes(self, todo_manager):
         """Test commit message includes notes."""
         todo_manager.is_strategic_phase = True

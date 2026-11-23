@@ -33,6 +33,7 @@ SECRETS = (
     "https://llm.internal.example",
     "https://embed.internal.example",
     "workspace-host.internal",
+    "MIIBpinned-certificate",
 )
 
 
@@ -49,6 +50,7 @@ def _frozen_blob() -> dict:
                 "temperature": 0.2,
                 "api_key": "sk-llm-secret",
                 "base_url": "https://llm.internal.example",
+                "tls_pinned_cert": "MIIBpinned-certificate",
             },
             "auxiliary": {"model": "aux", "api_key": "sk-aux-secret"},
             "env_keys": {

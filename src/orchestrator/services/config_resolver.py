@@ -17,11 +17,14 @@ import copy
 import logging
 from typing import Awaitable, Callable, Optional
 
+from orchestrator.security.config_redaction import strip_in_flight_only_keys
+from shared.job_phases import PHASES_KEY, plans_in_phases
 from shared.runtime.core.loader import (
     INHERIT_MODEL,
     ROLE_ROOTS,
     ROOT_NAMES,
     _apply_settings_matrix,
+    apply_no_phases,
     authored_llm_keys,
     canonical_config_name,
     deep_merge,
@@ -43,14 +46,13 @@ logger = logging.getLogger(__name__)
 
 # Prompt segments a DB/forked expert may override — one family-agnostic version
 # each (model adaptation stays in the systemprompt_<family> wrapper). persona +
-# instructions are v1 (migration 0028); strategic/tactical/summarization are
-# Part 2 (full DB-expert prompt parity). Reused to build the ``_db_prompt_keys``
-# provenance marker the render path fences on.
+# instructions are v1 (migration 0028); summarization is Part 2. Reused to build
+# the ``_db_prompt_keys`` provenance marker the render path fences on. The old
+# strategic/tactical segments are retired (migration 0567): a stored manifest
+# that still carries one is ignored here, so it never reaches a job.
 _OVERLAY_PROMPT_KEYS = (
     "persona",
     "instructions",
-    "strategic",
-    "tactical",
     "summarization",
 )
 
@@ -306,8 +308,8 @@ def resolve_config(
         # decision 7: mark the DB-authored persona so the render path fences it.
         data["_persona_source"] = "db"
         # Part 2: record which prompt segments are DB-authored (untrusted) so the
-        # render path fences strategic/tactical (fence_phase_directive) and brace-
-        # escapes summarization. Only the segments actually present in the row —
+        # render path brace-escapes summarization. Only the segments actually
+        # present in the row —
         # inherited (disk) segments stay trusted.
         data["_db_prompt_keys"] = [
             k for k in _OVERLAY_PROMPT_KEYS if prompts_override.get(k)
@@ -325,8 +327,22 @@ def resolve_config(
     # before U2, a session expert dispatched as a worker) would otherwise lose
     # its phase guidance silently. Restored here, before the capture and the
     # freeze, so the PDP view and the blob agree.
+    #
+    # Only a job that plans in phases (shared.job_phases) gets that floor. A
+    # job without phases, the default, has its tools, bindings and phase gate
+    # rewritten for one task instead. This has to run before the capture too:
+    # the captured fragment is stored as the job's policy, whose `tools`
+    # section is merged back onto the frozen blob at every dispatch, so a tool
+    # removed after the capture would return. Roster entries are resolved
+    # below from their own layers and keep their tools. The effective value is
+    # written back, so the frozen blob always states it.
     if role == "worker":
-        data = ensure_worker_phase_skill_bindings(data)
+        if plans_in_phases(data):
+            data = ensure_worker_phase_skill_bindings(data)
+            data[PHASES_KEY] = True
+        else:
+            data = apply_no_phases(data)
+            data[PHASES_KEY] = False
 
     # Roster materialisation: every `subagents.roster` entry becomes its fully
     # merged subagent-role config (pruning point 3 of 3 runs per entry inside).
@@ -481,6 +497,11 @@ async def inject_blob_credentials(
     injector routes credentials for the *resolved* model, not the YAML default.
     """
     delivered = copy.deepcopy(blob)
+    # Every pin in the delivered config comes from an endpoint row. Drop any
+    # the blob brought, here and not only in the injector's copy below: the
+    # merge back adds keys and never removes one, and most of the blob never
+    # reaches the injector.
+    strip_in_flight_only_keys(delivered)
     agent = delivered.setdefault("agent", {})
 
     co: dict = {"llm": dict(agent.get("llm") or {})}
@@ -490,6 +511,8 @@ async def inject_blob_credentials(
         co["env_keys"] = dict(agent["env_keys"])
     if isinstance(agent.get("research"), dict):
         co["research"] = copy.deepcopy(agent["research"])
+    if isinstance(agent.get("image"), dict):
+        co["image"] = copy.deepcopy(agent["image"])
     # The roster's model slots (U1): the roster-wide ``subagents.llm`` and
     # each entry's ``llm`` — ONLY the llm blocks, never the entries' full
     # configs, so the injector's input stays a config_override-shaped dict
@@ -566,6 +589,12 @@ async def inject_blob_credentials(
         agent["live_session"] = copy.deepcopy(co["live_session"])
     else:
         agent.pop("live_session", None)
+    # The image section (generate_image) is resolved per dispatch like
+    # research: replaced whole, removed when nothing is pinned.
+    if isinstance(co.get("image"), dict) and co["image"]:
+        agent["image"] = copy.deepcopy(co["image"])
+    else:
+        agent.pop("image", None)
     co_sub = co.get("subagents")
     if isinstance(co_sub, dict) and isinstance(agent.get("subagents"), dict):
         sub = agent["subagents"]

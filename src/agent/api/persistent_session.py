@@ -65,6 +65,13 @@ from agent.tools.description_manager import apply_description_overrides
 logger = logging.getLogger(__name__)
 
 
+def _image_max_edge(config: object) -> int | None:
+    """The longest image edge the model is shown (read_file's region hint)."""
+    from agent.services.image_content import safe_image_max_edge
+
+    return safe_image_max_edge(config)
+
+
 class MemoryUnavailableError(RuntimeError):
     """A configured (required) memory component could not be set up.
 
@@ -124,7 +131,6 @@ _JOB_INSPECTION_DISABLED_KEY = "_job_inspection_disabled"
 _AGENT_CATALOG_DISABLED_KEY = "_agent_catalog_disabled"
 _WORKFLOWS_DISABLED_KEY = "_workflows_disabled"
 _CANVAS_DISABLED_KEY = "_canvas_disabled"
-_FLEET_MANAGEMENT_CONTROL_TOOLS = {"request_workspace_upgrade"}
 _CANVAS_SKILL_NAME = "present-with-canvas"
 _CANVAS_SKILL_MANIFEST = f"skills/{_CANVAS_SKILL_NAME}/.srw-managed.json"
 _CANVAS_SKILL_MANIFEST_OWNER = "srw-present-with-canvas-v1"
@@ -1086,8 +1092,9 @@ class PersistentSession:
                     workspace_backend.set_shell_owner_token(self.shell_owner_token)
                 # Only the internal attach API can attest that this exact SSH
                 # endpoint is paired to a Canvas generation and pinned host
-                # identity. Direct remote config, VMs, and legacy overrides all
-                # remain fail-closed even when the connection itself is usable.
+                # identity (a same-cluster VM: its controller-authenticated
+                # identity). Direct remote config and legacy overrides remain
+                # fail-closed even when the connection itself is usable.
                 workspace_backend.supports_canvas_presentation = (
                     workspace_override or {}
                 ).get("canvas_presentation_available") is True
@@ -1331,7 +1338,7 @@ class PersistentSession:
                 )
             logger.info(
                 "Background officer session: refusing project cloud mount "
-                "(object plane; officer_knowledge_plane.md §4)"
+                "(an officer never mounts the project's cloud folder)"
             )
             return
         if not self.workspace_manager:
@@ -2321,6 +2328,8 @@ class PersistentSession:
         bindings intact and must stay survivable (degraded), never an attach
         failure.
         """
+        # Design: knowledge-base/knowledge/features/officer_knowledge_plane.md
+        # §3.1 (K1).
         from agent.tools.registry import officer_ceiling_active
 
         if not officer_ceiling_active(getattr(self.config, "officer", None)):
@@ -2332,7 +2341,7 @@ class PersistentSession:
                 "Background officer attach refused: expected exactly one "
                 f"project binding, got {len(project_ids)} "
                 f"({project_ids or 'none'}). Commission an officer onto one "
-                "project post (officer_knowledge_plane.md §3.1)."
+                "project post."
             )
 
         from agent.services.knowledge.bindings import KnowledgeBinding
@@ -2343,8 +2352,9 @@ class PersistentSession:
             if isinstance(b, KnowledgeBinding)
         ]
         if not bindings:
-            # No explicit bindings travelled with this construction path; the
-            # single project id above synthesizes the sole native writable KB.
+            # No knowledge base is attached, so there is no write target to
+            # check. The officer then runs with the fail-closed knowledge
+            # tools (see _setup_tools): its project alone binds nothing.
             return
 
         writable = [b for b in bindings if b.writable]
@@ -2357,14 +2367,14 @@ class PersistentSession:
                 "native writable knowledge binding, got "
                 f"[{', '.join(shape)}]. External knowledge bases must be "
                 "read-only and no override may replace the project write "
-                "target (officer_knowledge_plane.md §3.1)."
+                "target."
             )
         if str(writable[0].kb_id) != project_ids[0]:
             raise OfficerKnowledgeBindingError(
                 "Background officer attach refused: the writable knowledge "
                 f"binding targets KB {writable[0].kb_id}, not the officer's "
                 f"project {project_ids[0]} — the write target cannot be "
-                "replaced (officer_knowledge_plane.md §3.1)."
+                "replaced."
             )
 
     def _setup_knowledge(self, vector_conn: Optional[Any]) -> None:
@@ -2376,8 +2386,11 @@ class PersistentSession:
 
         Mirrors the worker agent pattern in agent.py._setup_job_tools().
         """
-        if not self.knowledge_bindings and not self.project_ids:
-            return  # No native or selected external knowledge scope
+        if not self.knowledge_bindings:
+            # No knowledge-base connector is attached. The session's project
+            # alone binds nothing: the attached connectors decide
+            # (build_knowledge_bindings).
+            return
 
         self._kb_degraded = False
         try:
@@ -2396,7 +2409,7 @@ class PersistentSession:
             )
             logger.info(
                 "Knowledge store initialized for %d KB binding(s)",
-                len(self.knowledge_bindings) or len(self.project_ids),
+                len(self.knowledge_bindings),
             )
         except Exception as e:
             self._kb_degraded = True
@@ -2469,6 +2482,9 @@ class PersistentSession:
             ),
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,
+            # The longest edge the model is shown, so read_file can say "you
+            # see this at W×H; use region" (image_generation.md WP5).
+            "image_max_edge": _image_max_edge(self.config),
             # Whether the parent model may send several tool calls per message
             # (matrix `parallel_tool_calls`): the delegate_agent description
             # offers session fan-out only to a model that can issue it.
@@ -3187,7 +3203,6 @@ class PersistentSession:
         agent_catalog_enabled = _agent_catalog_enabled(self.config)
         workflows_enabled = _workflows_enabled(self.config)
         fleet_management_tools = set(get_tools_by_category("orchestrator"))
-        fleet_management_tools.update(_FLEET_MANAGEMENT_CONTROL_TOOLS)
         job_control_tools = set(get_tools_by_category("job_control"))
         job_inspection_tools = set(get_tools_by_category("job_inspection"))
         agent_catalog_tools = set(get_tools_by_category("agent_catalog"))
@@ -3285,6 +3300,17 @@ class PersistentSession:
         # real sandbox. Gated on the backend lacking a shell — after a virtual →
         # sandbox swap this re-derives against the now-shell-capable backend and
         # the tool drops out (nothing left to upgrade to).
+        #
+        # Not gated on Fleet Management (2026-11-11). It used to be, as the
+        # opt-out for sessions that must not receive SRW app-control tools; but
+        # the orchestrator derives that opt-out marker from the fully merged
+        # config (session_config_resolution: "empty session-control groups are
+        # meaningful at every layer") and expert_base declares
+        # `tools.orchestrator: []`, so every default session read as opted out
+        # and none on a lite tier could ask for a shell. The tool only records a
+        # request a person approves, and the upgrade re-runs the owner's grants,
+        # so it stays with every lite session. A commissioned background officer
+        # still loses it to the ceiling applied below.
         _backend = getattr(self.workspace_manager, "backend", None)
         if (
             fleet_management_enabled
@@ -3293,11 +3319,7 @@ class PersistentSession:
         ):
             if "checkout_project_repository" not in tool_names:
                 tool_names.append("checkout_project_repository")
-        if (
-            fleet_management_enabled
-            and _backend is not None
-            and not getattr(_backend, "supports_shell", False)
-        ):
+        if _backend is not None and not getattr(_backend, "supports_shell", False):
             if "request_workspace_upgrade" not in tool_names:
                 tool_names.append("request_workspace_upgrade")
 
@@ -3991,9 +4013,11 @@ class PersistentSession:
                 )
                 self._memory_degraded = True
 
-        # KnowledgeStore (knowledge injection, project-scoped)
-        # Skip if already initialized by _setup_knowledge() (for tool loading)
-        if self.knowledge_store is None:
+        # KnowledgeStore (knowledge injection). Only for a session with a
+        # knowledge base attached, as in _setup_knowledge(): the project alone
+        # opens no store. Skip if _setup_knowledge() already opened it (for
+        # tool loading).
+        if self.knowledge_store is None and self.knowledge_bindings:
             try:
                 from shared.runtime.services.embedding_service import (
                     get_kb_embedding_service,
@@ -4095,9 +4119,11 @@ class PersistentSession:
         # loud rather than silently mid-turn. Sessions without a vector_conn
         # return above and keep the legacy (no-op) paths.
         if self.config.memory.manager_enabled:
+            from agent.core.knowledge_injection import attached_project_knowledge_ids
             from agent.services.memory import MemoryManager as MemorySeamManager
             from agent.services.memory import MemoryRuntime
 
+            _attached_kb_projects = attached_project_knowledge_ids(self)
             try:
                 self.memory_service = MemorySeamManager.from_config(
                     self.config.memory,
@@ -4110,8 +4136,10 @@ class PersistentSession:
                         extraction_prompt=self.memory_extraction_prompt,
                         job_id=self.thread_id,
                         agent_type=self.config.agent_id,
-                        project_id=self.project_id,
-                        project_ids=list(self.project_ids),
+                        # The knowledge scope (kb_notes): the projects whose
+                        # own knowledge base is attached, not every project.
+                        project_id=next(iter(_attached_kb_projects), None),
+                        project_ids=_attached_kb_projects,
                         # The legacy persistent path bounds each store call at
                         # 5 s (_RETRIEVAL_TIMEOUT in persistent_graph.py).
                         retrieval_timeout=5.0,

@@ -12,10 +12,16 @@ expert actually grants, and pin:
   line says "phase instructions";
 - the tactical body's shell block is present iff the expert grants a shell,
   and every ``has_tool("delegate_agent")`` block follows the grant;
-- a DB expert's phase prompt rides INSIDE the phase block as the fenced
-  ``<expert_workflow>`` addendum (one protected identity per path);
 - a frozen pre-U2 template keeps its phase swap for resume compatibility, while
   every newly resolved template is phase-agnostic.
+
+A job without phases binds none of the phase tools (it does one task and
+ends on ``job_complete``). Every template keeps the phased procedure inside
+``has_tool("next_phase_todos")`` blocks, so the same expert x family render with
+the tool list of a job without phases must name none of it, must name
+``job_complete``, and must not leave a gap where a block dropped out. The
+renders of a job that plans in phases are pinned byte for byte by
+``test_phased_prompts_unchanged.py``.
 
 Design: knowledge-base/knowledge/features/universal_experts_and_subagents.md §1.2.
 """
@@ -27,13 +33,12 @@ from pathlib import Path
 
 import pytest
 
+from shared.job_phases import PHASE_PROCEDURE_TOOLS
 from shared.runtime.core.loader import (
     PHASE_SKILLS,
     PromptMatrixResolver,
     _has_shell_tools,
-    append_expert_workflow_addendum,
     chain_root,
-    db_phase_addendum,
     delegation_system_floor,
     get_phase_system_prompt,
     get_system_prompt,
@@ -45,10 +50,8 @@ from shared.runtime.core.loader import (
     render_instruction_content,
     resolve_bound_skill_dir,
 )
-from shared.runtime.core.message_markers import protected_path
 from shared.runtime.core.model_registry import family_of
 from shared.runtime.core.skill_format import parse_skill_md
-from shared.runtime.core.workspace_injection import create_phase_instruction_message
 from agent.tools.registry import TOOL_REGISTRY
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -89,6 +92,34 @@ _PER_CALL_GATE_SENTENCE = (
     "calling one outside its phase returns an error for that call without "
     "affecting the other calls in the batch."
 )
+#: The tools of the phased procedure. A job without phases binds none of them
+#: and binds ``job_complete`` instead.
+_PHASE_TOOLS = PHASE_PROCEDURE_TOOLS
+#: Text about the phased procedure that the prompt of a job without phases
+#: must not carry.
+_PHASE_PROCEDURE_TEXT = (
+    "todo_complete",
+    "next_phase_todos",
+    "request_replan",
+    "todo_list",
+    "todos.yaml",
+    "plan.md",
+    "phase_model",
+    "multiphase",
+    "strategic",
+    "tactical",
+    "[PHASE_TRANSITION]",
+)
+
+
+def _worker_templates() -> list[Path]:
+    templates = sorted(
+        p
+        for p in (_CONFIG / "prompts").glob("systemprompt*.txt")
+        if "interactive" not in p.name and "subagent" not in p.name
+    )
+    assert len(templates) == 14, templates
+    return templates
 
 
 def _worker_experts() -> list[tuple[str, Path]]:
@@ -115,6 +146,20 @@ def _granted_tools(leaf: Path) -> list[str]:
         if isinstance(name, str) and name in TOOL_REGISTRY
     }
     return sorted(names)
+
+
+def _no_phases_tools(tools: list[str]) -> list[str]:
+    """A job without phases: the phase tools removed, ``job_complete`` added."""
+    return sorted((set(tools) - set(_PHASE_TOOLS)) | {"job_complete"})
+
+
+def _assert_no_phase_procedure(text: str, label: str) -> None:
+    for needle in _PHASE_PROCEDURE_TEXT:
+        assert needle not in text, f"{label}: names {needle!r}"
+    assert not any(m in text for m in _PHASE_MODEL_MARKERS), label
+    assert _PER_CALL_GATE_SENTENCE not in text, label
+    assert "job_complete" in text, label
+    assert "{%" not in text and "%}" not in text, f"{label}: unrendered Jinja"
 
 
 def _config(leaf: Path):
@@ -206,6 +251,81 @@ def test_system_prompt_renders_phase_agnostic(name, leaf, family):
 
 
 # ---------------------------------------------------------------------------
+# The same system prompt for a job without phases (no phase tools)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("family", sorted(_FAMILY_MODELS))
+@pytest.mark.parametrize("name,leaf", _WORKERS, ids=_WORKER_IDS)
+def test_no_phases_system_prompt_names_no_phase_procedure(name, leaf, family):
+    cfg = _config(leaf)
+    worker_tools = _granted_tools(leaf)
+    tools = _no_phases_tools(worker_tools)
+    model = _FAMILY_MODELS[family]
+
+    prompt = get_system_prompt(cfg, model=model, tool_names=tools)
+    label = f"{name}/{family} system prompt without phases"
+    _assert_clean(prompt, label)
+    assert cfg.display_name in prompt, label
+    # The persona is the expert's own prose, not the scaffold's; some personas
+    # describe their phased method and are not part of this gate.
+    persona = PromptMatrixResolver(str(leaf.parent), family).load("persona").strip()
+    assert persona and persona in prompt, label
+    scaffold = prompt.replace(persona, "")
+    _assert_no_phase_procedure(scaffold, label)
+    assert "phase instructions" not in scaffold, label
+    # Blocks that drop out leave no extra blank lines behind.
+    worker = get_system_prompt(cfg, model=model, tool_names=worker_tools)
+    worker_scaffold = worker.replace(persona, "")
+    assert scaffold.count("\n\n\n") <= worker_scaffold.count("\n\n\n"), label
+
+    strategic = get_phase_system_prompt(
+        cfg, is_strategic=True, phase_number=0, model=model, tool_names=tools
+    )
+    assert strategic == prompt, label
+
+
+#: Tool lists of a job without phases that take each other condition of the
+#: templates (``kb_write``, ``memory_search``, ``delegate_agent``) both ways.
+_NO_PHASES_TOOL_LISTS = {
+    "every_tool": _no_phases_tools(sorted(TOOL_REGISTRY)),
+    "job_complete_only": ["job_complete"],
+}
+
+
+@pytest.mark.parametrize("tool_list", sorted(_NO_PHASES_TOOL_LISTS))
+@pytest.mark.parametrize("template", _worker_templates(), ids=lambda p: p.name)
+def test_every_worker_template_renders_for_a_job_without_phases(template, tool_list):
+    raw = template.read_text(encoding="utf-8")
+    assert 'has_tool("next_phase_todos")' in raw, template.name
+    tools = _NO_PHASES_TOOL_LISTS[tool_list]
+    rendered = render_instruction_content(raw, tools)
+    label = f"{template.name} ({tool_list})"
+    assert rendered.strip(), label
+    _assert_no_phase_procedure(rendered, label)
+    with_phase_tools = render_instruction_content(raw, sorted({*tools, *_PHASE_TOOLS}))
+    assert rendered.count("\n\n\n") <= with_phase_tools.count("\n\n\n"), label
+    assert rendered != with_phase_tools, label
+
+
+@pytest.mark.parametrize("tool_list", sorted(_NO_PHASES_TOOL_LISTS))
+@pytest.mark.parametrize("expert", ["engineer", "designer"])
+def test_expert_instructions_name_no_phase_procedure_without_phases(expert, tool_list):
+    raw = (_CONFIG / "experts" / expert / "instructions.md").read_text(encoding="utf-8")
+    tools = _NO_PHASES_TOOL_LISTS[tool_list]
+    rendered = render_instruction_content(raw, tools)
+    label = f"{expert} instructions ({tool_list})"
+    assert rendered.strip(), label
+    for needle in _PHASE_PROCEDURE_TEXT:
+        assert needle not in rendered, f"{label}: names {needle!r}"
+    assert "{%" not in rendered and "%}" not in rendered, label
+    with_phase_tools = render_instruction_content(raw, sorted({*tools, *_PHASE_TOOLS}))
+    assert rendered.count("\n\n\n") <= with_phase_tools.count("\n\n\n"), label
+    if expert == "engineer":
+        assert "`job_complete`" in rendered, label
+
+
+# ---------------------------------------------------------------------------
 # The phase bodies, per expert
 # ---------------------------------------------------------------------------
 
@@ -270,59 +390,6 @@ def test_expert_local_bodies_are_used_where_shipped():
                 leaf.parent / "skills" if name in local else _CONFIG / "skills"
             )
             assert skill_dir == expected_root / skill, (name, phase)
-
-
-# ---------------------------------------------------------------------------
-# DB expert addendum inside the phase block
-# ---------------------------------------------------------------------------
-
-
-def test_db_phase_prompt_is_fenced_inside_the_phase_block():
-    cfg = load_agent_config_from_dict(
-        {
-            "agent_id": "forked",
-            "display_name": "Forked",
-            "_db_prompt_keys": ["tactical"],
-            "_resolved_prompts": {
-                "tactical": 'Ship it. Emit {"status": "ok"} when done.',
-            },
-        }
-    )
-    assert db_phase_addendum(cfg, "strategic") is None  # not DB-authored
-    addendum = db_phase_addendum(cfg, "tactical")
-    assert addendum and addendum.startswith("<expert_workflow")
-    assert "{" not in addendum and '"status": "ok"' in addendum  # brace-safe
-
-    _raw, body = _phase_body(
-        "worker_base", _CONFIG / "overlays" / "worker.yaml", "tactical"
-    )
-    composed = append_expert_workflow_addendum(
-        render_instruction_content(body, []), addendum
-    )
-    assert composed.index("You are in TACTICAL mode.") < composed.index(
-        "<expert_workflow"
-    )
-    assert composed.rstrip().endswith("</expert_workflow>")
-
-    block = create_phase_instruction_message(
-        "skills/tactical-phase/SKILL.md", composed, "tactical", "2:tactical"
-    )
-    assert protected_path(block) == "skills/tactical-phase/SKILL.md"
-    assert block.content.startswith("[phase: tactical] Phase instructions")
-    assert block.content.count("<expert_workflow") == 1
-
-
-def test_addendum_needs_both_the_marker_and_the_text():
-    only_marker = load_agent_config_from_dict(
-        {"agent_id": "a", "display_name": "A", "_db_prompt_keys": ["tactical"]}
-    )
-    assert db_phase_addendum(only_marker, "tactical") is None
-    only_text = load_agent_config_from_dict(
-        {"agent_id": "a", "display_name": "A", "_resolved_prompts": {"tactical": "x"}}
-    )
-    assert (
-        db_phase_addendum(only_text, "tactical") is None
-    )  # bundled text is not fenced
 
 
 # ---------------------------------------------------------------------------

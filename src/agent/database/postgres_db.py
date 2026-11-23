@@ -1937,6 +1937,81 @@ class PostgresDB:
         RETURNING 1
     """
 
+    async def reserve_image_generation(
+        self, ref_kind: str, ref_id: str, count: int, cap: int
+    ) -> tuple[bool, int]:
+        """Reserve ``count`` paid images against a job's or Session's cap.
+
+        One conditional UPDATE: the counter under ``context`` (jobs) or
+        ``metadata`` (threads) ``['image_generation']['paid_images']`` moves
+        only when the result stays within ``cap`` (``cap <= 0`` = no cap), so
+        parallel calls and delegated children (which share the parent's id)
+        cannot overrun it, and it survives pause, resume and restarts
+        (image_generation.md §5 WP4, decision D1). Returns ``(reserved,
+        used)``: ``used`` is the count after a reservation, or the current
+        count when refused. A missing row reserves nothing.
+        """
+        from shared.image_generation import COUNTER_CONTEXT_KEY, COUNTER_FIELD
+
+        table, column = (
+            ("threads", "metadata") if ref_kind == "thread" else ("jobs", "context")
+        )
+        current = (
+            f"COALESCE(({column}->'{COUNTER_CONTEXT_KEY}'->>'{COUNTER_FIELD}')::int, 0)"
+        )
+        row = await self.fetchrow(
+            f"""
+            UPDATE {table}
+            SET {column} = jsonb_set(
+                    COALESCE({column}, '{{}}'::jsonb),
+                    '{{{COUNTER_CONTEXT_KEY}}}',
+                    COALESCE({column}->'{COUNTER_CONTEXT_KEY}', '{{}}'::jsonb)
+                        || jsonb_build_object('{COUNTER_FIELD}', {current} + $2::int)
+                )
+            WHERE id = $1::uuid AND ($3::int <= 0 OR {current} + $2::int <= $3::int)
+            RETURNING ({column}->'{COUNTER_CONTEXT_KEY}'->>'{COUNTER_FIELD}')::int AS used
+            """,
+            ref_id,
+            int(count),
+            int(cap),
+        )
+        if row is not None:
+            return True, int(row["used"])
+        used = await self.fetchval(
+            f"SELECT {current} FROM {table} WHERE id = $1::uuid",
+            ref_id,
+        )
+        return False, int(used or 0)
+
+    async def release_image_generation(
+        self, ref_kind: str, ref_id: str, count: int
+    ) -> None:
+        """Give back a reservation whose provider call failed (floor 0)."""
+        from shared.image_generation import COUNTER_CONTEXT_KEY, COUNTER_FIELD
+
+        table, column = (
+            ("threads", "metadata") if ref_kind == "thread" else ("jobs", "context")
+        )
+        current = (
+            f"COALESCE(({column}->'{COUNTER_CONTEXT_KEY}'->>'{COUNTER_FIELD}')::int, 0)"
+        )
+        await self.execute(
+            f"""
+            UPDATE {table}
+            SET {column} = jsonb_set(
+                    COALESCE({column}, '{{}}'::jsonb),
+                    '{{{COUNTER_CONTEXT_KEY}}}',
+                    COALESCE({column}->'{COUNTER_CONTEXT_KEY}', '{{}}'::jsonb)
+                        || jsonb_build_object(
+                            '{COUNTER_FIELD}', GREATEST({current} - $2::int, 0)
+                        )
+                )
+            WHERE id = $1::uuid
+            """,
+            ref_id,
+            int(count),
+        )
+
     async def save_thread_pending_memory(
         self,
         thread_id: str,

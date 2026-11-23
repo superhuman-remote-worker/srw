@@ -256,6 +256,14 @@ def test_cloud_overwrites_and_existing_pvc_reconciliation(manifests):
     assert "httpclient.allowselfsigned" not in hook
 
 
+def test_sso_logins_leave_project_groups_to_srw(manifests):
+    hook = manifests["ConfigMap", "srw-nextcloud-hooks"]["data"]["setup-nextcloud.sh"]
+    assert "--group-provisioning=1" not in hook
+    assert "--group-provisioning=0" in hook
+    template = manifests["Deployment", "srw-nextcloud"]["spec"]["template"]
+    assert template["metadata"]["annotations"]["checksum/setup-hook"]
+
+
 def test_bootstrap_users_have_valid_email_without_a_domain(manifests):
     realm = json.loads(
         manifests["ConfigMap", "srw-keycloak-realm"]["data"]["srw-realm.json"]

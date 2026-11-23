@@ -329,7 +329,7 @@ def verify_api_and_ide(
     api_origin: str,
     ide_path: str,
 ) -> list[ProbeResult]:
-    api = fetcher.get(_join(api_origin, "/openapi.json"), label="api.document")
+    api = fetcher.get(_join(api_origin, "/api/openapi.json"), label="api.document")
     ide = fetcher.get(_join(api_origin, ide_path), label="api.ide-document")
     return [
         _result(

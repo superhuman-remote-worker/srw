@@ -38,6 +38,9 @@ spec:
 
         agent_id: bughunter
         display_name: Bug Hunter
+        # This expert plans in phases (shared/job_phases.py; false by default).
+        # The bughunter's method lives in its own phase skills (skills/).
+        phases: true
         description: |
           Adversarial QA. Picks a target surface (module, endpoint family, feature
           flag, tenant boundary) and tries to break it. Probes inputs, races,

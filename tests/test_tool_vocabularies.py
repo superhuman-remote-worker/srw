@@ -102,6 +102,32 @@ class TestVocabularyDrift:
         assert enum is not None
         assert set(enum) == set(_AUTONOMY_VALUES)
 
+    def test_phases_is_a_boolean_on_both_creation_tools(self):
+        """create_job (the shared descriptor behind the agent, officer and MCP
+        tools) and MCP create_project_job take ``phases`` as an optional
+        boolean, the type shared.job_phases reads; no spelled-out vocabulary
+        of words can drift from it."""
+        import ast
+        import inspect
+        from pathlib import Path
+
+        from shared.orch_surface.jobs import get_descriptor
+
+        handler = get_descriptor("create_job").handler
+        hint = inspect.get_annotations(handler, eval_str=True)["phases"]
+        assert set(get_args(hint)) == {bool, type(None)}
+
+        # The MCP module is read, not imported: FastMCP wraps the function.
+        server = Path(__file__).resolve().parents[1] / "src/mcp_server/server.py"
+        (function,) = [
+            node
+            for node in ast.walk(ast.parse(server.read_text(encoding="utf-8")))
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "create_project_job"
+        ]
+        (argument,) = [a for a in function.args.args if a.arg == "phases"]
+        assert ast.unparse(argument.annotation) == "bool | None"
+
     def test_backlog_ticket_types_are_in_every_vocabulary(self):
         """A ticket type missing from any one site silently degrades: the tool
         rejects it, or kb_reindex rewrites it to 'learning' on the next pass."""
@@ -263,6 +289,22 @@ class TestOtherToolConstraints:
             "archived",
         }
         assert "datasource" in _enum_of(tools["kb_list"], "type")
+
+    def test_create_job_phases_is_a_boolean(self):
+        """The agent and officer create_job carries ``phases`` as a boolean in
+        its schema, not as free text described only in its docstring."""
+        from agent.tools.context import ToolContext
+        from agent.tools.orchestrator.jobs import create_orchestrator_tools
+
+        tools = {t.name: t for t in create_orchestrator_tools(ToolContext())}
+        prop = tools["create_job"].args_schema.model_json_schema()["properties"][
+            "phases"
+        ]
+        assert {branch.get("type") for branch in prop["anyOf"]} == {
+            "boolean",
+            "null",
+        }
+        assert prop.get("default") is None
 
     def test_task_add_priority_is_constrained(self):
         """Silently downgraded anything unrecognised to 'medium', with no word

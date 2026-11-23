@@ -42,6 +42,9 @@ spec:
 
         agent_id: developer
         display_name: Developer
+        # This expert plans in phases (shared/job_phases.py; false by default).
+        # The developer's method (plan.md, the phase skills in skills/) is written for the phased procedure.
+        phases: true
         description: |
           Strict test-first implementation for briefs that explicitly ask for TDD.
           Defines EARS acceptance criteria up front, writes failing tests, then writes

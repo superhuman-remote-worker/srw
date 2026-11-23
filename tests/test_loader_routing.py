@@ -42,6 +42,8 @@ def _make_config(**overrides):
     # Real attribute, not MagicMock truthiness — the factory's cache-key arm
     # gates on `if config.prompt_cache_key`.
     config.prompt_cache_key = overrides.get("prompt_cache_key", None)
+    # Real value: a factory refuses any pin it can't read, a mock included.
+    config.tls_pinned_cert = overrides.get("tls_pinned_cert", None)
     return config
 
 

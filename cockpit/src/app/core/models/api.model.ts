@@ -199,8 +199,8 @@ export interface ExpertDetail extends Expert {
   name?: string;
   owner_id?: string;
   version?: number;
-  /** Prompt segments for DB-backed experts: persona, instructions, and (Part 2)
-   *  strategic, tactical, summarization. Empty/absent segments inherit the base. */
+  /** Prompt segments for DB-backed experts: persona, instructions and
+   *  summarization. Empty/absent segments inherit the base. */
   prompts?: Record<string, unknown>;
 }
 
@@ -416,6 +416,10 @@ export interface DatasourceConfig {
   /** GitHub App repository (C5): the App and its installation, and a GitHub
    *  Enterprise Server's API base. Set through the API; the form keeps it. */
   github_app?: {app_id: string; installation_id: string; api_base?: string};
+  /** MCP connectors (remote and managed): what a yes/no question the
+   *  server asks mid-call gets by itself. Absent follows the installation
+   *  default (`McpServerQuestionsSetting`). */
+  server_questions?: McpServerQuestionsChoice;
   /** Kubeconfig (C5): TokenRequest minting for one ServiceAccount. Set
    *  through the API; the form never sends a kubeconfig's config. */
   token_request?: {
@@ -473,6 +477,9 @@ export interface Datasource {
   id: string;
   name: string;
   description: string | null;
+  /** The catalog's: the name of the project a connector SRW keeps belongs
+   *  to; null for any other connector. */
+  native_project_name?: string | null;
   type: DatasourceType;
   connection_url: string | null;
   /** True when REST returned only a sanitized display URL. Editors must omit
@@ -591,6 +598,9 @@ export interface EligibleDatasource extends Datasource {
 export interface DatasourceCatalogResponse {
   items: Datasource[];
   next_cursor: string | null;
+  /** First page only: how many connectors of each type there are under
+   *  every filter but the type. */
+  type_counts?: Record<string, number>;
 }
 
 export interface DatasourceCatalogFilters {
@@ -602,6 +612,9 @@ export interface DatasourceCatalogFilters {
   visibility?: 'private' | 'public';
   ownership?: 'mine' | 'shared';
   availability?: 'all' | 'projects' | 'unavailable';
+  /** true: only the connectors SRW keeps (a project's folders and knowledge
+   *  base, a user's cloud); false: only the ones people created. */
+  managed?: boolean;
   cursor?: string;
   limit?: number;
 }
@@ -701,10 +714,12 @@ export interface ProjectDatasource extends Datasource {
 /**
  * Result from testing a datasource connection.
  */
-/** The SSH endpoint a connector form is editing; Test reaches it unsaved. */
+/** What a connector form is editing; Test reaches it unsaved. An SSH
+ *  connector's endpoint, or an MCP server's URL and credentials. */
 export interface DatasourceTestEdits {
   connection_url?: string | null;
   config?: DatasourceConfig;
+  credentials?: Record<string, unknown>;
 }
 
 export interface DatasourceTestResult {
@@ -754,10 +769,33 @@ export interface User {
 }
 
 /**
+ * Response body from /api/admin/system-settings/image_generation (GET/PUT):
+ * the paid-image cap per job or Session (0 = no cap) and the share of the
+ * subscription window above which proxy image calls are refused.
+ */
+export interface ImageGenerationSettings {
+  max_paid_images: number;
+  proxy_quota_threshold_percent: number;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+/**
  * Response body from /api/admin/system-settings/vm_workspaces (GET/PUT).
  */
 export interface VmWorkspacesSetting {
   enabled: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
+}
+
+/** What an MCP connector without its own `config.server_questions` does
+ *  when its server asks a yes/no question mid-call (system setting
+ *  `mcp.server_questions_default`). */
+export type McpServerQuestionsChoice = 'decline' | 'accept';
+
+export interface McpServerQuestionsSetting {
+  default: McpServerQuestionsChoice;
   updated_at: string | null;
   updated_by: string | null;
 }
@@ -810,7 +848,8 @@ export type LlmModelCapability =
   | 'search'
   | 'fetch'
   | 'rerank'
-  | 'live_voice';
+  | 'live_voice'
+  | 'image_generation';
 
 /**
  * A user-registered OpenAI-compatible LLM endpoint. Models attached to this
@@ -839,6 +878,57 @@ export interface LlmEndpoint {
   managed_by_helm?: boolean;
   /** Managed, but last edited in the Cockpit: the next upgrade reverts it. */
   helm_drift?: boolean;
+  /** The one certificate SRW accepts for this endpoint, or null (normal verification). */
+  tls_pin?: LlmEndpointTlsPin | null;
+}
+
+/** A pinned endpoint certificate. `sha256` is `AA:BB:…` upper-case hex pairs. */
+export interface LlmEndpointTlsPin {
+  sha256: string;
+  subject: string | null;
+  issuer: string | null;
+  not_after: string | null;
+  expired: boolean;
+  trusted_at: string | null;
+}
+
+/** The certificate a server presented during Test. */
+export interface LlmEndpointCertificate {
+  sha256: string;
+  subject: string | null;
+  issuer: string | null;
+  not_before: string | null;
+  not_after: string | null;
+  expired: boolean;
+  san: string[];
+}
+
+export type LlmEndpointTlsReason =
+  | 'self_signed'
+  | 'unknown_issuer'
+  | 'address_mismatch'
+  | 'expired'
+  | 'not_yet_valid'
+  | 'certificate_changed'
+  | 'other';
+
+/**
+ * Certificate report attached to Test results; null for http:// or a
+ * certificate that verifies normally on an unpinned endpoint. Decide what to
+ * render from `certificate` / `reason` / `can_trust`, not from `verified`
+ * (an unreachable host is `verified: false` with neither).
+ */
+export interface LlmEndpointTlsReport {
+  verified: boolean;
+  reason: LlmEndpointTlsReason | null;
+  message: string;
+  certificate: LlmEndpointCertificate | null;
+  pin: LlmEndpointTlsPin | null;
+  pin_matches: boolean;
+  publicly_valid: boolean;
+  can_trust: boolean;
+  /** Why Trust is not offered for a certificate it would otherwise offer (the endpoint can't be pinned). */
+  refusal?: string | null;
 }
 
 /** `source` column shared by the Helm-reconciled provider tables. */
@@ -868,6 +958,7 @@ export interface LlmEndpointTestResult {
   status: number | null;
   error: string | null;
   probe_url: string;
+  tls?: LlmEndpointTlsReport | null;
 }
 
 /**
@@ -946,14 +1037,15 @@ export type CatalogCapability =
   | 'search'
   | 'fetch'
   | 'rerank'
-  | 'live_voice';
+  | 'live_voice'
+  | 'image_generation';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
 export const CATALOG_CAPABILITIES: CatalogCapability[] = [
   'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts', 'search', 'fetch',
-  'rerank', 'live_voice',
+  'rerank', 'live_voice', 'image_generation',
 ];
 
 /**
@@ -1035,6 +1127,7 @@ export interface CatalogModelTestResult {
   status: number | null;
   error: string | null;
   probe_url: string | null;
+  tls?: LlmEndpointTlsReport | null;
 }
 
 export interface CatalogModelDeleteResult {
@@ -2531,7 +2624,10 @@ export interface WorkspaceLifecycleView {
 
 export interface Job {
   id: string;
+  /** The task text the job was created from. */
   description: string;
+  /** The name a person gave the job afterwards; null when it was never named. */
+  title?: string | null;
   document_path?: string | null;
   config_name: string | null;
   /** JSONB can arrive as JSON text; normalize before reading its fields. */
@@ -2613,6 +2709,12 @@ export interface Job {
   vm_creation?: VMCreationView | null;
   workspace_creation?: WorkspaceCreationView | null;
   workspace_lifecycle?: WorkspaceLifecycleView | null;
+  /** Whether the job plans in phases (`core/util/phases.ts`): `true` plans,
+   *  works through to-dos in phases and reviews; `false` does its task
+   *  directly. `null` is unknown: a job from before the setting, or one on a
+   *  custom harness image. Decided at creation from the job's own override,
+   *  the project default or its Expert's `phases` key. */
+  phases: boolean | null;
 }
 
 /**
@@ -2659,8 +2761,6 @@ export interface JobCreateRequest {
   upload_id?: string;
   config_upload_id?: string;
   instructions_upload_id?: string;
-  document_path?: string;
-  document_dir?: string;
   /** Unified selector: bundled expert ID or DB expert UUID; omission uses the server default.
    *  Or a complete inline Expert (`{inline: ExpertSpec}`) when the form changed a template —
    *  creation_ui_expert_workspace_connectors.md D2. */
@@ -2692,6 +2792,9 @@ export interface JobCreateRequest {
   execution_lane?: 'pinned' | 'stateless';
   /** Start inside a live session (needs execution.session; set by live automations). */
   live_session?: boolean;
+  /** Overrides the Expert's `phases` setting for this job. API callers only:
+   *  the Cockpit's form never sends it. */
+  phases?: boolean;
 }
 
 /**
@@ -2975,6 +3078,8 @@ export interface JobSubjob {
   /** 0 = a direct child of the job asked about. */
   depth: number;
   description: string;
+  /** The name a person gave the subjob; null when it was never named. */
+  title?: string | null;
   status: string;
   /** The role: `scholar`, `critic`, `curator`. What makes a row readable. */
   config_name: string | null;
@@ -3212,6 +3317,8 @@ export interface GrantCatalogEntry {
   default: unknown;
   restrict_only: boolean;
   order?: string[];
+  /** One line for the administrator: what allowing the key lets a user do. */
+  description?: string;
 }
 
 export type GrantCatalog = Record<string, GrantCatalogEntry>;
@@ -3336,6 +3443,9 @@ export interface SessionQueueState {
   /** Tool calls whose result is unknown (a parked unit only): the owner's
    * Continue / Stop decision answers them. Empty or absent otherwise. */
   unknown_tool_calls?: SessionUnknownToolCall[];
+  /** True while this unit is queued and the whole chat pool has stalled (no
+   * executor is taking messages). Drives the "chat is unavailable" bubble. */
+  pool_stalled?: boolean;
 }
 
 /** A tool call that started but has no recorded result. `args` is null when
@@ -3424,6 +3534,9 @@ export interface AdminCapacity {
   executors: { total: number | null; ready: number | null; busy: number };
   queued: { session_turn: number; worker_batch: number; total: number };
   oldest_queued_age_s: number;
+  oldest_session_turn_age_s: number | null;
+  chat_pool_stalled: boolean;
+  stall_threshold_s: number;
   desired: number;
   params: { min_replicas: number; reserve: number };
   parked?: AdminCapacityParkedRow[];

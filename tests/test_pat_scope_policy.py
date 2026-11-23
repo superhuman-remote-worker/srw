@@ -35,6 +35,7 @@ from fastapi import HTTPException
 from orchestrator.schemas.tokens import VALID_PAT_SCOPES
 from orchestrator.security.token_scopes import (
     ANY,
+    CONTENT_SCOPES,
     READS_THAT_WRITE,
     REFUSED,
     UNMAPPED,
@@ -120,8 +121,12 @@ class TestEveryMountedRouteIsClassified:
         )
 
     def test_decisions_use_exactly_the_minted_vocabulary(self, endpoints):
+        # A scope no route decides is checked by a service from the request's
+        # content (token_scopes.CONTENT_SCOPES); every other minted scope must
+        # open at least one route, and no route may need an unminted one.
         decisions = {classify_route(e.method, e.path) for e in endpoints}
-        assert decisions - {ANY, REFUSED} == VALID_PAT_SCOPES
+        assert CONTENT_SCOPES < VALID_PAT_SCOPES
+        assert decisions - {ANY, REFUSED} == VALID_PAT_SCOPES - CONTENT_SCOPES
 
 
 # GET routes a `:read` token keeps although serving them writes. Every GET a
@@ -269,6 +274,25 @@ class TestClassifyRoute:
             ("POST", "/api/api-keys", REFUSED),
             ("GET", "/api/auth/me", ANY),
             ("get", "/api/jobs", "jobs:read"),
+            # Manifests: three POST-shaped reads, and the two writes a token
+            # without `admin` may make.
+            ("POST", "/api/manifests/validate", "jobs:read"),
+            ("POST", "/api/manifests/preview", "jobs:read"),
+            ("POST", "/api/manifests/export", "jobs:read"),
+            ("GET", "/api/manifests/schema", "jobs:read"),
+            ("POST", "/api/manifests/apply", "resources:write"),
+            ("DELETE", "/api/resources/{resource_id}", "resources:write"),
+            ("GET", "/api/resources/{resource_id}", "jobs:read"),
+            ("GET", "/api/resources", "jobs:read"),
+            # Their neighbours stay where they were: the rules are exact and
+            # method-restricted, so nothing beside them moves.
+            ("PUT", "/api/manifests/apply", "admin"),
+            ("POST", "/api/manifests/apply/{anything}", "admin"),
+            ("POST", "/api/resources/{resource_id}/outcome", "admin"),
+            ("PUT", "/api/resources/{resource_id}", "admin"),
+            ("PUT", "/api/resource-secrets/{name}", "admin"),
+            ("DELETE", "/api/workspace-cache/{artifact_id}", "admin"),
+            ("DELETE", "/api/workspace-instances/{instance_id}", "admin"),
         ],
     )
     def test_decision(self, method, path, expected):

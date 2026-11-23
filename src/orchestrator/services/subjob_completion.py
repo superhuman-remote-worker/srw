@@ -13,6 +13,7 @@ import json
 import logging
 from typing import Any, Protocol
 
+from shared.job_phases import PHASES_KEY
 from shared.runtime.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
@@ -235,11 +236,14 @@ async def spawn_scholar_subjob(
     elif dependencies.should_provision_parent_container(config_override):
         scholar_context["provisions_parent_workspace"] = job_id
 
+    # A sub-job never inherits its parent's setting: the research pass is the
+    # phased procedure whatever the parent job or a default says.
     scholar_override: dict[str, Any] = {
         "scholar": {"enabled": False},
         "verification": {"enabled": False},
         "curator": {"enabled": False},
         "autonomy": "full",
+        PHASES_KEY: True,
         "workspace": {"backend": parent_workspace_backend},
     }
     if config_override and isinstance(config_override.get("llm"), dict):

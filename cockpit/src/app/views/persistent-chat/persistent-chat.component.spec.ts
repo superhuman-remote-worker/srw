@@ -19,10 +19,11 @@ import {
     formatRewindStamp,
     HEADER_FOLD_HYSTERESIS_PX,
     HEADER_LEFT_RESERVE_PX,
-    isMicMode,
+    withoutDictation,
     isNearBottom,
     formatQueueWait,
     queueWaitTier,
+    queuedNotice,
     QUEUE_BUSY_AFTER_MS,
     QUEUE_ELAPSED_AFTER_MS,
     isRewindCommand,
@@ -38,6 +39,7 @@ import {
     pickWorkspaceOfferCard,
     PersistentChatComponent,
     readingWidthToCss,
+    reconnectRetryingKey,
     saveDraft,
     shouldFoldHeaderActions,
     shouldFoldToolRun,
@@ -51,6 +53,8 @@ import {
 } from './persistent-chat.component';
 import {cloudReviewBannerVisible} from './cloud-review-banner/cloud-review-banner.component';
 import {AssistantTurn, MIN_FOLD_RUN, Turn, UserTurn} from '../../core/models/turn.model';
+import de from '../../../assets/i18n/de-DE.json';
+import en from '../../../assets/i18n/en.json';
 
 /**
  * Build a minimal DataTransferItem stand-in. The real DataTransferItemList
@@ -111,6 +115,28 @@ describe('shouldShowReconnectBanner', () => {
     });
 });
 
+describe('reconnectRetryingKey', () => {
+    // The live run read "Retrying… (attempt 1 of -1)": the session stream
+    // retries without a limit and the banner printed the -1 sentinel.
+    const render = (dict: {chat: {disconnected: Record<string, string>}}, key: string) =>
+        dict.chat.disconnected[key.split('.').pop()!]
+            .replace('{{attempt}}', '3')
+            .replace('{{max}}', '-1');
+
+    it('names no limit when the retry loop has none', () => {
+        const key = reconnectRetryingKey(-1);
+        expect(key).toBe('chat.disconnected.retryingUnbounded');
+        expect(render(en, key)).toBe('Retrying… (attempt 3)');
+        expect(render(de, key)).toBe('Erneuter Versuch… (Versuch 3)');
+        expect(render(en, key)).not.toContain('-1');
+    });
+
+    it('keeps "attempt N of M" for a real limit', () => {
+        expect(reconnectRetryingKey(8)).toBe('chat.disconnected.retrying');
+        expect(reconnectRetryingKey(0)).toBe('chat.disconnected.retryingUnbounded');
+    });
+});
+
 describe('queueWaitTier', () => {
     it('is fresh under the 10 s attention limit', () => {
         expect(queueWaitTier(0)).toBe('fresh');
@@ -122,6 +148,20 @@ describe('queueWaitTier', () => {
         expect(queueWaitTier(QUEUE_ELAPSED_AFTER_MS - 1)).toBe('busy');
         expect(queueWaitTier(QUEUE_ELAPSED_AFTER_MS)).toBe('long');
         expect(queueWaitTier(10 * 60_000)).toBe('long');
+    });
+});
+
+describe('queuedNotice', () => {
+    it('shows the unavailable line instead of busy when the queue reports pool_stalled', () => {
+        for (const tier of ['fresh', 'busy', 'long'] as const) {
+            expect(queuedNotice(tier, true)).toBe('unavailable');
+        }
+    });
+
+    it('keeps today\'s tiers when the pool is not stalled', () => {
+        expect(queuedNotice('fresh', false)).toBeNull();
+        expect(queuedNotice('busy', false)).toBe('busy');
+        expect(queuedNotice('long', false)).toBe('busy');
     });
 });
 
@@ -337,29 +377,15 @@ describe('uploadStageFor', () => {
     });
 });
 
-describe('isMicMode', () => {
-    it('offers the mic on an empty idle composer with audio input', () => {
-        expect(isMicMode(true, false, '', 0)).toBe(true);
+describe('withoutDictation', () => {
+    it('hides dictation recordings and keeps every other attachment', () => {
+        const pdf = {id: 'a', name: 'a.pdf'};
+        const voice = {id: 'v', name: 'voice.webm', dictation: true};
+        expect(withoutDictation([pdf, voice])).toEqual([pdf]);
     });
 
-    it('flips to send on the first real keystroke', () => {
-        expect(isMicMode(true, false, 'h', 0)).toBe(false);
-    });
-
-    it('treats whitespace-only text as still empty (nothing sendable)', () => {
-        expect(isMicMode(true, false, '  \n', 0)).toBe(true);
-    });
-
-    it('flips to send when an attachment is queued without text', () => {
-        expect(isMicMode(true, false, '', 1)).toBe(false);
-    });
-
-    it('yields to the stop/spinner states while a turn is in flight', () => {
-        expect(isMicMode(true, true, '', 0)).toBe(false);
-    });
-
-    it('never offers the mic without an audio input device', () => {
-        expect(isMicMode(false, false, '', 0)).toBe(false);
+    it('treats a missing list as empty', () => {
+        expect(withoutDictation(undefined)).toEqual([]);
     });
 });
 

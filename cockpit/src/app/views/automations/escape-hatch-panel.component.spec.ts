@@ -28,4 +28,9 @@ describe('EscapeHatchPanelComponent', () => {
     const panel = createPanel();
     expect(panel.apiDocsUrl).not.toMatch(/\/api\/api\/docs$/);
   });
+
+  it('the guide link opens the public API page, not a moved repository file', () => {
+    const panel = createPanel();
+    expect(panel.guideUrl).toBe('https://docs.superhuman-remote-worker.com/api/');
+  });
 });

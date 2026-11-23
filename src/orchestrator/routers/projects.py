@@ -143,18 +143,19 @@ async def list_projects(
         * A non-admin passing ``?user_id=`` for anyone other than themselves
           is rejected (403). Self-query is allowed but redundant.
 
-    Lifecycle (knowledge-base/knowledge/features/project_and_job_list_filtering.md
-    §4.2): archived projects are excluded by default on BOTH branches. The
+    Lifecycle: archived projects are excluded by default on BOTH branches. The
     server does this, not the client — a filter applied in Angular still pays
-    for the rows in Postgres and leaves every other consumer unprotected.
-    The old admin-branch ``status != 'deleted'`` predicate was dead code:
-    ``valid_project_status`` has no such value (deletion is a hard row
-    delete), so it never excluded anything.
+    for the rows in Postgres and leaves every other consumer unprotected. The
+    old admin-branch ``status != 'deleted'`` predicate was dead code:
+    ``valid_project_status`` has no such value (deletion is a hard row delete),
+    so it never excluded anything.
 
     ``get_projects_for_user`` keeps its LIMIT 100. With archived excluded that
     ceiling stops being reachable for realistic accounts; if it ever is, the
     projects grid needs paging too (out of scope, phase 1).
     """
+    # Lifecycle design: knowledge-base/knowledge/features/
+    # project_and_job_list_filtering.md §4.2.
     caller = await dependencies.require_approved_user(request, dependencies.store)
     return await projects.list_projects(
         caller=caller,
@@ -175,9 +176,9 @@ async def get_project(
 
     The warm path is pure Postgres — cloud/Keycloak reconciliation and
     identity resolution run as throttled background repairs, never on the
-    request (knowledge-base/knowledge/issues/project_page_open_blocks_on_cloud_heal.md
-    measured 2.3-5s per page open when they were inline).
+    request (they cost 2.3-5s per page open when they were inline).
     """
+    # Measurement: knowledge-history/done/project_page_open_blocks_on_cloud_heal.md.
     _, project = await dependencies.require_project_member(
         request, dependencies.store, project_id
     )

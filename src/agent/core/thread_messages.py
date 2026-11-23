@@ -92,6 +92,15 @@ ANTHROPIC_CONTENT_KEY = "anthropic_content"
 #: langchain-google-genai keeps each function call's thought signature here,
 #: by tool-call id.
 _REPLAYED_KWARGS = ("__gemini_function_call_thought_signatures__",)
+#: The reasoning a Chat Completions model returned beside its answer. Kept in
+#: the envelope only for a family whose requests send it back
+#: (``replay_reasoning_content`` in the family matrix, DeepSeek): there a
+#: restored turn must carry it like the live one did, or the next request
+#: differs from the previous one at that turn (a cache miss) and the model has
+#: lost its earlier reasoning. The ``thinking`` column holds the same text for
+#: display; restore reads this copy because only the envelope names the model
+#: that produced it.
+_REASONING_KWARG = "reasoning_content"
 #: Replay Responses item ids only this long: OpenAI stores responses 30 days.
 RESPONSES_ITEM_RETENTION = timedelta(days=25)
 
@@ -112,11 +121,17 @@ def _native_provider_raw(msg: Any) -> Optional[Dict[str, Any]]:
     content = getattr(msg, "content", None)
     kwargs = getattr(msg, "additional_kwargs", None) or {}
     replayed = {k: kwargs[k] for k in _REPLAYED_KWARGS if kwargs.get(k)}
+    metadata = getattr(msg, "response_metadata", None) or {}
+    model = metadata.get("model_name") or metadata.get("model")
+    reasoning = kwargs.get(_REASONING_KWARG)
+    if isinstance(reasoning, str) and reasoning and model:
+        from shared.runtime.core.loader import replays_reasoning_content
+
+        if replays_reasoning_content(model):
+            replayed[_REASONING_KWARG] = reasoning
     if not isinstance(content, list) and not replayed:
         return None
-    metadata = getattr(msg, "response_metadata", None) or {}
     raw: Dict[str, Any] = {}
-    model = metadata.get("model_name") or metadata.get("model")
     if model:
         raw["model"] = model
     if metadata.get("model_provider"):
@@ -194,7 +209,9 @@ def native_ai_fields(provider_raw: Any, created_at: Any = None) -> Dict[str, Any
         fields["response_metadata"] = metadata
     kwargs = provider_raw.get("additional_kwargs")
     if isinstance(kwargs, dict):
-        replayed = {k: kwargs[k] for k in _REPLAYED_KWARGS if kwargs.get(k)}
+        replayed = {
+            k: kwargs[k] for k in (*_REPLAYED_KWARGS, _REASONING_KWARG) if kwargs.get(k)
+        }
         if replayed:
             fields["additional_kwargs"] = replayed
     return fields

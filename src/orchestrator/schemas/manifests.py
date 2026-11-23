@@ -2,8 +2,9 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from shared.manifests.parsing import MAX_SOURCES
 from shared.manifests.validation import MAX_SOURCE_BYTES
 
 
@@ -14,11 +15,65 @@ class ManifestScope(BaseModel):
     name: str = Field(pattern=r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", max_length=63)
 
 
-class ManifestInput(BaseModel):
+class ManifestSource(BaseModel):
+    """One named manifest text, usually one file."""
+
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    name: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[^\x00-\x1f\x7f]+$",
+        description=(
+            "What to call this source in an error, usually the file's path. "
+            "Names must differ within one request."
+        ),
+    )
     source: str = Field(min_length=1, max_length=MAX_SOURCE_BYTES)
     format: Literal["yaml", "json"] = "yaml"
+
+
+class ManifestInput(BaseModel):
+    """A manifest as one text, or as several named texts read as one bundle."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    source: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_SOURCE_BYTES,
+        description="The manifest text. Give this or `sources`, not both.",
+    )
+    format: Literal["yaml", "json"] = Field(
+        default="yaml", description="The format of `source`."
+    )
+    sources: list[ManifestSource] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_SOURCES,
+        description=(
+            "Several manifest texts as one bundle, each with its own format, "
+            "in place of `source`. Together they obey the limits of one "
+            "source. An error then carries `source`, the name of the text it "
+            "is in, and `document` counts inside that text."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def one_input(self) -> "ManifestInput":
+        if (self.source is None) == (self.sources is None):
+            raise ValueError("Give either `source` or `sources`.")
+        if self.sources is not None:
+            if "format" in self.model_fields_set:
+                raise ValueError(
+                    "`format` belongs to `source`; with `sources`, give each "
+                    "source its own format."
+                )
+            # Characters never outnumber bytes, so this refuses early what the
+            # parser would refuse by its byte count.
+            if sum(len(item.source) for item in self.sources) > MAX_SOURCE_BYTES:
+                raise ValueError("The manifest sources together exceed 1 MiB.")
+        return self
 
 
 class ManifestPreviewInput(ManifestInput):

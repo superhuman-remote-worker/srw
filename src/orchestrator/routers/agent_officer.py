@@ -37,12 +37,13 @@ async def agent_file_officer_wake(
     """File an officer session's durable sleep timer. **Internal** — requires
     ``X-Internal-Key``; ingress strips this path.
 
-    Called by the sleep tool's park path (centurion.md §4, decision
-    2026-07-29): the timer is a Postgres ``session_wake_events`` row
-    (source='timer'), so pod or node death never loses the schedule — the
-    drain fires it when due. Minutes are clamped to the thread's officer
-    bounds HERE; the tool's value is a request, not an order.
+    Called by the sleep tool's park path: the timer is a Postgres
+    ``session_wake_events`` row (source='timer'), so pod or node death never
+    loses the schedule — the drain fires it when due. Minutes are clamped to
+    the thread's officer bounds HERE; the tool's value is a request, not an
+    order.
     """
+    # Design: knowledge-base/knowledge/features/centurion.md §4 (decision 2026-07-29).
     await require_internal(request)
     return await officer_paging.agent_file_officer_wake(
         request,
@@ -58,8 +59,8 @@ async def agent_officer_notify(
     thread_id: str,
     body: OfficerNotifyRequest,
 ) -> dict[str, Any]:
-    """The officer's notify_user contract (centurion.md §6). **Internal** —
-    requires ``X-Internal-Key``; ingress strips this path.
+    """The officer's notify_user contract. **Internal** — requires
+    ``X-Internal-Key``; ingress strips this path.
 
     Three urgencies, each a feed row on the Legate's notification center
     (unified notification system):
@@ -72,6 +73,7 @@ async def agent_officer_notify(
         page budget — the platform throttles (dedup per text per day,
         preferences, quiet hours), not the agent.
     """
+    # Design: knowledge-base/knowledge/features/centurion.md §6.
     await require_internal(request)
     return await officer_paging.agent_officer_notify(
         request,

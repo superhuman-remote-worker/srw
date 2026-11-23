@@ -571,6 +571,57 @@ class TestWorkspaceFactsReadme:
         assert self.DESCRIPTION not in content
         assert self.KICKOFF not in content
 
+    def test_storage_line_only_for_a_persistent_home(self, tmp_path):
+        from agent.core.datasource_setup import PERSISTENT_HOME_FACT
+
+        kept = self._inject(self._ws(tmp_path), persistent_home=True)
+        assert f"## Storage\n\n{PERSISTENT_HOME_FACT}\n\n## Layout" in kept
+        assert "`/home/agent-host` (this workspace included)" in PERSISTENT_HOME_FACT
+        assert "`/tmp`" in PERSISTENT_HOME_FACT
+        plain = self._inject(self._ws(tmp_path / "plain"))
+        assert "## Storage" not in plain
+        assert "/home/agent-host" not in plain
+
+    def test_tool_only_files_line_only_when_the_worker_has_a_shell(self, tmp_path):
+        from agent.core.datasource_setup import TOOL_ONLY_FILES_FACT
+
+        told = self._inject(self._ws(tmp_path), tool_only_files=True)
+        assert f"## Storage\n\n{TOOL_ONLY_FILES_FACT}\n\n## Layout" in told
+        plain = self._inject(self._ws(tmp_path / "plain"))
+        assert "## Storage" not in plain
+        assert "copy_file" not in plain
+        assert "not on disk" not in plain
+
+    def test_tool_only_files_line_sits_beside_the_persistent_home_line(self, tmp_path):
+        from agent.core.datasource_setup import (
+            PERSISTENT_HOME_FACT,
+            TOOL_ONLY_FILES_FACT,
+        )
+
+        both = self._inject(
+            self._ws(tmp_path), persistent_home=True, tool_only_files=True
+        )
+        assert (
+            f"## Storage\n\n{PERSISTENT_HOME_FACT}\n\n{TOOL_ONLY_FILES_FACT}"
+            "\n\n## Layout"
+        ) in both
+        assert both.count("## Storage") == 1
+
+    def test_tool_only_files_line_names_the_three_paths_and_the_way_out(self):
+        """The overlay's refusal wording, and nothing that only a job with
+        phases has: the same line for a job with phases and for one without."""
+        from agent.core.datasource_setup import TOOL_ONLY_FILES_FACT
+
+        for path in ("`instructions.md`", "`task_brief.md`", "`tools/`"):
+            assert path in TOOL_ONLY_FILES_FACT
+        assert "generated from live state" in TOOL_ONLY_FILES_FACT
+        assert "not on disk" in TOOL_ONLY_FILES_FACT
+        assert "shell command cannot read them" in TOOL_ONLY_FILES_FACT
+        assert "`copy_file`" in TOOL_ONLY_FILES_FACT
+        assert "normal workspace path" in TOOL_ONLY_FILES_FACT
+        for phased_only in ("todo_complete", "next_phase_todos", "phase", "plan.md"):
+            assert phased_only not in TOOL_ONLY_FILES_FACT
+
     def test_project_line_omitted_when_unknown(self, tmp_path):
         content = self._inject(self._ws(tmp_path), expert="Scholar")
         assert "**Project**" not in content
@@ -1131,3 +1182,125 @@ class TestFreshWorkspaceInit:
         agent, ws = self._agent("sandbox")
         agent._initialize_fresh_workspace({})
         ws.initialize.assert_called_once_with()
+
+
+class TestWorkspaceHomeIsPersistent:
+    """The worker names the surviving paths only for a home on a persistent
+    volume (``k8s-pvc:`` binding) and only with a shell tool bound."""
+
+    @staticmethod
+    def _decide(monkeypatch, binding, tools):
+        import agent.agent as agent_module
+        import agent.tools.registry as registry
+        from agent.agent import UniversalAgent
+
+        monkeypatch.setattr(agent_module, "get_all_tool_names", lambda config: tools)
+        monkeypatch.setattr(registry, "expand_tool_wildcards", lambda names: names)
+        monkeypatch.setattr(
+            registry, "filter_tools_by_backend", lambda names, backend: names
+        )
+        metadata = {} if binding is None else {"_workspace_binding": binding}
+        fake = SimpleNamespace(
+            _job_metadata=metadata,
+            config=object(),
+            _workspace_manager=SimpleNamespace(backend=object()),
+        )
+        return UniversalAgent._workspace_home_is_persistent(fake)
+
+    @pytest.mark.parametrize(
+        ("binding", "tools", "expected"),
+        [
+            ({"backing_id": "k8s-pvc:ns:uid"}, ["run_command", "read_file"], True),
+            ({"backing_id": "k8s-pod:ns:uid"}, ["run_command", "read_file"], False),
+            (None, ["run_command", "read_file"], False),
+            ({"backing_id": "k8s-pvc:ns:uid"}, ["read_file", "write_file"], False),
+            # A code-granted member of the shell category is not a shell.
+            ({"backing_id": "k8s-pvc:ns:uid"}, ["srw_cloud_status"], False),
+            ("not-a-dict", ["run_command"], False),
+        ],
+    )
+    def test_decision(self, monkeypatch, binding, tools, expected):
+        assert self._decide(monkeypatch, binding, tools) is expected
+
+
+class TestReadmeNamesToolOnlyFiles:
+    """A worker with a shell and ``copy_file`` is told that the shell cannot
+    read its virtual instructions.md, task_brief.md and tools/; the phase tools
+    play no part (blocked_worker_cycles_phases_instead_of_stopping.md WP1)."""
+
+    @staticmethod
+    def _fake(backend=None):
+        return SimpleNamespace(
+            _job_metadata={},
+            config=object(),
+            _workspace_manager=SimpleNamespace(backend=backend or object()),
+        )
+
+    @classmethod
+    def _decide(cls, monkeypatch, tools):
+        import agent.agent as agent_module
+        import agent.tools.registry as registry
+        from agent.agent import UniversalAgent
+
+        monkeypatch.setattr(agent_module, "get_all_tool_names", lambda config: tools)
+        monkeypatch.setattr(registry, "expand_tool_wildcards", lambda names: names)
+        monkeypatch.setattr(
+            registry, "filter_tools_by_backend", lambda names, backend: names
+        )
+        return UniversalAgent._readme_names_tool_only_files(cls._fake())
+
+    @pytest.mark.parametrize(
+        ("tools", "expected"),
+        [
+            (["run_command", "read_file", "copy_file"], True),
+            # With the phase tools or without: the same decision.
+            (["run_command", "copy_file", "next_phase_todos", "todo_complete"], True),
+            (["read_file", "write_file", "copy_file"], False),
+            # The line names copy_file; without it, no line.
+            (["run_command", "read_file", "write_file"], False),
+            # A code-granted member of the shell category is not a shell.
+            (["srw_cloud_status", "copy_file"], False),
+        ],
+    )
+    def test_decision(self, monkeypatch, tools, expected):
+        assert self._decide(monkeypatch, tools) is expected
+
+    def test_a_backend_without_a_shell_gets_no_line(self, monkeypatch):
+        """The real backend filter drops the shell on a lite tier."""
+        import agent.agent as agent_module
+        from agent.agent import UniversalAgent
+
+        tools = ["run_command", "read_file", "copy_file"]
+        monkeypatch.setattr(agent_module, "get_all_tool_names", lambda config: tools)
+        lite = SimpleNamespace(supports_shell=False, supports_file_tools=True)
+        shell = SimpleNamespace(supports_shell=True, supports_file_tools=True)
+
+        assert UniversalAgent._readme_names_tool_only_files(self._fake(lite)) is False
+        assert UniversalAgent._readme_names_tool_only_files(self._fake(shell)) is True
+
+    def test_an_unreadable_tool_list_gets_no_line(self, monkeypatch):
+        import agent.agent as agent_module
+        from agent.agent import UniversalAgent
+
+        def _boom(config):
+            raise RuntimeError("no config")
+
+        monkeypatch.setattr(agent_module, "get_all_tool_names", _boom)
+        assert UniversalAgent._readme_names_tool_only_files(self._fake()) is False
+
+    @pytest.mark.parametrize("shell", [True, False])
+    def test_readme_with_and_without_a_shell_tool(self, monkeypatch, tmp_path, shell):
+        from agent.core.datasource_setup import (
+            TOOL_ONLY_FILES_FACT,
+            inject_workspace_facts,
+        )
+
+        tools = ["read_file", "write_file", "copy_file"]
+        if shell:
+            tools.append("run_command")
+        ws = WorkspaceManager(job_id="t", backend=FilesystemTestBackend(tmp_path))
+        content = inject_workspace_facts(
+            [], ws, tool_only_files=self._decide(monkeypatch, tools)
+        )
+        assert (TOOL_ONLY_FILES_FACT in content) is shell
+        assert ("## Storage" in content) is shell

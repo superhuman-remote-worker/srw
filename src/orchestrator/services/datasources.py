@@ -225,6 +225,7 @@ async def list_datasource_catalog(
     limit: int,
     cursor: str | None,
     dependencies: DatasourceDependencies,
+    managed: bool | None = None,
 ) -> dict[str, Any]:
     """Cursor-paginated connector management catalog.
 
@@ -253,6 +254,7 @@ async def list_datasource_catalog(
             visibility=visibility,
             ownership=ownership,
             availability=availability,
+            managed=managed,
             limit=limit,
             cursor=cursor,
         )
@@ -1042,11 +1044,12 @@ async def test_datasource(
 
     Attempts to connect using the stored connection details and returns
     the result. Does not modify any data. F3: creator/admin only (test
-    uses live credentials and probes the target). ``overrides`` is the
-    endpoint a connector form is editing; a driver that can test an edit
-    validates it like an update, and every other driver ignores it.
-    The credentials come from the Connector's resource secret, which the
-    owner may always use, or from the row where the resource has none yet.
+    uses live credentials and probes the target). ``overrides`` is what a
+    connector form is editing (an endpoint, an MCP server's credentials); a
+    driver that can test an edit validates it like an update, and every
+    other driver ignores it. The saved credentials come from the
+    Connector's resource secret, which the owner may always use, or from
+    the row where the resource has none yet.
     """
     try:
         user, ds = await resolve_datasource()

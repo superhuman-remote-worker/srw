@@ -33,7 +33,12 @@ router = APIRouter()
 class ThreadApproveRequest(BaseModel):
     """Body for POST /api/persistent/threads/{id}/approve/{approval_id}."""
 
-    decision: str  # "approve" or "deny"
+    decision: str  # "approve" or "deny"; a server's question also "cancel"
+    #: An MCP server's question: the answer to its form (omitted for a
+    #: yes/no, which sends the yes).
+    content: dict[str, Any] | None = None
+    #: An MCP server's yes/no: also accept its later ones in this Session.
+    always_accept: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +95,8 @@ async def thread_approve(
         approval_id,
         body.decision,
         decided_by=decided_by,
+        content=body.content,
+        always_accept=body.always_accept,
     )
     await dependencies.notification_service.resolve_source(
         "permission_request", approval_id, resolved_by=f"user:{decided_by}"

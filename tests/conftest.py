@@ -38,6 +38,13 @@ def pytest_configure(config):
 # CI and local runs don't need extra setup.
 os.environ.setdefault("LICENSE_TERMS_ACCEPTED", "true")
 
+# The MCP server's OAuth state store writes through aiofile, whose caio picks
+# io_uring when the kernel has it. Every test's event loop then opens a ring,
+# and the locked memory runs out within a run (ENOMEM). The server process
+# sets the same default (src/mcp_server/__init__.py); caio reads it once, on
+# import, which a test module can trigger before that package loads.
+os.environ.setdefault("CAIO_IMPL", "thread")
+
 # Set WORKSPACE_PATH to a temp directory for tests so that workspace files
 # (logs, checkpoints, uploads) don't get created inside the repository.
 if "WORKSPACE_PATH" not in os.environ:

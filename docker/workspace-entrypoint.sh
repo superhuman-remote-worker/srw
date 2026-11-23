@@ -244,9 +244,14 @@ else
     # Drop it from this process's environment so it is not inherited by the
     # agent's own shells further down the tree.
     unset HASHED_PASSWORD
+    # --disable-proxy: code-server would otherwise serve whatever listens on a
+    # workspace port at /proxy/<port>/ and /absproxy/<port>/. The IDE is
+    # reached through /api/ide/<id>/proxy/, so such a page would run on the
+    # origin that serves /api, with the viewer's session.
     su -s /bin/sh agent-host -c "$CODE_SERVER_PROCESS_PREFIX code-server \
         --config $CODE_SERVER_CONFIG \
         --bind-addr 0.0.0.0:38080 \
+        --disable-proxy \
         --user-data-dir /var/lib/code-server \
         --extensions-dir /var/lib/code-server/extensions \
         /home/agent-host/workspace" &

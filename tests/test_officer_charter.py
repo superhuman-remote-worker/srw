@@ -529,18 +529,35 @@ class TestCharterInjection:
         recall = MagicMock()
         recall.retrieve = AsyncMock(return_value=[MemoryRecord(content="memories")])
         ks = MagicMock()
+        ks.embedding_service.model = "test-embed"
+        ks.embedding_service.expected_dimensions = 16
         ks.get_charter_note = AsyncMock(return_value=charter)
-        ks.hybrid_search = AsyncMock(
+        ks.search_chunks = AsyncMock(
             return_value=[
                 KnowledgeRecord(
                     note_id="n1",
-                    project_id=uuid.UUID(self._PROJECT_ID),
+                    kb_id=uuid.UUID(self._PROJECT_ID),
                     title="Notes",
                     note_type="learning",
                     content="notes",
                 )
             ]
         )
+        # The officer's project knowledge base is attached: the charter and
+        # the notes are read from it, and only then.
+        tool_context = MagicMock()
+        tool_context.knowledge_bindings = [
+            KnowledgeBinding(
+                kb_id=uuid.UUID(self._PROJECT_ID),
+                alias="project",
+                name="Project Knowledge",
+                kind="native",
+                writable=True,
+            )
+        ]
+        tool_context.citation_engine = None
+        tool_context.subagent_runtime = None
+        tool_context.consume_freeze_request.return_value = None
         context_manager = AsyncMock()
         context_manager.should_summarize = MagicMock(return_value=False)
         context_manager.record_main_request = MagicMock()
@@ -588,6 +605,7 @@ class TestCharterInjection:
             recall_store=recall,
             knowledge_store=ks,
             project_id=self._PROJECT_ID,
+            tool_context=tool_context,
         )
         assert result.error is None
         assert len(captured) == 1

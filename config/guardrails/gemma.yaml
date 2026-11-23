@@ -46,7 +46,7 @@ tool_examples:
         <|tool_call>call:git_diff{}<tool_call|>                                                                 # uncommitted changes
         <|tool_call>call:git_diff{ref1:<|"|>HEAD~5<|"|>}<tool_call|>                                            # last 5 commits vs working dir
         <|tool_call>call:git_diff{ref1:<|"|>phase-1-tactical-complete<|"|>,ref2:<|"|>HEAD<|"|>}<tool_call|>     # between tag and HEAD
-        <|tool_call>call:git_diff{file_path:<|"|>plan.md<|"|>}<tool_call|>                                 # uncommitted changes in one file
+        <|tool_call>call:git_diff{file_path:<|"|>report.md<|"|>}<tool_call|>                               # uncommitted changes in one file
 
   git_status: |-
     Example output (clean):
@@ -62,7 +62,7 @@ tool_examples:
           + updated.md
 
         Modified (1):
-          M plan.md
+          M report.md
 
   git_tags: |-
     Examples:
@@ -104,7 +104,7 @@ tool_examples:
   edit_file: |-
     Examples:
         # Replace mode (default)
-        <|tool_call>call:edit_file{path:<|"|>plan.md<|"|>,old_string:<|"|>## Draft<|"|>,new_string:<|"|>## Final<|"|>}<tool_call|>
+        <|tool_call>call:edit_file{path:<|"|>report.md<|"|>,old_string:<|"|>## Draft<|"|>,new_string:<|"|>## Final<|"|>}<tool_call|>
 
         # Append mode — add to end of file
         <|tool_call>call:edit_file{path:<|"|>notes.md<|"|>,new_string:<|"|>\n## New Section<|"|>,position:<|"|>end<|"|>}<tool_call|>
@@ -114,7 +114,7 @@ tool_examples:
 
   move_file: |-
     Examples:
-        <|tool_call>call:move_file{source:<|"|>todos.yaml<|"|>,dest:<|"|>archive/todos_phase_1.yaml<|"|>}<tool_call|>     # move to subdir
+        <|tool_call>call:move_file{source:<|"|>draft.md<|"|>,dest:<|"|>archive/draft_v1.md<|"|>}<tool_call|>     # move to subdir
         <|tool_call>call:move_file{source:<|"|>draft.md<|"|>,dest:<|"|>final.md<|"|>}<tool_call|>                        # rename in place
 
   read_file: |-
@@ -226,6 +226,16 @@ nudges:
     Mark each finished task by invoking the `todo_complete` tool with its todo id. This task list is a status reminder, not a tool list — every tool bound in this request stays available. Invocations use the canonical Gemma tool-call format from your system prompt: `<|tool_call>call:fn{{...}}<tool_call|>`.
     Never type tool calls as plain text or with parens.
 
+  # The two keys above, for a job whose tools do not include `todo_complete`
+  # (see default.yaml). They carry the same wire-format reminder.
+  todo_action_job_complete: |-
+    Your last reply contained no tool call. If the task is done, call the `job_complete` tool now. If it cannot be done, call `job_complete` and say so in the summary. Otherwise continue with a tool call.
+    The Gemma tool-call format is `<|tool_call>call:fn{{key:<|"|>val<|"|>}}<tool_call|>` — use braces, never parens.
+
+  todo_list_footer_job_complete: |-
+    When the task is done, invoke the `job_complete` tool. This task list is a status reminder, not a tool list — every tool bound in this request stays available. Invocations use the canonical Gemma tool-call format from your system prompt: `<|tool_call>call:fn{{...}}<tool_call|>`.
+    Never type tool calls as plain text or with parens.
+
   read_file_required_error: |-
     Error: You must read `{file_path}` before using {tool_name}. It contains critical instructions for this operation.
     Read it first by invoking the `read_file` tool, then invoke {tool_name} again. Use the canonical Gemma tool-call format — braces only.
@@ -243,7 +253,7 @@ nudges:
   phase_transition_tactical_to_strategic: |-
     [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}. Review what was accomplished, update plan.md and record key learnings, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool. All tool invocations use the canonical Gemma brace format from your system prompt.
 
-  # Other nudges (loop_warning_suffix, tool_not_found_suffix,
-  # phase_transition_strategic_to_tactical, degenerate_recovery_*,
+  # Other nudges (loop_warning_suffix, tool_not_found_suffix and their
+  # *_job_complete variants, phase_transition_strategic_to_tactical, degenerate_recovery_*,
   # memory/knowledge headers/footers, empty_response_recovery)
   # inherit from default.yaml unchanged — they don't reference a wire format.

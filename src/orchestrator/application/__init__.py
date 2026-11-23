@@ -49,6 +49,7 @@ from orchestrator.services import (
     connector_git_swap_delivery,
     connector_service_images,
 )
+from orchestrator.services import installation
 from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.catalogue_resources import CatalogueResources
 from orchestrator.services.cloud import MainCloudRouter, build_backend
@@ -315,10 +316,22 @@ def create_app(*, settings: DeploymentSettings | None = None) -> FastAPI:
         ),
     )
 
+    # The reference is served under /api because /api is the one prefix every
+    # exposure mode routes to the orchestrator (the API host, the cockpit
+    # host with sameOriginApi, and single-origin). FastAPI's /docs default is
+    # unreachable from the cockpit host and single-origin installs.
     app = FastAPI(
-        title="Debug Cockpit API",
-        description="Backend API for the Superhuman Remote Worker Cockpit",
-        version="0.1.0",
+        title="SRW API",
+        description=(
+            "The orchestrator API behind the Cockpit. Authenticate with "
+            "`Authorization: Bearer ak_…` (a personal access token from "
+            "Settings → API Keys). Guide: "
+            "https://docs.superhuman-remote-worker.com/api/"
+        ),
+        version=installation.server_version()["release_version"],
+        docs_url="/api/docs",
+        redoc_url="/api/redoc",
+        openapi_url="/api/openapi.json",
         lifespan=lifecycle.lifespan,
         default_response_class=http.CustomJSONResponse,
     )

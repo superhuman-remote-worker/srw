@@ -54,6 +54,18 @@ connector's system only while that connector is attached. When SRW has no
 connector type for a credential, you can [build a connector
 driver](connector-drivers.md).
 
+An MCP server's tools become the agent's tools. The agent can also read a
+resource the server offers, such as a generated file one of its tools links
+to (`read_mcp_resource`), or save one into the workspace
+(`save_mcp_resource`). A server may ask a question while a call runs, such as
+"Spend 12 Buzz to run this?". Each MCP connector says what such a question
+gets on its own: **Decline**, the default, or **Accept** for yes/no
+confirmations. An admin sets the default for connectors that don't choose.
+A job and an Autonomous session apply the setting. A Read-only or Auto-accept
+session that would decline shows you the question instead, with **Always
+accept in this session**. A question that needs typed input or a link to open
+always comes to you in such a session, and is declined anywhere else.
+
 ### The runtime
 
 The runtime is everything that turns those bricks into running work: the
@@ -76,10 +88,38 @@ SRW runs work in two shapes.
   irreversible or outbound actions and shell commands; **Autonomous** never
   asks.
 - A **job** is a goal the agent works on without you: you describe it, SRW
-  queues it, an agent picks it up and works through it in phases, and you
-  review the result. Jobs are the shape for long, unattended work.
+  queues it, an agent picks it up and works through it, and you review the
+  result. Jobs are the shape for unattended work.
 
-Both use the same experts, workspaces and connectors.
+A job either plans in phases or it does not, and its expert decides. Most
+experts do not: the agent gets the task, works on it with its tools and ends.
+An expert meant for long work has **Plans in phases** on: the agent plans,
+works through todos in phases and reviews its result. Both kinds keep the
+queue, the review, the deliverable checks and the record. A job can override
+its expert through the API. A job that starts inside a live session always
+plans in phases.
+
+Both shapes use the same experts, workspaces and connectors.
+
+### The Canvas and the shared browser
+
+A session has a **Canvas** beside the chat. The agent puts things there for
+you to look at: a file from its workspace (Markdown, code, images, HTML pages,
+Office documents), and its **shared browser**.
+
+The shared browser is the browser in the session's workspace, shown live in
+the Canvas. The agent and you take turns: choose **Take control** to click and
+type yourself, **Release control** to hand it back. Because the browser runs
+inside the workspace, it reaches what the agent runs there. Ask the agent to
+build a web app and show it to you, and it starts the app, opens it in this
+browser and puts it on the Canvas for you to try, beside the chat where you
+ask for changes.
+
+The shared browser needs a session with a machine: a **Container**
+workspace, or a **VM** running on the same cluster as SRW. A session that
+starts on the default Virtual workspace asks to upgrade when the task needs
+one. Jobs have no Canvas. Operators can turn the shared browser
+off with the chart value `canvas.sharedBrowser.enabled: false`.
 
 ## Job statuses
 
@@ -100,7 +140,8 @@ decides.
 
 ## Strategic and tactical phases
 
-A job runs as one loop that alternates between two kinds of phase:
+A job in worker mode runs as one loop that alternates between two kinds of
+phase:
 
 - **Strategic phases** plan. The agent reviews where it stands, updates its
   notes and memory, and stages the todo list for the next phase. Only here can
@@ -113,7 +154,8 @@ and carries knowledge forward through workspace files, project knowledge and
 memory. This keeps long jobs inside the model's context window and gives
 review points between planning and execution. The phase number counts up from
 0, the first strategic phase. Sessions do not use phases; they run a
-continuous conversation loop.
+continuous conversation loop. A job whose expert does not plan in phases has
+none either.
 
 ## Autonomy levels
 
@@ -130,6 +172,13 @@ A job's autonomy level decides when it stops for review.
 Approving a job stopped at a phase boundary lets it continue; approving a
 finished job completes it. Administrators can limit the highest autonomy level
 each user may choose.
+
+A job without phases stops once, at its end: `partial`, `guided` and
+`dependent` then behave like `review`.
+
+A job at `full` also applies its own changes to the project's cloud folder when
+it completes, where the other levels show them to the owner as a diff first.
+[Cloud folders](cloud-folders.md#jobs) has the rules.
 
 ## Projects
 

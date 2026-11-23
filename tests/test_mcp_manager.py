@@ -20,16 +20,11 @@ from shared.connectors.builtin import MCP_STDIO_RETIRED
 HTTP_ECHO_SERVER = textwrap.dedent(
     """
     import sys
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
     port = int(sys.argv[1])
     transport = sys.argv[2]
-    mcp = FastMCP(
-        "echo",
-        host="127.0.0.1",
-        port=port,
-        log_level="ERROR",
-    )
+    mcp = MCPServer("echo", log_level="ERROR")
 
     @mcp.tool()
     def echo(text: str) -> str:
@@ -41,7 +36,7 @@ HTTP_ECHO_SERVER = textwrap.dedent(
         \"\"\"Add two integers.\"\"\"
         return a + b
 
-    mcp.run(transport=transport)
+    mcp.run(transport=transport, host="127.0.0.1", port=port)
     """
 )
 
@@ -189,6 +184,17 @@ async def test_connect_discover_call_close(tmp_path):
             await manager.aclose()
 
 
+def _server_tools_only_from(manager: MCPManager, slug: str) -> bool:
+    """Every server tool is that server's; the two resource tools, which
+    serve every server that offers resources, name only that server."""
+    tools = manager.get_langchain_tools()
+    server_tools = [t for t in tools if t.metadata["mcp_server_slug"] is not None]
+    resource_tools = [t for t in tools if t.metadata["mcp_server_slug"] is None]
+    return all(t.name.startswith(f"mcp__{slug}__") for t in server_tools) and all(
+        t.args_schema["properties"]["server"]["enum"] == [slug] for t in resource_tools
+    )
+
+
 @pytest.mark.asyncio
 async def test_unreachable_server_degrades_not_raises(tmp_path):
     broken = _http_ds(_free_port(), name="Broken")
@@ -200,10 +206,7 @@ async def test_unreachable_server_degrades_not_raises(tmp_path):
             manager.annotate_configs()
             assert broken["_mcp_status"].startswith("unavailable")
             assert good["_mcp_status"] == "connected"
-            assert all(
-                tool.name.startswith("mcp__good__")
-                for tool in manager.get_langchain_tools()
-            )
+            assert _server_tools_only_from(manager, "good")
         finally:
             await manager.aclose()
 
@@ -226,10 +229,7 @@ async def test_a_stdio_entry_is_unavailable_and_never_started(tmp_path):
             )
             assert stdio["_mcp_tools"] == []
             assert good["_mcp_status"] == "connected"
-            assert all(
-                tool.name.startswith("mcp__good__")
-                for tool in manager.get_langchain_tools()
-            )
+            assert _server_tools_only_from(manager, "good")
         finally:
             await manager.aclose()
 

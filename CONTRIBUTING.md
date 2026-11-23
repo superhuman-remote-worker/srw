@@ -46,6 +46,8 @@ npm ci
 ```
 
 CI uses Python 3.12, Node.js 22, npm, and the versions pinned by the repository.
+The `srw` command-line client under `cli/` is a Go module; it needs the Go
+version named in `cli/go.mod` and nothing from the Python environment.
 
 ## Make a change
 
@@ -82,6 +84,10 @@ cd cockpit
 npm test
 npm run i18n:check
 npm run build
+
+# srw CLI (in cli/)
+go vet ./... && go test -race ./...
+go run ./cmd/gen-docs > ../docs/cli-reference.md  # after changing a command or flag
 
 # Helm
 helm lint helm/ -f helm/ci/test-values.yaml

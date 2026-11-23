@@ -1,6 +1,6 @@
 """Provider key, endpoint and default model request contracts."""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 VALID_API_KEY_PROVIDERS = {
@@ -97,6 +97,7 @@ VALID_DEFAULT_MODEL_KINDS = {
     "search_fallback",
     "rerank",
     "live_voice",
+    "image_generation",
 }
 
 
@@ -139,3 +140,23 @@ class SubscriptionModelImport(BaseModel):
             "store the advertised maximum unchanged."
         ),
     )
+
+
+class LlmEndpointTlsPinSet(BaseModel):
+    """Request body for trusting an endpoint's presented certificate.
+
+    ``sha256`` is the fingerprint the admin reviewed, ``AB:CD:...`` (32 byte
+    pairs); it is compared, upper-cased, with what the server presents now.
+    """
+
+    sha256: str = Field(
+        ...,
+        pattern=r"^([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}$",
+        min_length=95,
+        max_length=95,
+    )
+
+    @field_validator("sha256")
+    @classmethod
+    def _upper(cls, value: str) -> str:
+        return value.upper()

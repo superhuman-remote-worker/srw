@@ -35,10 +35,19 @@ from agent.tools.registry import (
 )
 
 from orchestrator.database.postgres import JobQueryResult
+from tests._kb_context import project_kb_connector
 
 PROJECT_A = str(uuid.uuid4())
 PROJECT_B = str(uuid.uuid4())
 EXTERNAL_KB = str(uuid.uuid4())
+
+
+def _project_a_bindings():
+    """An officer's knowledge scope: its project's knowledge base, attached."""
+    return build_knowledge_bindings(
+        project_ids=[PROJECT_A], datasources=[project_kb_connector(PROJECT_A)]
+    )
+
 
 #: The reviewed grant (officer_knowledge_plane.md §3) — exactly these eleven
 #: (kb_delete added by kb_gardening G1; kb_grep added by kb_retrieval_hardening T7).
@@ -150,9 +159,7 @@ class TestOfficerBindingInvariant:
             session._enforce_officer_knowledge_invariant()
 
     def test_single_project_native_writable_passes(self):
-        session = self._officer_session(
-            [PROJECT_A], build_knowledge_bindings(project_ids=[PROJECT_A])
-        )
+        session = self._officer_session([PROJECT_A], _project_a_bindings())
         session._enforce_officer_knowledge_invariant()  # no raise
 
     def test_external_read_only_alongside_native_passes(self):
@@ -229,7 +236,13 @@ class TestBuildKnowledgeBindingsGuarantees:
     """Verify what the doc says build_knowledge_bindings already holds."""
 
     def test_first_native_is_sole_writable(self):
-        bindings = build_knowledge_bindings(project_ids=[PROJECT_A, PROJECT_B])
+        bindings = build_knowledge_bindings(
+            project_ids=[PROJECT_A, PROJECT_B],
+            datasources=[
+                project_kb_connector(PROJECT_A),
+                project_kb_connector(PROJECT_B),
+            ],
+        )
         assert [b.writable for b in bindings] == [True, False]
         assert all(b.is_native for b in bindings)
 
@@ -238,12 +251,13 @@ class TestBuildKnowledgeBindingsGuarantees:
         bindings = build_knowledge_bindings(
             project_ids=[PROJECT_A],
             datasources=[
+                project_kb_connector(PROJECT_A),
                 {
                     "type": "kb",
                     "id": EXTERNAL_KB,
                     "name": "Handbook",
                     "config": {"writable": True},
-                }
+                },
             ],
         )
         external = [b for b in bindings if not b.is_native]
@@ -686,7 +700,7 @@ class TestDegradedKnowledgeTools:
         session = _make_session(
             config=cfg,
             project_ids=[PROJECT_A],
-            knowledge_bindings=build_knowledge_bindings(project_ids=[PROJECT_A]),
+            knowledge_bindings=_project_a_bindings(),
         )
         session.workspace_manager = MagicMock()
         session.workspace_manager.backend = SimpleNamespace(**_LITE_BACKEND)
@@ -780,7 +794,7 @@ class TestOfficerSurvivesMemoryOutage:
         session = _make_session(
             config=cfg,
             project_ids=[PROJECT_A],
-            knowledge_bindings=build_knowledge_bindings(project_ids=[PROJECT_A]),
+            knowledge_bindings=_project_a_bindings(),
         )
         session.tool_context = MagicMock()
 

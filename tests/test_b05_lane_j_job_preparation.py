@@ -236,6 +236,11 @@ def _dispatch_credential_deps() -> (
             preparation_composition.dispatch_credential_dependencies,
             main.app.state.resources,
         ),
+        inject_image_credentials=bound(
+            dispatch_credentials_module.inject_image_credentials,
+            preparation_composition.dispatch_credential_dependencies,
+            main.app.state.resources,
+        ),
         inject_system_kb_embedding_profile=bound(
             dispatch_credentials_module.inject_system_kb_embedding_profile,
             preparation_composition.dispatch_credential_dependencies,
@@ -2845,10 +2850,9 @@ class TestJobStartBundle:
             "no resolvable endpoint" in bundle_env.status_writes[-1][1]["error_message"]
         )
 
-    @pytest.mark.asyncio
-    async def test_a_delivered_blob_suppresses_the_flat_override(
-        self, bundle_env, monkeypatch
-    ):
+    @staticmethod
+    def _deliver_a_resolved_blob(monkeypatch, resolved):
+        """The expert path, stubbed so the bundle carries ``resolved``."""
         monkeypatch.setattr(
             deployment_gates_module, "is_experts_db_enabled", lambda: True
         )
@@ -2883,7 +2887,7 @@ class TestJobStartBundle:
             config_resolver_module,
             "resolve_config",
             lambda **kwargs: (kwargs["capture"].__setitem__("merged_fragment", {}))
-            or {"llm": {"model": "m"}},
+            or dict(resolved),
         )
         monkeypatch.setattr(
             config_resolver_module,
@@ -2891,6 +2895,12 @@ class TestJobStartBundle:
             AsyncMock(side_effect=lambda resolved, inject: resolved),
         )
         monkeypatch.setattr(job_start_bundle, "unrouted_model_slots", lambda r: [])
+
+    @pytest.mark.asyncio
+    async def test_a_delivered_blob_suppresses_the_flat_override(
+        self, bundle_env, monkeypatch
+    ):
+        self._deliver_a_resolved_blob(monkeypatch, {"llm": {"model": "m"}})
         bundle = await job_start_bundle.build_job_start_request(
             _bundle_job(), dependencies=_start_bundle_deps()
         )
@@ -2898,6 +2908,50 @@ class TestJobStartBundle:
         assert bundle.config_override is None
         assert bundle.resolved_config == {"llm": {"model": "m"}}
         assert bundle_env.resolved_config_writes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "autonomy, access, told",
+        [
+            # Full autonomy applies the copy's changes at completion, and the
+            # brief says so instead of promising a review.
+            ("full", "reviewed_write_back", "applied"),
+            ("review", "reviewed_write_back", "reviewed"),
+            # Full autonomy lifts the review, never the level.
+            ("full", "read_only", "discarded"),
+        ],
+    )
+    async def test_a_job_is_told_what_its_autonomy_does_to_its_folder_copy(
+        self, bundle_env, monkeypatch, autonomy, access, told
+    ):
+        self._deliver_a_resolved_blob(
+            monkeypatch, {"llm": {"model": "m"}, "autonomy": autonomy}
+        )
+        admitted = "reviewed" if access == "reviewed_write_back" else "discarded"
+        job = _bundle_job(cloud_diff_baseline_commit="a" * 40)
+        job["context"].update(
+            {
+                "cloud_checkout": {"datasource_id": "c1", "access": access},
+                "cloud_connectors": [
+                    {
+                        "kind": "cloud_folder_checkout",
+                        "path": "projects/hand_book/",
+                        "folder": "Hand Book",
+                        "edits": admitted,
+                        "access": access,
+                    },
+                    {"kind": "cloud_outbox"},
+                ],
+            }
+        )
+        bundle = await job_start_bundle.build_job_start_request(
+            job, dependencies=_start_bundle_deps()
+        )
+        assert bundle is not None
+        copy, outbox = bundle.context["cloud_connectors"]
+        assert copy["edits"] == told
+        assert copy["path"] == "projects/hand_book/"
+        assert outbox == {"kind": "cloud_outbox"}
 
     @pytest.mark.asyncio
     async def test_an_unexpected_error_returns_none_rather_than_a_partial_bundle(
@@ -4346,6 +4400,13 @@ LATE_BINDING_TABLE = [
         "inject_search_credentials",
         _BOUND,
         (dispatch_credentials_module, "inject_search_credentials"),
+        _PREP.dispatch_credential_dependencies,
+    ),
+    (
+        _dispatch_credential_deps,
+        "inject_image_credentials",
+        _BOUND,
+        (dispatch_credentials_module, "inject_image_credentials"),
         _PREP.dispatch_credential_dependencies,
     ),
     (

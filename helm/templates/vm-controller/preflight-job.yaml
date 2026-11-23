@@ -46,7 +46,7 @@ metadata:
   name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   annotations:
-    srw.io/preflight: "Requires the KubeVirt and CDI CRDs; see helm/README.md#vm-workspaces-on-your-cluster"
+    srw.io/preflight: "Requires the KubeVirt and CDI CRDs; see https://github.com/superhuman-remote-worker/srw/blob/main/helm/README.md#vm-workspaces-on-your-cluster"
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: "-5"
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded

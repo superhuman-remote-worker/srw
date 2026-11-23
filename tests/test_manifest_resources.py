@@ -660,6 +660,44 @@ async def test_failed_admission_rolls_back_resource_and_operation(database, acto
 
 
 @pytest.mark.asyncio
+async def test_list_filters_by_name_and_reports_truncation(
+    database, actor, monkeypatch
+):
+    service = ManifestResourceService(database)
+    await apply(service, [expert("alpha"), expert("beta"), expert("gamma")], actor)
+
+    everything = await service.list(actor)
+    assert [r["resource"]["metadata"]["name"] for r in everything["resources"]] == [
+        "alpha",
+        "beta",
+        "gamma",
+    ]
+    assert everything["truncated"] is False
+
+    one = await service.list(actor, kind="Expert", name="beta")
+    assert [r["resource"]["metadata"]["name"] for r in one["resources"]] == ["beta"]
+    assert one["truncated"] is False
+    assert (await service.list(actor, kind="Expert", name="delta"))["resources"] == []
+    assert (await service.list(actor, kind="Job", name="beta"))["resources"] == []
+
+    # The owner's view of its own resource: the stored document, with the
+    # row facts a table needs.
+    view = one["resources"][0]
+    assert view["redacted"] is False
+    assert view["linkedId"] is None and view["managedBy"] is None
+    assert view["createdAt"] and view["updatedAt"]
+
+    monkeypatch.setattr(
+        "orchestrator.services.manifest_resources.LIST_LIMIT", 2, raising=True
+    )
+    cut = await service.list(actor)
+    assert len(cut["resources"]) == 2
+    assert cut["truncated"] is True
+    # A name narrows the list below the limit again.
+    assert (await service.list(actor, name="gamma"))["truncated"] is False
+
+
+@pytest.mark.asyncio
 async def test_delete_and_recreate_has_new_identity(database, actor):
     service = ManifestResourceService(database)
     first = (await apply(service, expert(), actor))["resources"][0]

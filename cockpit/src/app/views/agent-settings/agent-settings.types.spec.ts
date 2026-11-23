@@ -35,6 +35,20 @@ describe('autonomy level descriptions follow the freeze rule', () => {
   });
 });
 
+describe('detectModelFamily — DeepSeek', () => {
+  it.each(['', 'deepseek/', 'openrouter/deepseek/', 'deepseek-ai/'])(
+    'gives V4.1 Flash its vision family, the rest stay text-only, with prefix %s', (prefix) => {
+      expect(detectModelFamily(`${prefix}deepseek-flash`)).toBe('deepseek-v4.1-flash');
+      expect(detectModelFamily(`${prefix}DeepSeek-V4.1-Flash-1017`)).toBe('deepseek-v4.1-flash');
+      expect(detectModelFamily(`${prefix}deepseek-v4-flash-vision-exp`)).toBe('deepseek-v4.1-flash');
+      expect(detectModelFamily(`${prefix}deepseek-v4-flash`)).toBe('deepseek');
+      expect(detectModelFamily(`${prefix}deepseek-v4-pro`)).toBe('deepseek');
+      expect(detectModelFamily(`${prefix}deepseek-flashy`)).toBe('deepseek');
+      expect(detectModelFamily(`${prefix}deepseek-v4.10-flash`)).toBe('deepseek');
+    },
+  );
+});
+
 describe('detectModelFamily — Muse Spark 1.3', () => {
   it.each(['', 'meta/', 'openrouter/meta/'])(
     'recognizes standard and Contributor IDs with prefix %s', (prefix) => {

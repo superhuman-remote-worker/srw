@@ -465,6 +465,9 @@ export class AutomationsPageComponent implements OnInit {
       enabled: e.enabled,
       max_fires_per_day: e.maxFiresPerDay,
     };
+    // No config_override: the editor offers none of its keys, and a PATCH
+    // replaces the stored one whole. Left out, every key an automation was
+    // given through the API (phases among them) stays as it is.
     if (e.triggerType === 'live') {
       if (this.connectorsLoading() || this.connectorsError() || !this.selectedLiveConnectors().some((c) => c.id === e.primaryConnectorId)) {
         this.errorMessage.set(this.transloco.translate('automations.editor.liveConnectorRequired'));

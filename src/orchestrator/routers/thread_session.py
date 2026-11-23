@@ -92,10 +92,10 @@ async def get_thread(
 ) -> dict[str, Any]:
     """Get thread status and metadata (auth: owner only).
 
-    Phase 1 of cloud_collaboration_model.md §9 surfaces the thread's
-    attached mounts here so the Cockpit "Project files" panel can render
-    them without a second round-trip. ``project_ids`` is the derived
-    list-of-strings view kept stable for callers that only need scoping.
+    Surfaces the thread's attached mounts here so the Cockpit "Project files"
+    panel can render them without a second round-trip. ``project_ids`` is the
+    derived list-of-strings view kept stable for callers that only need
+    scoping.
 
     Threads created before migration 0202 have ``ssh_handle IS NULL``; mint
     one lazily here on first view rather than showing an empty SSH panel
@@ -111,6 +111,7 @@ async def get_thread(
     exhausted-retries ``RuntimeError``; either way the response degrades to
     a null handle (the panel already renders "unavailable" for that).
     """
+    # Mounts: phase 1 of knowledge-history/done/cloud_collaboration_model.md §9.
     store = dependencies.store
     user, thread = await dependencies.require_thread_owner(request, store, thread_id)
     result = redact_thread_metadata(dict(thread))

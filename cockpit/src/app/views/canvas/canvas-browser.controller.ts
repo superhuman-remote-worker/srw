@@ -1,6 +1,7 @@
 import { DestroyRef, Injectable, InjectionToken, inject, signal } from '@angular/core';
 import { CanvasState } from '../../core/models/canvas.model';
 import {
+  BROWSER_CLIENT_FEATURES,
   BrowserBaton,
   BrowserControl,
   BrowserInput,
@@ -75,6 +76,20 @@ interface LastPresentation {
 }
 
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000] as const;
+/**
+ * Longest a stream socket may stay in CONNECTING. The broker runs the
+ * workspace's `browser-exec stream_info` (which may start Chromium) before it
+ * accepts, so a healthy handshake can take seconds; one sent to an
+ * orchestrator pod that is going away can hang for minutes and never fail
+ * (WP1 k3d run, answer 8), and the backoff only runs after a close or error.
+ */
+export const BROWSER_HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/** CSS pixels. */
+export interface BrowserViewportSize {
+  readonly width: number;
+  readonly height: number;
+}
 
 /** Pane-local owner of one shared-browser socket and decoded bitmap pipeline. */
 @Injectable()
@@ -92,6 +107,14 @@ export class CanvasBrowserController {
   readonly errorMessage = signal<string | null>(null);
   /** Expected holder after a sent baton control; cleared only by authoritative STATE. */
   readonly pendingBaton = signal<BrowserBaton | null>(null);
+  /** The daemon sizes its page to `requestViewport`; false on older daemons. */
+  readonly viewportControl = signal(false);
+  /**
+   * CSS size of the page shown in `frame` (the FRAME header), set together
+   * with it: the exact space viewer input maps onto, even while a resize is
+   * on its way. Null when the daemon did not say.
+   */
+  readonly frameSize = signal<BrowserViewportSize | null>(null);
 
   private presentation: LastPresentation | null = null;
   private desired: DesiredBrowser | null = null;
@@ -101,6 +124,7 @@ export class CanvasBrowserController {
   private decodeEpoch: number | null = null;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
   private terminalIdentity: string | null = null;
   private destroyed = false;
 
@@ -165,6 +189,28 @@ export class CanvasBrowserController {
   sendInput(message: BrowserInput): boolean {
     if (this.pageState()?.baton !== 'user' || this.pendingBaton() !== null) return false;
     return this.send(encodeBrowserInput, message);
+  }
+
+  /**
+   * Ask the daemon to size its page's viewport (CSS pixels). Only while this
+   * viewer drives and the daemon advertised the capability; a size the page
+   * already has is not sent again. The daemon clamps and reports the real
+   * size in STATE.
+   */
+  requestViewport(width: number, height: number): boolean {
+    if (
+      !this.viewportControl() ||
+      !Number.isInteger(width) ||
+      !Number.isInteger(height) ||
+      width < 1 ||
+      height < 1
+    ) {
+      return false;
+    }
+    const state = this.pageState();
+    if (state?.baton !== 'user' || this.pendingBaton() !== null) return false;
+    if (state.viewport.width === width && state.viewport.height === height) return false;
+    return this.send(encodeBrowserControl, {op: 'set_viewport', width, height});
   }
 
   private evaluatePresentation(): void {
@@ -251,13 +297,23 @@ export class CanvasBrowserController {
       return;
     }
     this.socket = socket;
+    socket.onopen = () => {
+      if (this.isCurrent(epoch, socket)) this.clearHandshakeTimer();
+    };
     socket.onmessage = (event) => this.handleMessage(epoch, socket, event);
     socket.onclose = (event) => this.handleClose(epoch, socket, event);
     socket.onerror = () => this.handleSocketError(epoch, socket);
+    this.handshakeTimer = this.timeouts.set(() => {
+      this.handshakeTimer = null;
+      if (this.isCurrent(epoch, socket) && socket.readyState === 0) {
+        this.scheduleReconnect('browser_stream_handshake_timeout');
+      }
+    }, BROWSER_HANDSHAKE_TIMEOUT_MS);
   }
 
   private handleMessage(epoch: number, socket: WebSocket, event: MessageEvent<unknown>): void {
     if (!this.isCurrent(epoch, socket)) return;
+    this.clearHandshakeTimer();
     if (!(event.data instanceof ArrayBuffer)) {
       this.finishTerminal('error', 'invalid_browser_protocol');
       return;
@@ -269,7 +325,8 @@ export class CanvasBrowserController {
     }
 
     if (message.type === 'state') {
-      if (this.expectedGeneration === null) {
+      const first = this.expectedGeneration === null;
+      if (first) {
         this.expectedGeneration = message.generation;
         this.reconnectAttempt = 0;
         this.connectionStatus.set('ready');
@@ -280,7 +337,17 @@ export class CanvasBrowserController {
         return;
       }
       this.pageState.set(message.state);
+      this.viewportControl.set(message.viewportControl);
       if (this.pendingBaton() === message.state.baton) this.pendingBaton.set(null);
+      // Opt in to the STATE keys this Cockpit understands. An older daemon
+      // ignores the op, so viewportControl stays false and the pane keeps
+      // scaling the page to fit.
+      if (first) {
+        this.send(encodeBrowserControl, {
+          op: 'client_features',
+          features: [...BROWSER_CLIENT_FEATURES],
+        });
+      }
       return;
     }
 
@@ -292,14 +359,14 @@ export class CanvasBrowserController {
       ) {
         return;
       }
-      this.decodeFrame(epoch, message.jpeg);
+      this.decodeFrame(epoch, message.jpeg, frameSizeOf(message.headerWidth, message.headerHeight));
       return;
     }
 
     this.handleServerError(message.code, message.message);
   }
 
-  private decodeFrame(epoch: number, jpeg: Uint8Array): void {
+  private decodeFrame(epoch: number, jpeg: Uint8Array, size: BrowserViewportSize | null): void {
     this.decodeEpoch = epoch;
     let decoded: Promise<ImageBitmap>;
     try {
@@ -318,6 +385,7 @@ export class CanvasBrowserController {
           return;
         }
         const previous = this.frame();
+        this.frameSize.set(sameSize(this.frameSize(), size) ? this.frameSize() : size);
         this.frame.set(bitmap);
         if (previous && previous !== bitmap) closeBitmap(previous);
         if (this.errorCode() === 'browser_frame_decode_failed') this.errorCode.set(null);
@@ -406,6 +474,7 @@ export class CanvasBrowserController {
     this.errorCode.set(code);
     this.errorMessage.set(null);
     this.pendingBaton.set(null);
+    this.viewportControl.set(false);
     this.connectionStatus.set('reconnecting');
     const desiredIdentity = this.desired.identity;
     const delay =
@@ -438,6 +507,7 @@ export class CanvasBrowserController {
     this.errorCode.set(code);
     this.errorMessage.set(message);
     this.pendingBaton.set(null);
+    this.viewportControl.set(false);
     this.terminalIdentity = identity;
   }
 
@@ -449,6 +519,7 @@ export class CanvasBrowserController {
     this.expectedGeneration = null;
     this.decodeEpoch = null;
     this.pendingBaton.set(null);
+    this.viewportControl.set(false);
     this.connectionStatus.set(status);
     if (status === 'idle') {
       this.errorCode.set(null);
@@ -460,7 +531,9 @@ export class CanvasBrowserController {
     const socket = this.socket;
     this.socket = null;
     this.epoch += 1;
+    this.clearHandshakeTimer();
     if (!socket) return;
+    socket.onopen = null;
     socket.onmessage = null;
     socket.onclose = null;
     socket.onerror = null;
@@ -478,9 +551,15 @@ export class CanvasBrowserController {
     this.reconnectTimer = null;
   }
 
+  private clearHandshakeTimer(): void {
+    if (this.handshakeTimer !== null) this.timeouts.clear(this.handshakeTimer);
+    this.handshakeTimer = null;
+  }
+
   private clearFrame(): void {
     const current = this.frame();
     this.frame.set(null);
+    this.frameSize.set(null);
     if (current) closeBitmap(current);
   }
 
@@ -510,6 +589,16 @@ export class CanvasBrowserController {
       return false;
     }
   }
+}
+
+function frameSizeOf(width: number | null, height: number | null): BrowserViewportSize | null {
+  if (width === null || height === null) return null;
+  const size = {width: Math.round(width), height: Math.round(height)};
+  return size.width >= 1 && size.height >= 1 ? size : null;
+}
+
+function sameSize(a: BrowserViewportSize | null, b: BrowserViewportSize | null): boolean {
+  return a === b || (!!a && !!b && a.width === b.width && a.height === b.height);
 }
 
 function closeBitmap(bitmap: ImageBitmap): void {

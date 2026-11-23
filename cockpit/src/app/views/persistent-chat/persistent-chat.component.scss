@@ -215,16 +215,6 @@
         display: block;
         padding: 0;
       }
-      .settings-row {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-      }
-      .settings-label {
-        font-size: 11px;
-        color: var(--text-muted);
-        white-space: nowrap;
-      }
       .settings-slider {
         width: 100px;
         accent-color: var(--accent-color);
@@ -1309,6 +1299,22 @@
         color: var(--text-muted);
       }
 
+      /* An MCP server's settled question, one muted line under its call's card. */
+      .question-trail {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin: 2px 0 4px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .question-trail-icon { flex-shrink: 0; }
+
+      .question-trail[data-outcome='declined'] .question-trail-icon { color: var(--danger); }
+
+      .question-trail[data-outcome='accepted'] .question-trail-icon { color: var(--success); }
+
       .approval-badge {
         display: inline-flex;
         align-items: center;
@@ -1771,49 +1777,57 @@
         border-radius: var(--radius-tag);
       }
 
-      /* Transient "Transcribing…" hint shown while STT runs after a recording.
-         The spinner reuses the existing .action-spinner-sm (currentColor). */
-      .transcribing-hint {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 8px 12px;
-        margin: 8px 10px 0;
-        background: var(--info-tint);
-        color: var(--info);
-        font-size: 12px;
-        border-radius: var(--radius-tag);
-      }
-
-      /* Recording strip — replaces the textarea while recording. */
+      /* Dictation strip: replaces the text box and the controls row while
+         recording or transcribing. ✕ | waveform | time | ✓, with ✓ in Send's
+         slot. The canvas MUST be allowed to shrink (min-width: 0): a fixed
+         intrinsic width once pushed the time and ✓ off a phone screen. */
       .recording-strip {
         display: flex;
         align-items: center;
-        gap: 12px;
-        padding: 10px 12px;
+        gap: 10px;
+        padding: 10px 10px 10px 12px;
         min-height: 64px;
       }
 
       .recording-canvas {
-        flex: 1;
-        height: 56px;
-        border-radius: var(--radius-tag);
-        background: transparent;
+        flex: 1 1 0;
+        min-width: 0;
+        width: 100%;
+        height: 40px;
+        display: block;
+        color: var(--accent-color);
+        transition: opacity 0.2s ease, filter 0.2s ease;
       }
 
-      .recording-time {
+      /* Frozen and dimmed while transcribing: "working", not "listening". */
+      .recording-strip.transcribing .recording-canvas {
+        opacity: 0.35;
+        filter: saturate(0.4);
+      }
+
+      .recording-time,
+      .recording-status {
+        flex-shrink: 0;
         display: inline-flex;
         align-items: center;
         gap: 6px;
         font-variant-numeric: tabular-nums;
         font-size: 13px;
         color: var(--text-primary);
-        min-width: 50px;
+      }
+
+      .recording-time {
+        min-width: 52px;
+      }
+
+      .recording-status {
+        color: var(--text-secondary);
       }
 
       .recording-time.near-cap { color: var(--warning); }
 
       .recording-cap-warning {
+        padding: 0 14px 8px;
         font-size: 12px;
         color: var(--warning);
       }
@@ -1832,16 +1846,18 @@
       }
 
       .recording-btn {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
+        flex-shrink: 0;
+        display: grid;
+        place-items: center;
         width: 32px;
         height: 32px;
+        padding: 0;
         background: transparent;
         border: 1px solid var(--border-color, var(--surface-0));
         border-radius: 50%;
         color: var(--text-muted);
         cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
       }
 
       .recording-btn.cancel:hover {
@@ -1853,6 +1869,51 @@
         background: var(--accent-color);
         color: var(--on-accent, var(--timeline-bg));
         border-color: transparent;
+      }
+
+      .recording-btn.confirm:not(:disabled):hover {
+        background: var(--accent-hover, var(--accent-color));
+      }
+
+      .recording-btn.confirm:disabled {
+        cursor: wait;
+        opacity: 0.85;
+      }
+
+      .recording-btn.confirm .action-spinner {
+        border-color: var(--on-accent, var(--timeline-bg));
+        border-top-color: transparent;
+      }
+
+      /* Dictate: a quiet round icon button left of Send, present in every
+         composer state (dictation_composer_redesign.md D2). */
+      .dictate {
+        width: 30px;
+        height: 30px;
+        display: grid;
+        place-items: center;
+        flex-shrink: 0;
+        padding: 0;
+        background: transparent;
+        border: 0;
+        border-radius: 50%;
+        color: var(--text-muted);
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease;
+      }
+
+      .dictate:hover:not(:disabled) {
+        background: var(--hover, color-mix(in srgb, var(--text-primary) 8%, transparent));
+        color: var(--text-primary);
+      }
+
+      .dictate:disabled {
+        cursor: not-allowed;
+        opacity: 0.45;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .recording-dot { animation: none; }
       }
 
       /* Attach menu */
@@ -2341,7 +2402,18 @@
           padding: 0;
         }
 
-        .send {
+        .send,
+        .dictate {
+          width: 44px;
+          height: 44px;
+        }
+
+        .recording-strip {
+          gap: 8px;
+          padding: 8px;
+        }
+
+        .recording-btn {
           width: 44px;
           height: 44px;
         }

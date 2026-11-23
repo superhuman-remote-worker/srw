@@ -17,7 +17,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.managers.todo import TodoManager
-from agent.tools.core.job import _final_phase_data, create_job_tools
+from agent.tools.core.job import (
+    _final_phase_data,
+    create_job_tools,
+    seed_final_phase_data,
+)
 from agent.tools.core.todo import close_last_pending_todo
 from tests._tool_invoke import invoke_tool
 
@@ -109,6 +113,76 @@ class TestJobCompleteClosesItsTodo:
             "Phase marked as final. No remaining todos - job will complete now."
         )
         context.progress_committer.on_todo_complete.assert_not_called()
+
+
+class TestRepeatedJobCompleteClosesTheLastTodo:
+    """A decision already recorded and one todo still pending: a restart
+    between the decision's journal write and the next checkpoint leaves a job
+    in exactly that state (the decision is re-seeded from the journal, the
+    todo list comes from the older checkpoint). The repeated call closes the
+    todo as the first call would have; without that, a job that has no
+    ``todo_complete`` could never end."""
+
+    @staticmethod
+    def _recorded_decision() -> None:
+        seed_final_phase_data(
+            JOB_ID,
+            {
+                "summary": "Done.",
+                "deliverables": [],
+                "confidence": 0.9,
+                "job_id": JOB_ID,
+                "tool_call_id": "call_first",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_one_pending_todo_is_closed(self):
+        mgr = _manager("CLOSE OR CONTINUE")
+        context = _context(mgr)
+        self._recorded_decision()
+
+        result = await _job_complete(context)
+
+        assert result == (
+            "Phase is already marked as final. Completed the last todo "
+            "(CLOSE OR CONTINUE) - job will complete now."
+        )
+        assert mgr.all_complete()
+        assert mgr.list_all()[0].notes == ["Marked the job final with job_complete."]
+        context.progress_committer.on_todo_complete.assert_called_once_with(
+            "todo_1", "CLOSE OR CONTINUE"
+        )
+        # The recorded decision is the one that stands.
+        assert _final_phase_data[JOB_ID]["tool_call_id"] == "call_first"
+
+    @pytest.mark.asyncio
+    async def test_more_work_left_keeps_the_original_answer(self):
+        mgr = _manager("VERIFY THE RESULT", "CLOSE OR CONTINUE")
+        context = _context(mgr)
+        self._recorded_decision()
+
+        result = await _job_complete(context)
+
+        assert result == (
+            "Phase is already marked as final. Complete your remaining todos\n"
+            "to finish the job."
+        )
+        assert len(mgr.list_pending()) == 2
+        context.progress_committer.on_todo_complete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_job_without_todo_complete_is_told_it_ends(self):
+        mgr = _manager("Do the task in the brief.")
+        context = _context(mgr)
+        context._resolved_tool_names = ["job_complete", "write_file"]
+        self._recorded_decision()
+
+        result = await _job_complete(context)
+
+        assert result == "The job is already marked as complete. It ends now."
+        assert mgr.all_complete()
+        assert "todo_complete" not in result
 
 
 class TestCloseLastPendingTodo:

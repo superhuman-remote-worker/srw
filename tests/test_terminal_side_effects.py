@@ -1004,6 +1004,189 @@ class TestLoopCloudCompletion:
         advance.assert_not_awaited()
 
 
+class TestFullAutonomyFolderDelivery:
+    """A job that runs at full autonomy applies its own project-folder
+    changes at completion (owner's decision, 2026-11-16). Only a
+    conflict-free diff is applied; anything else waits for review exactly as
+    before, captured so the owner finds the same diff and the same accept."""
+
+    PROJECT = {
+        "id": PROJECT_ID,
+        "name": "Cloud Project",
+        "main_cloud_backend": "nextcloud",
+        "main_cloud_folder_handle": "opaque",
+    }
+    APPLIED = {
+        "delivery_status": "cloud-applied",
+        "needs_review": False,
+        "delivery_sha": "b" * 40,
+        "notes": [],
+        "applied": 1,
+        "deleted": 0,
+    }
+    CONFLICT = {
+        "delivery_status": "cloud-conflict",
+        "needs_review": True,
+        "delivery_sha": "b" * 40,
+        "notes": ["cloud changed since baseline: report.md"],
+    }
+
+    def _job(self, *, autonomy="full", access="reviewed_write_back", **over):
+        row = {
+            "status": "processing",
+            "repo_name": "job-abcdef12",
+            "branch_name": None,
+            "cloud_diff_baseline_commit": "a" * 40,
+            "resolved_config": {"autonomy": autonomy},
+            "freeze_data": {"status": "job_completed", "summary": "Done."},
+            "context": {
+                "cloud_checkout": {"datasource_id": "c1", "access": access},
+                "cloud_baseline": {"state": "ready", "entries": {}},
+            },
+        }
+        row.update(over)
+        return _job(**row)
+
+    async def _complete(self, job, *, delivery, capture=None):
+        db = _FakeDB(job, project=self.PROJECT)
+        body = job_runtime_module.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data=job["freeze_data"],
+        )
+        with ExitStack() as stack:
+            _patch_complete(stack, job, _make_gitea(), db)
+            deliver = stack.enter_context(
+                patch(
+                    "orchestrator.services.job_cloud_baseline.deliver_loop_diff_to_cloud",
+                    AsyncMock(return_value=delivery),
+                )
+            )
+            captured = stack.enter_context(
+                patch(
+                    "orchestrator.services.job_cloud_baseline.capture_checkout_diff",
+                    AsyncMock(
+                        return_value=capture or {"state": "captured", "files": 1}
+                    ),
+                )
+            )
+            handled = await b08_helpers.complete_job(MagicMock(), str(JOB_ID), body)
+        return handled, deliver, captured, db
+
+    @pytest.mark.asyncio
+    async def test_a_clean_diff_is_applied_and_the_job_completes(self) -> None:
+        job = self._job()
+        handled, deliver, captured, _db = await self._complete(
+            job, delivery=self.APPLIED
+        )
+
+        assert handled["new_status"] == "completed"
+        assert job["status"] == "completed"
+        assert job["merge_status"] == "cloud-applied"
+        assert job["context"]["loop_cloud_delivery"] == self.APPLIED
+        assert "project folder delivery -> cloud-applied" in handled["actions"]
+        deliver.assert_awaited_once()
+        # Nothing is left to review, so nothing is captured for one.
+        captured.assert_not_awaited()
+        assert not job.get("error_message")
+
+    @pytest.mark.asyncio
+    async def test_a_job_that_changed_nothing_completes_without_a_write(self) -> None:
+        job = self._job()
+        handled, deliver, captured, _db = await self._complete(
+            job,
+            delivery={
+                "delivery_status": "no-changes",
+                "needs_review": False,
+                "delivery_sha": "b" * 40,
+                "notes": [],
+                "applied": 0,
+                "deleted": 0,
+            },
+        )
+
+        assert handled["new_status"] == "completed"
+        assert job["merge_status"] == "no-changes"
+        deliver.assert_awaited_once()
+        captured.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_conflict_waits_for_review_and_is_captured_like_any_diff(
+        self,
+    ) -> None:
+        job = self._job()
+        handled, deliver, captured, _db = await self._complete(
+            job, delivery=self.CONFLICT
+        )
+
+        assert handled["new_status"] == "pending_review"
+        assert job["status"] == "pending_review"
+        assert job["merge_status"] == "cloud-conflict"
+        assert (
+            "project folder delivery cloud-conflict -> pending_review"
+            in handled["actions"]
+        )
+        deliver.assert_awaited_once()
+        # The owner finds the diff where every reviewed job's diff is.
+        captured.assert_awaited_once()
+        # Nobody watches a full-autonomy job: its row says why it waits.
+        assert "not applied (cloud-conflict)" in job["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_a_delivery_that_raises_waits_for_review(self) -> None:
+        job = self._job()
+        db = _FakeDB(job, project=self.PROJECT)
+        body = job_runtime_module.JobCompleteRequest(
+            should_stop=True, goal_achieved=True, freeze_data=job["freeze_data"]
+        )
+        with ExitStack() as stack:
+            _patch_complete(stack, job, _make_gitea(), db)
+            stack.enter_context(
+                patch(
+                    "orchestrator.services.job_cloud_baseline.deliver_loop_diff_to_cloud",
+                    AsyncMock(side_effect=RuntimeError("cloud is down")),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "orchestrator.services.job_cloud_baseline.capture_checkout_diff",
+                    AsyncMock(return_value={"state": "captured", "files": 1}),
+                )
+            )
+            handled = await b08_helpers.complete_job(MagicMock(), str(JOB_ID), body)
+
+        assert handled["new_status"] == "pending_review"
+        assert job["merge_status"] == "cloud-unavailable"
+        assert "project folder delivery failed -> pending_review" in handled["actions"]
+
+    @pytest.mark.asyncio
+    async def test_a_job_below_full_autonomy_still_waits_for_its_owner(self) -> None:
+        job = self._job(
+            autonomy="review",
+            freeze_data={"freeze_type": "job_complete", "notes": "Done."},
+        )
+        handled, deliver, captured, _db = await self._complete(
+            job, delivery=self.APPLIED
+        )
+
+        assert handled["new_status"] == "pending_review"
+        deliver.assert_not_awaited()
+        captured.assert_awaited_once()
+        assert job["merge_status"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_read_only_copy_is_never_written_back(self) -> None:
+        job = self._job(access="read_only")
+        handled, deliver, captured, _db = await self._complete(
+            job, delivery=self.APPLIED
+        )
+
+        assert handled["new_status"] == "completed"
+        deliver.assert_not_awaited()
+        captured.assert_not_awaited()
+        assert job["merge_status"] is None
+
+
 class TestBothPathsAgree:
     @pytest.mark.asyncio
     async def test_approve_and_complete_produce_the_same_effects(

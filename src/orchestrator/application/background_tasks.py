@@ -39,6 +39,7 @@ from orchestrator.services import (
     container_provisioner as container_provisioner_module,
     cron_dispatcher,
     default_project_knowledge,
+    dispatch_watchdog,
     ide_session,
     ide_settings,
     imap_poller as imap_poller_module,
@@ -102,6 +103,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "token_cleanup",
     "session_cleanup",
     "dispatcher",
+    "dispatch_watchdog",
     "vm_readiness",
     "vm_creation_retry",
     "vm_workspace_recovery",
@@ -113,6 +115,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "completion_finalizer",
     "completion_sweep_router",
     "completion_monitor",
+    "chat_pool_stall_watch",
     "security_events_prune",
     "ssh_attachments_prune",
     "connector_lease_sweeper",
@@ -316,6 +319,20 @@ async def start_background_tasks(
             dependencies=jobs_composition.job_dispatch_dependencies(resources),
         ),
     )
+    # Reads the dispatcher's pass timestamps on the same replica: an ERROR when
+    # passes stop, and the replica ends itself when the deployment asks for it.
+    tasks.start_leader_gated(
+        "dispatch_watchdog",
+        functools.partial(
+            dispatch_watchdog.dispatch_stall_watchdog,
+            state=resources.job_dispatch_state,
+            may_schedule=job_dispatcher.may_schedule,
+            interval=job_dispatcher.DISPATCH_INTERVAL_SECONDS,
+            alarm_seconds=resources.settings.dispatch_stall_alarm_seconds,
+            restart_seconds=resources.settings.dispatch_stall_restart_seconds,
+            preflight_timeout=(resources.settings.dispatch_preflight_timeout_seconds),
+        ),
+    )
     if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster":
         tasks.start_leader_gated(
             "vm_readiness",
@@ -418,6 +435,17 @@ async def start_background_tasks(
         "completion_monitor",
         resources.completion_runtime.monitor().run(resources.shutdown_event),
         name="completion-monitor",
+    )
+    # Every replica ticks; the notification dedup key keeps it to one row per
+    # admin per incident.
+    from orchestrator.services.chat_pool_stall import ChatPoolStallWatch
+
+    tasks.start(
+        "chat_pool_stall_watch",
+        ChatPoolStallWatch(
+            resources.postgres_db, notification_service_module.notification_service
+        ).run(resources.shutdown_event),
+        name="chat-pool-stall-watch",
     )
     from shared.cloud_push_tasks import enabled as cloud_push_recovery_enabled
 

@@ -90,6 +90,49 @@ describe('AdminCatalogComponent search/fetch form', () => {
     expect(c.formCapabilities()).toEqual(['chat']);
   });
 
+  it('offers image generation alone with an adapter and writes provider and ops', () => {
+    const fixture = TestBed.createComponent(AdminCatalogComponent);
+    const c = fixture.componentInstance;
+    c.toggleFormCapability('chat', true);
+    c.toggleFormCapability('image_generation', true);
+    expect(c.formCapabilities()).toEqual(['image_generation']);
+    c.formProviderKey.set('system:google');
+    c.formModelId.set('gemini-nano-banana-2.1');
+    c.formDisplayLabel.set('Nano Banana 2.1');
+    c.formFamily.set('');
+    c.formImageAdapter.set('gemini');
+    fixture.detectChanges();
+    expect(fixture.nativeElement.querySelector('.chat-model-config')).toBeNull();
+    expect(fixture.nativeElement.querySelector('.image-generation-config')).not.toBeNull();
+    const adapters = Array.from(
+      (fixture.nativeElement as HTMLElement).querySelectorAll<HTMLOptionElement>(
+        '.image-generation-config app-select option',
+      ),
+    ).map((option) => option.value);
+    expect(adapters).toEqual(['openai-images', 'gemini']);
+    expect(c.canSubmit()).toBe(true);
+    c.submit();
+    expect(createModel).toHaveBeenCalledWith(expect.objectContaining({
+      capabilities: ['image_generation'],
+      family: 'default',
+      context_window: null,
+      params_json: {provider: 'gemini', ops: ['generate', 'edit']},
+    }));
+    c.toggleFormCapability('vision', true);
+    expect(c.formCapabilities()).toEqual(['vision']);
+  });
+
+  it('rejects mixed image generation capabilities with their own message', () => {
+    const c = TestBed.createComponent(AdminCatalogComponent).componentInstance;
+    c.formProviderKey.set('system:openai');
+    c.formModelId.set('gpt-image-2');
+    c.formCapabilities.set(['image_generation', 'chat']);
+    expect(c.canSubmit()).toBe(false);
+    c.submit();
+    expect(createModel).not.toHaveBeenCalled();
+    expect(c.formError()).toBe(en.admin.catalog.imageGeneration.onlyCapability);
+  });
+
   it('submits without a display label and uses the model ID instead', () => {
     const fixture = TestBed.createComponent(AdminCatalogComponent);
     const c = fixture.componentInstance;

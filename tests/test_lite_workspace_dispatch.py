@@ -454,7 +454,7 @@ class TestObjectStoreStartupWarning:
         assert "LiteWorkspaceConfigError" in msg  # virtual bullet
         assert "snapshots" in msg.lower()  # snapshot bullet
         assert "garage.enabled=true" in msg
-        assert "knowledge-history/done/s3_object_store_bundled_fallback.md" in msg
+        assert "knowledge-" not in msg  # no pointer into the private vault
 
     def test_warns_about_virtual_when_only_snapshots_configured(self):
         # S3_ENDPOINT set (snapshots OK) but the virtual tier is unconfigured —

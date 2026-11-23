@@ -18,14 +18,27 @@ reader is ``src/orchestrator/database/audit_store.py`` (PR 3); the schema is
 ``migrations/audit/0001_initial.sql``.
 
 Error contract:
-- One-shot connect gate: the first failure to stand up the loop/pool (5 s
-  timeout) **permanently disables** writing for the process — mirrors the
-  archiver's old ``_connection_attempted`` latch.
-- Every facade method swallows all exceptions → ``logger.warning`` (including the
-  SQLSTATE so ``23514`` = missing partition is greppable) → ``None``/``False``.
-- The writer is never closed in production (daemon thread dies with the process;
-  every call blocks, so no writes can be pending at exit). ``close()`` exists for
-  tests only.
+- The store being unreachable never disables the writer. A failed connect or
+  write marks the store down and the next try waits out a backoff (1 s doubling
+  to 30 s); between tries nothing touches the network, so a down store costs a
+  caller no time.
+- A row that could not be written is kept in a bounded in-memory spool and
+  written, in order, once the store answers again. A caller whose row was
+  spooled gets a placeholder id (negative), which later rows may reference
+  (``request_id``, ``pre_id``); the writer maps it to the real id on replay.
+  A replayed row carries ``audit_replayed: true`` (``metrics`` or ``payload``):
+  if the first try reached the server before the connection dropped, the row
+  exists twice with the same ``timestamp``.
+- A row is dropped, never retried, when the server rejects its content
+  (SQLSTATE class 22/23/42, except ``23514`` = no partition for its month,
+  which creating the partition fixes) or when the spool is full.
+- Nothing raises: every facade method logs a warning (with the SQLSTATE) and
+  returns ``None``/``False``. What was written, replayed, dropped or is still
+  spooled is counted per job (:meth:`SyncAuditWriter.job_stats`), so the
+  archiver can leave a receipt that says whether a job's record is complete.
+- The spool lives in this process. ``flush()`` drains it before a job ends;
+  rows still spooled when the process exits are lost, and the missing receipt
+  says so.
 """
 
 from __future__ import annotations
@@ -36,9 +49,12 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
+from collections import OrderedDict, deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Deque, Dict, Optional, Tuple
 from urllib.parse import quote
 
 import asyncpg
@@ -47,12 +63,50 @@ from shared.runtime_actor import audit_metadata_payload, redact_audit_payload_me
 
 logger = logging.getLogger(__name__)
 
-# Pool/loop startup must not hang the first write indefinitely; a bounded
-# one-shot connect budget.
+# Pool/loop startup must not hang a write indefinitely; a bounded connect budget.
 _CONNECT_TIMEOUT_S = 5.0
 # Per-write budget. Generous vs a single-row INSERT but bounded so a wedged
 # backend can't pin a caller forever (it blocks the event loop on the hot path).
 _WRITE_TIMEOUT_S = 15.0
+# After a failure the store is left alone for this long, doubling per failure.
+_RECONNECT_BASE_S = 1.0
+_RECONNECT_MAX_S = 30.0
+# What one write may spend on older, spooled rows before its own.
+_DRAIN_BUDGET_S = 2.0
+# Spool bounds. A model-call row is the request it archives (100 KB and more),
+# so the byte bound is the one that binds; past either, new rows are dropped.
+_SPOOL_MAX_ROWS = 5000
+_SPOOL_MAX_BYTES = 256 * 1024 * 1024
+# Placeholder ids remembered for rows that reference them later.
+_RESOLVED_MAX = 20000
+
+
+def _spool_limits() -> Tuple[int, int]:
+    """Spool bounds, overridable per deployment (rows, megabytes)."""
+
+    def _int(name: str, default: int) -> int:
+        try:
+            value = int(os.getenv(name, "") or default)
+        except ValueError:
+            return default
+        return value if value > 0 else default
+
+    return (
+        _int("AUDIT_SPOOL_MAX_ROWS", _SPOOL_MAX_ROWS),
+        _int("AUDIT_SPOOL_MAX_MB", _SPOOL_MAX_BYTES // (1024 * 1024)) * 1024 * 1024,
+    )
+
+
+def _synchronous_commit() -> str:
+    """``synchronous_commit`` for the writer's sessions.
+
+    ``off`` (default) acknowledges a row before it is on disk: a database
+    crash can lose the last ~600 ms of acknowledged rows, and the writer never
+    learns of it. ``AUDIT_SYNCHRONOUS_COMMIT=on`` waits for the flush, for a
+    record that must not lose a row it reported as written.
+    """
+    value = os.getenv("AUDIT_SYNCHRONOUS_COMMIT", "").strip().lower()
+    return value if value in ("on", "off", "local", "remote_write") else "off"
 
 
 def _build_audit_dsn() -> Optional[str]:
@@ -169,6 +223,49 @@ def _fmt_pg_error(exc: Exception) -> str:
     )
 
 
+def _is_content_error(exc: BaseException) -> bool:
+    """Whether the server (or the encoder) rejected the row itself.
+
+    The same row would fail the same way, so it is dropped. Everything else is
+    the store being unreachable, restarting or overloaded, and the row waits.
+    ``23514`` is a row with no partition for its month: the orchestrator's
+    partition maintenance creates it, so that one waits too.
+    """
+    sqlstate = getattr(exc, "sqlstate", None) or ""
+    if sqlstate == "23514":
+        return False
+    if sqlstate[:2] in ("22", "23", "42"):
+        return True
+    # asyncpg's client-side DataError (a value it cannot encode) is a ValueError.
+    return isinstance(exc, (ValueError, TypeError, KeyError))
+
+
+def _approx_size(value: Any) -> int:
+    """A cheap size for the spool's byte bound (not a serialized length)."""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, dict):
+        return 64 + sum(_approx_size(k) + _approx_size(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return 64 + sum(_approx_size(v) for v in value)
+    return 16
+
+
+@dataclass
+class _Pending:
+    """One write: live, or waiting in the spool for the store to come back."""
+
+    kind: str  # "llm" | "pre" | "post" | "chat"
+    job_id: Optional[str]
+    args: Dict[str, Any]
+    local_id: Optional[int] = None  # placeholder handed to the caller
+    size: int = 0
+
+
+def _new_counts() -> Dict[str, int]:
+    return {"written": 0, "replayed": 0, "dropped": 0}
+
+
 class SyncAuditWriter:
     """Blocking, thread-safe writer backed by a private loop + asyncpg pool."""
 
@@ -177,8 +274,25 @@ class SyncAuditWriter:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._pool: Optional[asyncpg.Pool] = None
-        self._disabled = False  # one-shot connect gate
-        self._lock = threading.Lock()
+        # One writer at a time: rows reach the store in the order they were
+        # made, and the spool and its counters need no finer locking.
+        self._lock = threading.RLock()
+        # Down state: no network before ``_retry_at`` (monotonic seconds).
+        self._retry_at = 0.0
+        self._backoff = _RECONNECT_BASE_S
+        self._down_since: Optional[datetime] = None
+        self._last_error: Optional[str] = None
+        # Rows waiting for the store, oldest first.
+        self._spool: Deque[_Pending] = deque()
+        self._spool_bytes = 0
+        self._spool_max_rows, self._spool_max_bytes = _spool_limits()
+        self._next_local_id = -1
+        # placeholder id -> real id (None: the row was dropped).
+        self._resolved: "OrderedDict[int, Optional[int]]" = OrderedDict()
+        # pre row id (real or placeholder) -> job, for counting post rows.
+        self._pre_jobs: "OrderedDict[int, Optional[str]]" = OrderedDict()
+        self._counts: Dict[str, Dict[str, Dict[str, int]]] = {}
+        self._outages: Dict[str, int] = {}
 
     @classmethod
     def from_env(cls) -> Optional["SyncAuditWriter"]:
@@ -208,48 +322,76 @@ class SyncAuditWriter:
             min_size=1,
             max_size=2,
             command_timeout=10,
+            timeout=_CONNECT_TIMEOUT_S,
             statement_cache_size=0,  # PgBouncer-transaction-mode safe
             server_settings={
                 "application_name": "srw-audit-write",
-                "synchronous_commit": "off",  # ≤~600ms loss window, no corruption
+                "synchronous_commit": _synchronous_commit(),
             },
             init=_init_connection,
         )
 
-    def _ensure_started(self) -> bool:
-        """One-shot: start the loop+pool. First failure disables for the process."""
+    def _mark_down(self, exc: BaseException) -> None:
+        """Leave the store alone for a backoff; say so once per outage."""
+        self._last_error = _fmt_pg_error(exc)
+        if self._down_since is None:
+            self._down_since = datetime.now(timezone.utc)
+            logger.warning(
+                "Audit store unreachable (%s) — rows are kept and written when "
+                "it answers again",
+                self._last_error,
+            )
+        self._retry_at = time.monotonic() + self._backoff
+        self._backoff = min(self._backoff * 2, _RECONNECT_MAX_S)
+
+    def _mark_up(self) -> None:
+        if self._down_since is not None:
+            down_for = (datetime.now(timezone.utc) - self._down_since).total_seconds()
+            logger.info(
+                "Audit store reachable again after %.0fs; %d row(s) to replay",
+                down_for,
+                len(self._spool),
+            )
+        self._down_since = None
+        self._retry_at = 0.0
+        self._backoff = _RECONNECT_BASE_S
+
+    def _connect_locked(self) -> bool:
+        """Have a pool, or try for one unless a backoff is running."""
+        if time.monotonic() < self._retry_at:
+            return False
         if self._pool is not None:
             return True
-        if self._disabled:
-            return False
-        with self._lock:
-            if self._pool is not None:
-                return True
-            if self._disabled:
-                return False
-            try:
+        try:
+            if self._loop is None:
                 self._loop = asyncio.new_event_loop()
                 self._thread = threading.Thread(
                     target=self._run_loop, name="srw-audit-writer", daemon=True
                 )
                 self._thread.start()
-                fut = asyncio.run_coroutine_threadsafe(self._create_pool(), self._loop)
-                self._pool = fut.result(timeout=_CONNECT_TIMEOUT_S)
-                logger.info("Audit writer connected (Postgres audit store)")
-                return True
-            except Exception as exc:
-                logger.warning(
-                    "Audit writer connect failed (%s) — archiving disabled for "
-                    "this process",
-                    _fmt_pg_error(exc),
-                )
-                self._disabled = True
-                self._stop_loop()
-                return False
+            self._pool = self._submit(self._create_pool(), _CONNECT_TIMEOUT_S + 1.0)
+        except Exception as exc:
+            self._mark_down(exc)
+            return False
+        logger.info("Audit writer connected (Postgres audit store)")
+        return True
+
+    def _ensure_started(self) -> bool:
+        """Whether a write can be attempted right now."""
+        with self._lock:
+            return self._connect_locked()
 
     def ensure_ready(self) -> bool:
-        """Public gate for the archiver's pre-build short-circuit."""
-        return self._ensure_started()
+        """Gate for the archiver's pre-build short-circuit.
+
+        True while the store is down too: the row is then built and spooled.
+        False only when the spool can take no more, so a caller does not build
+        a row that would be dropped.
+        """
+        with self._lock:
+            if self._connect_locked():
+                return True
+            return self._spool_has_room()
 
     def _stop_loop(self) -> None:
         if self._loop is not None and self._loop.is_running():
@@ -259,11 +401,16 @@ class SyncAuditWriter:
         self._loop = None
         self._thread = None
 
-    def _submit(self, coro):
+    def _submit(self, coro, timeout: float = _WRITE_TIMEOUT_S):
         """Run ``coro`` on the writer loop from any thread and block for the result."""
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(
-            timeout=_WRITE_TIMEOUT_S
-        )
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return future.result(timeout=timeout)
+        except BaseException:
+            # A caller that gave up must not leave the coroutine holding one
+            # of the pool's two connections.
+            future.cancel()
+            raise
 
     def close(self) -> None:
         """Close the pool + stop the loop. Tests only; production never calls it."""
@@ -277,16 +424,271 @@ class SyncAuditWriter:
         self._pool = None
         self._stop_loop()
 
+    # -- counters -----------------------------------------------------------
+
+    def _count(self, op: _Pending, outcome: str) -> None:
+        job = self._counts.setdefault(op.job_id or "", {})
+        job.setdefault(op.kind, _new_counts())[outcome] += 1
+
+    def job_stats(
+        self,
+        job_id: str,
+        *,
+        reset: bool = False,
+        _exclude: Optional[_Pending] = None,
+    ) -> Dict[str, Any]:
+        """What this process did with ``job_id``'s rows since the last receipt.
+
+        Per kind (``llm``, ``pre``, ``post``, ``chat``): rows written first
+        try, written on replay, dropped. ``spooled``: rows still waiting.
+        ``complete`` is True when nothing was dropped and nothing waits.
+        """
+        with self._lock:
+            kinds = {
+                kind: dict(counts)
+                for kind, counts in (self._counts.get(job_id) or {}).items()
+            }
+            spooled = sum(
+                1 for op in self._spool if op.job_id == job_id and op is not _exclude
+            )
+            dropped = sum(counts["dropped"] for counts in kinds.values())
+            stats: Dict[str, Any] = {
+                "rows": kinds,
+                "spooled": spooled,
+                "dropped": dropped,
+                "replayed": sum(counts["replayed"] for counts in kinds.values()),
+                "complete": dropped == 0 and spooled == 0,
+                "outages": self._outages.get(job_id, 0),
+            }
+            if self._last_error and (dropped or spooled or stats["replayed"]):
+                stats["last_error"] = self._last_error
+            if reset:
+                self._counts.pop(job_id, None)
+                self._outages.pop(job_id, None)
+            return stats
+
+    # -- spool --------------------------------------------------------------
+
+    def _spool_has_room(self) -> bool:
+        return (
+            len(self._spool) < self._spool_max_rows
+            and self._spool_bytes < self._spool_max_bytes
+        )
+
+    def _remember(self, table: "OrderedDict", key: int, value: Any) -> None:
+        table[key] = value
+        while len(table) > _RESOLVED_MAX:
+            table.popitem(last=False)
+
+    def _park_locked(self, op: _Pending) -> Any:
+        """Keep ``op`` for later; return what its caller gets meanwhile."""
+        if not self._spool_has_room():
+            self._count(op, "dropped")
+            logger.error(
+                "Audit spool full (%d rows, %d MB): dropping a %s row of job %s",
+                len(self._spool),
+                self._spool_bytes // (1024 * 1024),
+                op.kind,
+                op.job_id,
+            )
+            return self._failure_value(op)
+        if op.size == 0:
+            op.size = _approx_size(op.args)
+        if op.kind in ("llm", "pre") and op.local_id is None:
+            op.local_id = self._next_local_id
+            self._next_local_id -= 1
+            if op.kind == "pre":
+                self._remember(self._pre_jobs, op.local_id, op.job_id)
+        if not any(queued.job_id == op.job_id for queued in self._spool):
+            self._outages[op.job_id or ""] = self._outages.get(op.job_id or "", 0) + 1
+        self._spool.append(op)
+        self._spool_bytes += op.size
+        if op.kind in ("llm", "pre"):
+            return op.local_id
+        return True if op.kind == "post" else None
+
+    @staticmethod
+    def _failure_value(op: _Pending) -> Any:
+        return False if op.kind == "post" else None
+
+    def _resolve(self, ref: Any) -> Tuple[bool, Any]:
+        """Map a placeholder id to its row's real id.
+
+        Returns ``(known, id)``: an id from the store passes through; a
+        placeholder whose row was dropped, or that is still spooled, is
+        ``(False, None)``.
+        """
+        if not isinstance(ref, int) or ref >= 0:
+            return True, ref
+        if ref in self._resolved and self._resolved[ref] is not None:
+            return True, self._resolved[ref]
+        return False, None
+
+    def _run_locked(self, op: _Pending, *, replay: bool) -> Tuple[str, Any]:
+        """Try one write. Returns ``("ok", value)``, ``("wait", None)`` when
+        the store is not answering, or ``("drop", None)``."""
+        args = op.args
+        try:
+            if op.kind == "llm":
+                row = args["row"]
+                if replay:
+                    row = {
+                        **row,
+                        "metrics": {
+                            **(row.get("metrics") or {}),
+                            "audit_replayed": True,
+                        },
+                    }
+                value = self._submit(self._insert_llm_request(row))
+            elif op.kind == "pre":
+                row = args["row"]
+                if args.get("receipt"):
+                    # The counts as they are now, when the receipt reaches the
+                    # store: every row of the job queued before it has been
+                    # written or dropped by then.
+                    row = {
+                        **row,
+                        "payload": {
+                            **(row.get("payload") or {}),
+                            "audit_receipt": self.job_stats(
+                                op.job_id or "", _exclude=op
+                            ),
+                        },
+                    }
+                if replay:
+                    row = {
+                        **row,
+                        "payload": {
+                            **(row.get("payload") or {}),
+                            "audit_replayed": True,
+                        },
+                    }
+                value = self._submit(self._insert_audit_pre(row))
+            elif op.kind == "post":
+                known, pre_id = self._resolve(args["pre_id"])
+                if not known:
+                    # Its pre row never reached the store: nothing to attach to.
+                    return "drop", None
+                _, request_id = self._resolve(args["request_id"])
+                payload = args["payload"]
+                if replay:
+                    payload = {**(payload or {}), "audit_replayed": True}
+                value = self._submit(
+                    self._insert_audit_post(
+                        int(pre_id), payload, args["latency_ms"], request_id
+                    )
+                )
+                if not value:
+                    # "INSERT 0 0": the store holds no pre row with that id.
+                    return "drop", None
+            else:  # chat
+                row = args["row"]
+                _, request_id = self._resolve(row.get("request_id"))
+                value = self._submit(
+                    self._insert_chat_entry({**row, "request_id": request_id})
+                )
+        except Exception as exc:
+            if _is_content_error(exc):
+                logger.warning(
+                    "Audit %s row rejected, dropped (%s)", op.kind, _fmt_pg_error(exc)
+                )
+                self._last_error = _fmt_pg_error(exc)
+                return "drop", None
+            self._mark_down(exc)
+            return "wait", None
+        return "ok", value
+
+    def _settle(self, op: _Pending, outcome: str, value: Any, *, replay: bool) -> None:
+        """Book one finished write: counters and the placeholder map."""
+        if op.args.get("receipt"):
+            if outcome == "ok":
+                # The receipt holds the counts; the next one starts from zero.
+                self._counts.pop(op.job_id or "", None)
+                self._outages.pop(op.job_id or "", None)
+            if op.local_id is not None:
+                self._remember(
+                    self._resolved, op.local_id, value if outcome == "ok" else None
+                )
+            return
+        if outcome == "ok":
+            self._count(op, "replayed" if replay else "written")
+            if op.local_id is not None:
+                self._remember(self._resolved, op.local_id, value)
+            if op.kind == "pre" and isinstance(value, int):
+                self._remember(self._pre_jobs, value, op.job_id)
+        else:
+            self._count(op, "dropped")
+            if op.local_id is not None:
+                self._remember(self._resolved, op.local_id, None)
+
+    def _drain_locked(self, budget_s: float) -> bool:
+        """Write spooled rows, oldest first, for at most ``budget_s``.
+
+        Returns True when the spool is empty.
+        """
+        deadline = time.monotonic() + budget_s
+        while self._spool:
+            if time.monotonic() >= deadline or not self._connect_locked():
+                return False
+            op = self._spool[0]
+            outcome, value = self._run_locked(op, replay=True)
+            if outcome == "wait":
+                return False
+            if self._down_since is not None:
+                self._mark_up()  # the store answered: says how many rows wait
+            self._spool.popleft()
+            self._spool_bytes -= op.size
+            self._settle(op, outcome, value, replay=True)
+        return True
+
+    def _write(self, op: _Pending) -> Any:
+        """Write ``op`` after everything spooled before it, or spool it."""
+        with self._lock:
+            if self._spool and not self._drain_locked(_DRAIN_BUDGET_S):
+                return self._park_locked(op)
+            if not self._connect_locked():
+                return self._park_locked(op)
+            outcome, value = self._run_locked(op, replay=False)
+            if outcome == "wait":
+                return self._park_locked(op)
+            self._settle(op, outcome, value, replay=False)
+            if outcome == "ok":
+                if self._down_since is not None:
+                    self._mark_up()
+                return value
+            return self._failure_value(op)
+
+    def flush(self, timeout_s: float = 30.0) -> bool:
+        """Write every spooled row, waiting out the backoff, for ``timeout_s``.
+
+        For the end of a job: what is still spooled when the process exits is
+        lost. Blocks the calling thread (call it off the event loop). Returns
+        True when nothing is left.
+        """
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            with self._lock:
+                if not self._spool:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                if self._drain_locked(min(remaining, _DRAIN_BUDGET_S)):
+                    return True
+                wait = max(0.05, self._retry_at - time.monotonic())
+            time.sleep(min(wait, max(0.0, deadline - time.monotonic()), 1.0))
+
+    @property
+    def spooled(self) -> int:
+        """Rows waiting for the store."""
+        return len(self._spool)
+
     # -- write surface ------------------------------------------------------
 
     def insert_llm_request(self, row: dict) -> Optional[int]:
-        if not self._ensure_started():
-            return None
-        try:
-            return self._submit(self._insert_llm_request(row))
-        except Exception as exc:
-            logger.warning("Audit insert_llm_request failed (%s)", _fmt_pg_error(exc))
-            return None
+        return self._write(
+            _Pending("llm", str(row.get("job_id") or "") or None, {"row": row})
+        )
 
     async def _insert_llm_request(self, row: dict) -> Optional[int]:
         async with self._pool.acquire() as conn:
@@ -307,13 +709,27 @@ class SyncAuditWriter:
             )
 
     def insert_audit_pre(self, row: dict) -> Optional[int]:
-        if not self._ensure_started():
-            return None
-        try:
-            return self._submit(self._insert_audit_pre(row))
-        except Exception as exc:
-            logger.warning("Audit insert_audit_pre failed (%s)", _fmt_pg_error(exc))
-            return None
+        return self._write(
+            _Pending("pre", str(row.get("job_id") or "") or None, {"row": row})
+        )
+
+    def insert_job_receipt(self, row: dict) -> Optional[int]:
+        """Write ``row`` (an ``agent_audit`` row) as a job's audit receipt.
+
+        The writer adds ``payload.audit_receipt``: the job's counts
+        (:meth:`job_stats`) at the moment the row reaches the store, which is
+        after every row of the job queued before it. So a receipt that exists
+        is final for the rows before it: ``complete`` is whether any was
+        dropped. A job without a receipt has a record of unknown completeness.
+        Writing it starts the job's counts afresh.
+        """
+        return self._write(
+            _Pending(
+                "pre",
+                str(row.get("job_id") or "") or None,
+                {"row": row, "receipt": True},
+            )
+        )
 
     async def _insert_audit_pre(self, row: dict) -> Optional[int]:
         async with self._pool.acquire() as conn:
@@ -343,15 +759,22 @@ class SyncAuditWriter:
         # no DB touch, False.
         if pre_id is None:
             return False
-        if not self._ensure_started():
-            return False
-        try:
-            return self._submit(
-                self._insert_audit_post(int(pre_id), payload, latency_ms, request_id)
+        with self._lock:
+            job_id = self._pre_jobs.get(int(pre_id))
+        return bool(
+            self._write(
+                _Pending(
+                    "post",
+                    job_id,
+                    {
+                        "pre_id": int(pre_id),
+                        "payload": payload,
+                        "latency_ms": latency_ms,
+                        "request_id": request_id,
+                    },
+                )
             )
-        except Exception as exc:
-            logger.warning("Audit insert_audit_post failed (%s)", _fmt_pg_error(exc))
-            return False
+        )
 
     async def _insert_audit_post(
         self, pre_id: int, payload: dict, latency_ms: Optional[int], request_id
@@ -368,12 +791,9 @@ class SyncAuditWriter:
         return status.rsplit(" ", 1)[-1] == "1"
 
     def insert_chat_entry(self, row: dict) -> None:
-        if not self._ensure_started():
-            return
-        try:
-            self._submit(self._insert_chat_entry(row))
-        except Exception as exc:
-            logger.warning("Audit insert_chat_entry failed (%s)", _fmt_pg_error(exc))
+        self._write(
+            _Pending("chat", str(row.get("job_id") or "") or None, {"row": row})
+        )
 
     async def _insert_chat_entry(self, row: dict) -> None:
         async with self._pool.acquire() as conn:

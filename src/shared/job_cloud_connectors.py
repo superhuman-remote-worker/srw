@@ -40,7 +40,8 @@ EDITS_DISCARDED = "discarded"
 #: human-reviewed job).
 EDITS_REVIEWED = "reviewed"
 #: A conflict-free diff is applied automatically; anything else parks the
-#: job for review (a project loop's copy).
+#: job for review (a project loop's copy, and the copy of a job that runs at
+#: full autonomy).
 EDITS_APPLIED = "applied"
 EDITS: tuple[str, ...] = (EDITS_DISCARDED, EDITS_REVIEWED, EDITS_APPLIED)
 

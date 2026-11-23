@@ -172,6 +172,40 @@ class TestOtherLinks:
         assert kwargs["access"] is ...
 
     @pytest.mark.asyncio
+    async def test_a_note_edit_leaves_the_read_only_switch_as_it_is(self):
+        # The store writes every field it is handed: read_only=None here would
+        # put a read-only link back on its connector's default, read-write.
+        _result, update = await _patch(_postgres(), description="Bookings, read here")
+        kwargs = update.await_args.kwargs
+        assert kwargs["description"] == "Bookings, read here"
+        assert kwargs["read_only"] is ...
+        assert kwargs["access"] is ...
+
+    @pytest.mark.asyncio
+    async def test_an_access_change_leaves_the_note_as_it_is(self):
+        _result, update = await _patch(_postgres(), read_only=True)
+        assert update.await_args.kwargs["description"] is ...
+        _result, update = await _patch(_folder(), access="protected")
+        assert update.await_args.kwargs["description"] is ...
+
+    @pytest.mark.asyncio
+    async def test_null_still_clears_what_it_names(self):
+        _result, update = await _patch(_postgres(), read_only=None)
+        kwargs = update.await_args.kwargs
+        assert kwargs["read_only"] is None
+        assert kwargs["description"] is ...
+        _result, update = await _patch(_postgres(), description=None)
+        kwargs = update.await_args.kwargs
+        assert kwargs["description"] is None
+        assert kwargs["read_only"] is ...
+
+    @pytest.mark.asyncio
+    async def test_a_forced_read_only_link_stays_read_only_through_a_note_edit(self):
+        kb = {**_postgres(), "type": "kb", "name": "Handbook"}
+        _result, update = await _patch(kb, description="Decisions and plans")
+        assert update.await_args.kwargs["read_only"] is True
+
+    @pytest.mark.asyncio
     async def test_linking_stores_no_level(self):
         row = _postgres()
         deps = _deps(row)

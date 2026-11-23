@@ -23,6 +23,9 @@ Software. This file discharges that obligation for every bundled dependency.
   only and are not shipped).
 - **Voice path images** (`srw-asterisk`, `srw-voice-gateway`): their own
   hand-maintained section, [Voice path images](#voice-path-images-local-phone-lines).
+- **The `srw` command-line client** (`cli/`): the Go modules linked into the
+  program, in their own hand-maintained file; see
+  [Command-line client](#command-line-client-srw).
 
 **NOT covered, by design** — server software we deploy but do **not** redistribute:
 
@@ -206,6 +209,22 @@ cache; its licences are listed in that folder's README.
 
 ---
 
+## Command-line client (`srw`)
+
+`srw` (`cli/`) is a static Go program, released as archives on the GitHub
+Release and as the `srw-cli` image. What it links, with every licence text and
+the one NOTICE file among them (`go.yaml.in/yaml/v3`), is in
+[`cli/THIRD_PARTY_NOTICES.md`](cli/THIRD_PARTY_NOTICES.md). That file ships
+inside every archive and in the image under `/usr/share/licenses/srw/`.
+Hand-maintained: update it with `cli/go.mod`; a test in `cli/internal/notices`
+fails when a module is missing or listed at another version.
+
+| Component | License |
+|---|---|
+| `github.com/spf13/cobra`, `github.com/inconshreveable/mousetrap` (Windows only) | Apache-2.0 |
+| `github.com/spf13/pflag`, `golang.org/x/term`, `golang.org/x/sys`, the Go standard library | BSD-3-Clause |
+| `go.yaml.in/yaml/v3` | MIT and Apache-2.0 |
+
 ## Adapted prompt text
 
 Prompt text taken from other projects, with the changes we made (Apache-2.0 §4(b)).
@@ -215,6 +234,7 @@ Hand-maintained; add a row whenever a prompt adopts third-party text.
 |---|---|---|---|
 | The two compaction paragraphs ("When you run out of context…", "Compaction does not end the task…") in `config/prompts/systemprompt_gpt_5.txt`, `systemprompt_interactive_gpt_5.txt`, `systemprompt_gpt_6_1_sol.txt` and `systemprompt_interactive_gpt_6_1_sol.txt` | [OpenAI Codex](https://github.com/openai/codex), `codex-rs/models-manager/models.json`, the GPT-6 `instructions_template` ("Working with the user"), commit `a6baf8867cb4` | Apache-2.0 | Removed the clause "but you will still see all prior user requests" (SRW does not keep them) |
 | `config/prompts/compaction/codex/prompt.md` (the native compaction instruction for GPT models) | [OpenAI Codex](https://github.com/openai/codex), `codex-rs/prompts/templates/compact/prompt.md`, commit `a6baf8867cb4` | Apache-2.0 | Added a last line asking for the summary only, without tool calls (SRW keeps the tools in the request) |
+| `config/prompts/compaction/deepseek/prompt.md` (the native compaction instruction for DeepSeek models; MIT licence text in `config/prompts/compaction/deepseek/LICENSE`) | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), `packages/compaction/compaction-basic/src/summarizer.ts`, commit `39163dd30f70` | MIT | The rule on a prior checkpoint names a summary of earlier compacted turns instead of a `<compacted-summary>` block |
 | `config/skills/frontend-design/` (bundled skill, with its `LICENSE.txt`) | [Anthropic Agent Skills](https://github.com/anthropics/skills), `skills/frontend-design/`, commit `dbd4588f9e10` | Apache-2.0 | None |
 | `config/skills/webapp-testing/` (bundled skill with scripts and examples, with its `LICENSE.txt`) | [Anthropic Agent Skills](https://github.com/anthropics/skills), `skills/webapp-testing/`, commit `dbd4588f9e10` | Apache-2.0 | None |
 

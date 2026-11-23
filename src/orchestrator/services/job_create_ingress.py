@@ -92,6 +92,10 @@ _SERVER_OWNED_RAW_CREATE_CONTEXT_KEYS = (
         # session service writes it, after it started the IDE pod. A seeded
         # one would aim the proxy (and its credentials) at any address.
         "ide_session",
+        # A path on the agent's own filesystem. The agent ignores both now;
+        # a seeded one used to copy the agent's files into the workspace.
+        "document_path",
+        "document_dir",
     }
 )
 

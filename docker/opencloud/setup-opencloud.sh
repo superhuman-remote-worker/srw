@@ -34,7 +34,7 @@ log "Running OpenCloud pre-start hook"
 # ----- Sub-claim guard -------------------------------------------------------
 if [ "${PROXY_USER_OIDC_CLAIM:-}" != "sub" ]; then
     log "WARNING: PROXY_USER_OIDC_CLAIM is '${PROXY_USER_OIDC_CLAIM:-<unset>}'," \
-        "expected 'sub'. See knowledge-base/knowledge/operations/opencloud-bootstrap.md §4."
+        "expected 'sub'."
 fi
 
 # ----- OIDC issuer guard -----------------------------------------------------
@@ -47,7 +47,7 @@ log "Reminder: the orchestrator expects a Keycloak client named"
 log "  '${OPENCLOUD_KEYCLOAK_CLIENT_ID:-opencloud-orchestrator}'"
 log "with serviceAccountsEnabled=true and the 'opencloud-admin' role assigned."
 log "The chart's Keycloak bootstrap hook seeds this; otherwise create it in the"
-log "Keycloak admin UI. See knowledge-base/knowledge/operations/opencloud-bootstrap.md §2."
+log "Keycloak admin UI."
 
 log "Pre-start hook complete"
 exit 0

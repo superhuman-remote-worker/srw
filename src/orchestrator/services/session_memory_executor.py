@@ -37,6 +37,7 @@ from shared.runtime.core.transport_resolution import served_model_from_env
 from shared.runtime.services.memory_prompts import resolve_memory_extraction_prompt
 from shared.runtime.services.auxiliary import AuxiliaryLLM, ExtractMemoriesTask
 from shared.runtime.services.embedding_service import EmbeddingService
+from shared.tls_pinning import TlsPin
 from shared.runtime.services.memory.ingestion import maybe_attach_ingestion_verdict
 from shared.runtime.services.recall_store import RecallStore
 
@@ -423,6 +424,15 @@ def _build_embedding_service(config: Any) -> EmbeddingService:
             if provider == "openrouter"
             else EmbeddingService.OPENAI_API_URL
         )
+    # The pin belongs to the endpoint URL the env names; the provider's own
+    # default URL carries none. A pin that can't be read fails the drain: the
+    # service is never built unpinned (ruling R11).
+    try:
+        tls_pin = (
+            TlsPin.from_env("EMBEDDING", env) if env.get("EMBEDDING_BASE_URL") else None
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"resolved session embedding transport: {exc}") from exc
     try:
         dimensions = int(env.get("EMBEDDING_DIMENSIONS") or 4096)
     except (TypeError, ValueError) as exc:
@@ -441,6 +451,7 @@ def _build_embedding_service(config: Any) -> EmbeddingService:
             if env.get("EMBEDDING_PROFILE_ID")
             else None
         ),
+        tls_pin=tls_pin,
     )
 
 

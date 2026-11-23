@@ -74,6 +74,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Mapping,
     Optional,
     Tuple,
@@ -214,6 +215,15 @@ def _uncertain_worker_workspace_report(
 IDLE_POLL_SECONDS = 0.5
 IDLE_POLL_BACKOFF_SECONDS = 2.0
 IDLE_POLLS_BEFORE_BACKOFF = 30
+# How long a worker job waits before its next try after a batch that ended in a
+# recoverable failure (a provider that stopped answering, a workspace hiccup).
+# The wait grows with each failed try in a row: base, 2 x base, 3 x base, 4 x
+# base, and the fifth failure ends the job (``worker_retry_exhausted``). At the
+# default of 5 s that tolerates about 50 s of outage, at 60 s about ten
+# minutes. ``STATELESS_WORKER_ERROR_BACKOFF_SECONDS`` sets it for a deployment
+# that would rather wait out a provider outage than fail every job in flight.
+WORKER_ERROR_BACKOFF_SECONDS = 5.0
+WORKER_ERROR_BACKOFF_MAX_SECONDS = 900.0
 POLL_JITTER = 0.2  # ±20%
 # How long a pod keeps an idle thread's session attached, hoping for the next
 # turn (§5.3.4). The win it buys is the whole attach (measured 7.4s on k3d);
@@ -265,6 +275,24 @@ _WORKER_PRESERVE_SHELL_STATUSES = frozenset(
 _WORKER_TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _WORKER_UNFINISHED_COMMAND_STATES = frozenset({"pending", "finalizing"})
 _WORKER_FINALIZED_COMMAND_STATES = frozenset({"done", "superseded", "force_resolved"})
+
+
+def worker_error_backoff_seconds() -> float:
+    """The base wait after a failed worker batch, from
+    ``STATELESS_WORKER_ERROR_BACKOFF_SECONDS`` (1 to 900 s, default 5)."""
+    raw = os.getenv("STATELESS_WORKER_ERROR_BACKOFF_SECONDS", "").strip()
+    if not raw:
+        return WORKER_ERROR_BACKOFF_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "STATELESS_WORKER_ERROR_BACKOFF_SECONDS=%r is not a number; using %s",
+            raw,
+            WORKER_ERROR_BACKOFF_SECONDS,
+        )
+        return WORKER_ERROR_BACKOFF_SECONDS
+    return min(WORKER_ERROR_BACKOFF_MAX_SECONDS, max(1.0, value))
 
 
 def _enabled_env(name: str, default: bool = False) -> bool:
@@ -1221,6 +1249,7 @@ class StatelessTurnExecutor:
         bg_task_enabled: Optional[bool] = None,
         completion_commands_enabled: Optional[bool] = None,
         audit_writer: Any = _AUDIT_WRITER_UNSET,
+        worker_error_backoff: Optional[float] = None,
     ) -> None:
         self._pod_name = (
             pod_name or os.getenv("POD_NAME") or socket.gethostname() or "agent"
@@ -1233,6 +1262,11 @@ class StatelessTurnExecutor:
         self._cloud_push_wait_seconds = cloud_push_wait_seconds
         self._abort_grace_seconds = abort_grace_seconds
         self._warm_session_idle_ttl = warm_session_idle_ttl_seconds
+        self._worker_error_backoff_seconds = (
+            worker_error_backoff_seconds()
+            if worker_error_backoff is None
+            else float(worker_error_backoff)
+        )
         self._warm_since: Optional[float] = None
         self._worker_enabled = (
             _enabled_env("STATELESS_EXECUTOR", False)
@@ -1627,13 +1661,15 @@ class StatelessTurnExecutor:
         current_lease.set(self._lease)
         logger.info(
             "stateless turn executor started: pod=%s idle_poll=%.2fs "
-            "backoff=%.2fs/%d heartbeat=%ss worker_enabled=%s",
+            "backoff=%.2fs/%d heartbeat=%ss worker_enabled=%s "
+            "worker_error_backoff=%.0fs",
             self._pod_name,
             self._idle_poll_seconds,
             self._idle_backoff_seconds,
             self._idle_polls_before_backoff,
             HEARTBEAT_INTERVAL_SECONDS,
             self._worker_enabled,
+            self._worker_error_backoff_seconds,
         )
         idle_polls = 0
         while not self._stop.is_set():
@@ -3721,6 +3757,7 @@ class StatelessTurnExecutor:
                 unit_id=claim.unit_id,
                 lease_token=claim.lease_token,
                 park_on_exhaustion=park_on_exhaustion,
+                backoff_base_seconds=self._worker_error_backoff_seconds,
             )
         except Exception:
             logger.warning(
@@ -3996,15 +4033,17 @@ class StatelessTurnExecutor:
         branches: (1) the turn settled — its answer is durable and the
         interrupt close in ``_serve_claim``'s finally already checkpointed
         ``consumed_seq`` — so complete the unit (idempotent CAS) and leave the
-        push, if any, handed off; a failed CAS releases, never parks. (2) not
-        settled, no tool effect crossed — release with attempts++. (3) not
-        settled, effect crossed, but every persisted tool call has its
-        durable ToolMessage — release: the successor continues from the
-        transcript. (3b) the calls without a result are those of a
-        delegation-only batch whose opened children all have their rows —
-        release: the successor settles the batch (parallel_subagents.md §8).
-        (4) any other in-flight tool with no result row — the only remaining
-        park.
+        push, if any, handed off; a failed CAS releases. A settled turn that
+        still leaves a call without a result is parked first instead, for
+        the owner's Continue/Stop, exactly as at a normal turn end
+        (``_park_if_turn_left_tool_debt``). (2) not settled, no tool effect
+        crossed — release with attempts++. (3) not settled, effect crossed,
+        but every persisted tool call has its durable ToolMessage — release:
+        the successor continues from the transcript. (3b) the calls without
+        a result are those of a delegation-only batch whose opened children
+        all have their rows — release: the successor settles the batch
+        (parallel_subagents.md §8). (4) not settled, any other in-flight tool
+        with no result row — park.
         """
 
         pa = _pa()
@@ -4019,6 +4058,10 @@ class StatelessTurnExecutor:
                 reason="shutdown_after_settle",
                 claim=claim,
             )
+            # A settled turn that left a call without a result parks, as at
+            # the normal turn end, instead of completing or being released.
+            if await self._park_if_turn_left_tool_debt(pa, claim):
+                return
             if not self._lease.lost.is_set():
                 try:
                     state = await asyncio.wait_for(
@@ -4751,6 +4794,10 @@ class StatelessTurnExecutor:
             t0 = time.perf_counter()
             await self._detach_physical_before_transition("turn_complete")
             timing["detach_final"] = time.perf_counter() - t0
+            # A call still without a result parks for the owner's decision:
+            # completing would leave the next claim an admission refusal.
+            if await self._park_if_turn_left_tool_debt(pa, claim):
+                return
             t0 = time.perf_counter()
             state = await self._complete_with_retry(
                 claim, consumed_seq=completion_consumed_seq
@@ -5613,12 +5660,13 @@ class StatelessTurnExecutor:
             # A previous cached owner may still be resident. No validated
             # bundle/attach will retire it on this refusal, so do not accept
             # another owner after an unproven claim or predecessor authority.
-            # The executor stays stopped (pod unready) until it is replaced;
-            # say so, or the pod just goes quiet.
+            # The executor stops and its process exits, so the container
+            # restarts within seconds; say so, or the pod just goes quiet.
             logger.error(
                 "session tool-history admission refused: unit=%s token=%d — "
                 "this claim's authority or the predecessor's claim record is "
-                "unproven; stopping this executor until the pod is replaced",
+                "unproven; stopping this executor (the process exits so the "
+                "container restarts)",
                 claim.unit_id,
                 claim.lease_token,
             )
@@ -5630,9 +5678,111 @@ class StatelessTurnExecutor:
         # The cache can still belong to the previous unit. Drain under that
         # unit's existing lease; do not hand its push to this new claim or
         # activate the new mutable lease before the admission decision.
-        await self._quiesce_claim_before_transition(
-            pa, reason="unresolved_predecessor_tool"
+        outcome = await self._park_session_tool_debt(
+            pa,
+            claim,
+            quiesce_reason="unresolved_predecessor_tool",
+            release_reason="unresolved_predecessor_tool",
+            quiesce_with_claim=False,
         )
+        if outcome == "lost":
+            logger.error(
+                "session tool-debt park lost its authority: unit=%s token=%d; "
+                "stopping this executor (the process exits so the container "
+                "restarts)",
+                claim.unit_id,
+                claim.lease_token,
+            )
+            self.request_stop()
+        # A real late result may clear the debt under the same locked claim.
+        # A lost commit response is the existing idempotent parked outcome,
+        # never permission to reconstruct model/tool context.
+        return outcome == "clear"
+
+    async def _park_if_turn_left_tool_debt(self, pa: Any, claim: ClaimedUnit) -> bool:
+        """Park, instead of completing, a turn that leaves tool debt.
+
+        A completed turn whose transcript still holds a call without a result
+        would leave the next claim an admission refusal that stops this
+        executor. Park it for the owner's Continue/Stop under this claim's own
+        lease instead. True when the caller must return (parked, or the claim
+        was lost); False when there is no debt and completion proceeds.
+
+        The read retries like completion does. When it still fails, completion
+        proceeds as it did before this guard existed: a DB blip must never
+        park a healthy, answered turn.
+        """
+        row = None
+        for attempt in range(1, COMPLETE_RETRY_ATTEMPTS + 1):
+            try:
+                row = await self._session_tool_debt(self._db, claim)
+                break
+            except Exception as e:
+                if attempt < COMPLETE_RETRY_ATTEMPTS:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+                logger.warning(
+                    "turn-end tool-debt read FAILED after %d attempts: unit=%s "
+                    "token=%d — completing without the check: %s",
+                    COMPLETE_RETRY_ATTEMPTS,
+                    claim.unit_id,
+                    claim.lease_token,
+                    e,
+                )
+                return False
+        if row is None or not row["unresolved"]:
+            # No debt under this claim's proven authority: completion fences
+            # or completes exactly as before.
+            return False
+        outcome = await self._park_session_tool_debt(
+            pa,
+            claim,
+            quiesce_reason="turn_end_tool_debt",
+            release_reason="turn_end_tool_debt",
+            quiesce_with_claim=True,
+        )
+        if outcome == "parked":
+            self._clear_claim_tool_effect(pa, claim)
+            logger.warning(
+                "run_queue park: unit=%s token=%d reason=loop_died_after_tool_effect "
+                "(turn ended with unanswered tool calls)",
+                claim.unit_id,
+                claim.lease_token,
+            )
+            return True
+        if outcome == "lost":
+            # The locked recheck found this claim's authority gone (End, a
+            # steal, a stop marker): acknowledge it like a fenced-out
+            # completion. Never stop the executor for it.
+            await self._ack_terminal_claim_loss(claim)
+            self._clear_claim_tool_effect(pa, claim)
+            return True
+        return False
+
+    async def _park_session_tool_debt(
+        self,
+        pa: Any,
+        claim: ClaimedUnit,
+        *,
+        quiesce_reason: str,
+        release_reason: str,
+        quiesce_with_claim: bool,
+    ) -> Literal["parked", "clear", "lost"]:
+        """Quiesce, then park this claim's Session tool debt for the owner.
+
+        The atomic release/journal transaction rechecks locked current
+        authority and debt before it can retire this queue lease. When it
+        parks, it also retires this claim's active record, expires its
+        pending permission prompts and journals ``turn.parked``. Returns
+        ``"clear"`` when a real late result cleared the debt under the locked
+        claim and ``"lost"`` when the claim's authority is gone.
+        """
+        if quiesce_with_claim:
+            await self._quiesce_claim_before_transition(
+                pa, reason=quiesce_reason, claim=claim
+            )
+        else:
+            await self._quiesce_claim_before_transition(pa, reason=quiesce_reason)
         clear = False
         reason = "loop_died_after_tool_effect"
 
@@ -5653,14 +5803,14 @@ class StatelessTurnExecutor:
                 reason=reason,
             )
             # park_unit's general CAS intentionally accepts only token/state.
-            # This admission path also owes a current, unexpired owner at the
-            # CAS; an expiry while acquiring locks/checking debt rolls back.
+            # This park also owes a current, unexpired owner at the CAS; an
+            # expiry while acquiring locks/checking debt rolls back.
             if state is not None and not await conn.fetchval(
                 "SELECT $1::timestamptz > clock_timestamp()",
                 current["leased_until"],
             ):
                 raise _PostEffectParkError(
-                    "Session admission lease expired before park"
+                    "Session tool-debt lease expired before park"
                 )
             return state
 
@@ -5668,20 +5818,11 @@ class StatelessTurnExecutor:
             claim,
             cas=park_current_debt,
             park_reason=reason,
-            release_reason="unresolved_predecessor_tool",
+            release_reason=release_reason,
         )
-        if outcome is None and not clear:
-            logger.error(
-                "session tool-debt park lost its authority: unit=%s token=%d; "
-                "stopping this executor until the pod is replaced",
-                claim.unit_id,
-                claim.lease_token,
-            )
-            self.request_stop()
-        # A real late result may clear the debt under the same locked claim.
-        # A lost commit response is the existing idempotent parked outcome,
-        # never permission to reconstruct model/tool context.
-        return outcome is None and clear
+        if outcome is not None:
+            return "parked"
+        return "clear" if clear else "lost"
 
     async def _park_post_effect_claim(
         self,
@@ -6429,27 +6570,72 @@ class StatelessTurnExecutor:
 
 _executor: Optional[StatelessTurnExecutor] = None
 
+# Replaceable in tests.  ``os._exit`` skips the lifespan teardown on purpose: a
+# graceful exit would run ``terminate("shutdown")`` on a session that may have
+# failed to quiesce.
+_hard_exit: Callable[[int], None] = os._exit
+
+# Set once the lifespan shutdown begins; every intended stop (SIGTERM drain,
+# including the timeout path that cancels the loop task) happens after it.
+_lifespan_stopping: bool = False
+
+
+def mark_lifespan_stopping() -> None:
+    """Record that the lifespan shutdown has begun.
+
+    The lifespan calls this first thing after its ``yield``, before the attach
+    fence and receipt steps, so a claim loop that ends during the SIGTERM drain
+    never hard-exits. ``stop_stateless_executor`` sets it too.
+    """
+    global _lifespan_stopping
+    _lifespan_stopping = True
+
+
+def _on_executor_task_done(task: "asyncio.Task[Any]") -> None:
+    """Exit the process when the claim loop ends outside a lifespan shutdown.
+
+    A live process with a dead loop answers /health 200 forever and the kubelet
+    never restarts it; exiting makes it restart the container.
+    """
+    if _lifespan_stopping:
+        return
+    exc = None if task.cancelled() else task.exception()
+    detail = repr(exc) if exc is not None else "stopped itself; see the preceding error"
+    logger.critical(
+        "stateless turn executor loop ended outside shutdown (%s); "
+        "exiting so the kubelet restarts this container",
+        detail,
+    )
+    for handler in list(logging.getLogger().handlers):
+        with contextlib.suppress(Exception):
+            handler.flush()
+    _hard_exit(1)
+
 
 async def start_stateless_executor() -> StatelessTurnExecutor:
     """Create + start the singleton executor (idempotent)."""
-    global _executor
+    global _executor, _lifespan_stopping
     if _executor is not None and _executor._worker_quarantined:
         raise _ClaimQuiescenceError(
             "quarantined worker runtime requires process replacement"
         )
     if _executor is not None and _executor.running:
         return _executor
+    _lifespan_stopping = False
     executor = StatelessTurnExecutor()
     # Fail fast when the pool is missing — a stateless pod without its app-DB
     # pool can never serve a claim, and /ready must go 503, not lie.
     executor._db
     executor.start()
+    if executor._task is not None:
+        executor._task.add_done_callback(_on_executor_task_done)
     _executor = executor
     return executor
 
 
 async def stop_stateless_executor(timeout: Optional[float] = None) -> None:
-    global _executor
+    global _executor, _lifespan_stopping
+    _lifespan_stopping = True
     try:
         if _executor is not None:
             await _executor.stop(timeout)
@@ -6461,6 +6647,10 @@ async def stop_stateless_executor(timeout: Optional[float] = None) -> None:
         from agent.core.fenced_checkpointer import close_fenced_checkpointer_pool
 
         await close_fenced_checkpointer_pool()
+
+
+def executor_stopped_unexpectedly() -> bool:
+    return _executor is not None and not _executor.running and not _lifespan_stopping
 
 
 def executor_running() -> bool:

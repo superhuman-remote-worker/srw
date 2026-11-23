@@ -4,6 +4,10 @@
   height: 100%;
   min-width: 0;
   background: var(--app-bg);
+
+  // The Canvas is a pane beside the chat (about 585 px by default), so its
+  // header follows the pane's width, not the window's.
+  container-type: inline-size;
 }
 
 .canvas-shell {
@@ -317,17 +321,26 @@ app-canvas-image-renderer {
   gap: 8px;
 }
 
-@media (width <= 520px) {
+// Badges and the sync time move to their own row before they squeeze the
+// title to a letter or two.
+@container (width <= 760px) {
   .canvas-header {
     grid-template-columns: minmax(0, 1fr) auto;
-    gap: 6px;
-    padding-inline: 8px;
+    row-gap: 6px;
   }
 
   .canvas-trust {
     grid-column: 1 / -1;
     grid-row: 2;
-    padding-left: 34px;
+    flex-wrap: wrap;
+    padding-left: 32px;
+  }
+}
+
+@container (width <= 520px) {
+  .canvas-header {
+    gap: 6px;
+    padding-inline: 8px;
   }
 
   .canvas-trust time {

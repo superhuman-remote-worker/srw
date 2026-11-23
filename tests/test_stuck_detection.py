@@ -21,6 +21,7 @@ from langchain_core.messages import AIMessage, ToolMessage, SystemMessage
 from agent.graph import create_audited_tool_node  # noqa: E402
 from shared.runtime.core.loader import InstructionFileEntry, LimitsConfig  # noqa: E402
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError  # noqa: E402
+from shared.runtime.services.guardrails import format_nudge  # noqa: E402
 from agent.tools.context import ToolContext  # noqa: E402
 
 
@@ -500,6 +501,49 @@ class TestFingerPrintWarning:
             # Tool still executed (result contains "ok") plus warning
             assert any("LOOP WARNING" in (m.content or "") for m in tool_msgs)
             assert any("ok" in (m.content or "") for m in tool_msgs)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool_names, key",
+        [
+            (("some_tool", "todo_complete"), "loop_warning_suffix"),
+            (("some_tool", "job_complete"), "loop_warning_suffix_job_complete"),
+        ],
+    )
+    async def test_warning_names_only_a_lifecycle_tool_the_job_has(
+        self, config, tool_names, key
+    ):
+        """The warning tells a job with todo_complete to mark its todo
+        blocked; a job without it is pointed at job_complete."""
+        fake_tools = []
+        for name in tool_names:
+            fake_tool = MagicMock()
+            fake_tool.name = name
+            fake_tools.append(fake_tool)
+
+        with patch("agent.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            MockToolNode.return_value = mock_tn
+            audited = create_audited_tool_node(fake_tools, config)
+            for i in range(10):
+                call_id = f"call_{i}"
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [make_tool_result("some_tool", "ok", call_id)]
+                    }
+                )
+                result = await audited(
+                    make_state([make_tool_call("some_tool", {}, call_id)])
+                )
+
+        content = [m for m in result["messages"] if isinstance(m, ToolMessage)][
+            0
+        ].content
+        assert content == "ok\n\n" + format_nudge(key, model=None)
+        assert ("mark the current todo as blocked" in content) is (
+            key == "loop_warning_suffix"
+        )
+        assert ("job_complete" in content) is (key != "loop_warning_suffix")
 
     @pytest.mark.asyncio
     async def test_different_args_no_warning(self, config):
@@ -1030,11 +1074,24 @@ class TestBudgetCaps:
         assert result["freeze_data"]["budget_scope"] == "phase"
 
     @pytest.mark.asyncio
-    async def test_phase_cap_off_by_default(self):
-        """The default config must not stop a long single phase."""
+    async def test_tool_call_caps_off_by_default(self):
+        """The default config stops neither a long phase nor a long job."""
         cfg = FakeConfig(limits=LimitsConfig())
         assert cfg.limits.max_tool_calls_per_phase == 0
-        assert cfg.limits.max_tool_calls_per_job == 5000
+        assert cfg.limits.max_tool_calls_per_job == 0
+
+    def test_shipped_worker_arms_no_limit_on_a_jobs_own_work(self):
+        """The worker overlay states every such limit, and states it off."""
+        from shared.runtime.core.loader import load_role_base
+
+        limits = load_role_base("worker")["limits"]
+        for key in (
+            "max_tool_calls_per_phase",
+            "max_tool_calls_per_job",
+            "max_llm_calls_per_job",
+            "max_plain_replies_in_a_row",
+        ):
+            assert limits[key] == 0, key
 
 
 # =============================================================================
@@ -1046,10 +1103,25 @@ class TestToolNotFoundEnrichment:
     """Tests for enriching tool-not-found errors with guidance."""
 
     @pytest.mark.asyncio
-    async def test_unknown_tool_gets_guidance(self, config):
-        """Tool-not-found errors should get actionable guidance appended."""
-        fake_tool = MagicMock()
-        fake_tool.name = "read_file"
+    @pytest.mark.parametrize(
+        "tool_names, names_todo_complete",
+        [
+            # A worker job binds todo_complete: told to mark the todo blocked.
+            (("read_file", "todo_complete"), True),
+            # A job without it is pointed at job_complete instead.
+            (("read_file", "job_complete"), False),
+        ],
+    )
+    async def test_unknown_tool_gets_guidance(
+        self, config, tool_names, names_todo_complete
+    ):
+        """Tool-not-found errors should get actionable guidance appended,
+        naming only a lifecycle tool the job has."""
+        fake_tools = []
+        for name in tool_names:
+            fake_tool = MagicMock()
+            fake_tool.name = name
+            fake_tools.append(fake_tool)
 
         with patch("agent.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
@@ -1068,7 +1140,7 @@ class TestToolNotFoundEnrichment:
             )
             MockToolNode.return_value = mock_tn
 
-            audited = create_audited_tool_node([fake_tool], config)
+            audited = create_audited_tool_node(fake_tools, config)
 
             state = make_state([make_tool_call("kb_list", {}, "call_kb")])
             result = await audited(state)
@@ -1076,8 +1148,16 @@ class TestToolNotFoundEnrichment:
             msgs = result.get("messages", [])
             tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
             assert len(tool_msgs) >= 1
-            assert "todo_complete" in tool_msgs[0].content
-            assert "blocked" in tool_msgs[0].content
+            content = tool_msgs[0].content
+            if names_todo_complete:
+                assert content.endswith(
+                    "\n\n" + format_nudge("tool_not_found_suffix", model="gpt-4o")
+                )
+                assert "todo_complete" in content
+                assert "blocked" in content
+            else:
+                assert "todo_complete" not in content
+                assert "job_complete" in content
 
     @pytest.mark.asyncio
     async def test_normal_error_not_enriched(self, config):

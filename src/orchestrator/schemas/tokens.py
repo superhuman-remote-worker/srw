@@ -76,6 +76,12 @@ VALID_PAT_SCOPES = {
     "chat:write",
     "knowledge:read",
     "knowledge:write",
+    # Manifests as desired state: apply and delete stored resources in the
+    # caller's own account and in projects they can edit.
+    "resources:write",
+    # ``kind: Project`` documents in a manifest apply, and the delete of a
+    # Project resource. Checked beside ``resources:write``, never instead.
+    "projects:write",
     "admin",
 }
 

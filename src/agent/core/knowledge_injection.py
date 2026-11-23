@@ -37,6 +37,22 @@ def selected_knowledge_bindings(context: Any) -> List[KnowledgeBinding]:
     return [binding for binding in value if isinstance(binding, KnowledgeBinding)]
 
 
+def attached_project_knowledge_ids(context: Any) -> List[str]:
+    """The ids of the projects whose own knowledge base is attached to this
+    runtime, in binding order (the primary project first).
+
+    This, not the runtime's project ids, is the scope of everything that reads
+    a project's notes by project id: the memory manager's ``kb_notes``
+    retriever and the charter. A project whose knowledge-base connector is not
+    attached is not in it.
+    """
+    return [
+        str(binding.kb_id)
+        for binding in selected_knowledge_bindings(context)
+        if binding.is_native
+    ]
+
+
 async def _bounded(coro: Any, timeout: Optional[float]) -> Any:
     if timeout is None:
         return await coro

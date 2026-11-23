@@ -459,6 +459,14 @@ def filter_bound_skills(blob: dict[str, Any]) -> dict[str, Any]:
     }
     if not bound:
         return blob
+    # A job without phases (shared.job_phases) binds the direct-task skill in
+    # place of the phase-procedure skills. Those must not come back as optional
+    # menu entries: they describe planning phases and to-do tools the job does
+    # not have.
+    from shared.job_phases import DIRECT_TASK_SKILL, PHASE_PROCEDURE_SKILLS
+
+    if DIRECT_TASK_SKILL in bound:
+        bound |= set(PHASE_PROCEDURE_SKILLS)
     if skills.get("menu"):
         skills["menu"] = [m for m in skills["menu"] if m.get("name") not in bound]
     if skills.get("files"):

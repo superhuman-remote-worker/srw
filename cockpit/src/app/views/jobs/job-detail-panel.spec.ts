@@ -10,8 +10,10 @@ import {
   formatUsd,
   failureReason,
   heldForReviewReason,
+  pausedReason,
   jobExpertLabel,
   jobModelLabel,
+  jobPhasesFactKey,
   liveSubjobCount,
   JobDetailPanelComponent,
   type JobDetailState,
@@ -354,6 +356,83 @@ describe('held-for-review reason', () => {
   });
 });
 
+describe('paused reason', () => {
+  const reason =
+    'workspace ran out of memory (limit 4 GiB) and was stopped; interrupted command outcome is ' +
+    "unknown; explicit Resume required. Resume raises the job's memory limit to 8 GiB. Files " +
+    'under /home/agent-host are kept; running processes and other paths such as /tmp are gone.';
+
+  it('names why a paused job waits, as a failed job names why it failed', () => {
+    expect(pausedReason({status: 'paused', error_message: reason})).toBe(reason);
+  });
+
+  it('stays silent without a reason and for other statuses', () => {
+    expect(pausedReason({status: 'paused', error_message: null})).toBeNull();
+    expect(pausedReason({status: 'paused', error_message: '  '})).toBeNull();
+    expect(pausedReason({status: 'failed', error_message: reason})).toBeNull();
+    expect(pausedReason({status: 'processing', error_message: reason})).toBeNull();
+    expect(pausedReason(null)).toBeNull();
+  });
+
+  it('defers to the VM-creation and workspace recovery blocks', () => {
+    expect(
+      pausedReason({
+        status: 'paused',
+        error_message: reason,
+        vm_creation: {state: 'attention', message: 'x'} as unknown as JobSummary['vm_creation'],
+      }),
+    ).toBeNull();
+    expect(
+      pausedReason({
+        status: 'paused',
+        error_message: reason,
+        workspace_recovery: {state: 'paused_attention'} as unknown as JobSummary['workspace_recovery'],
+      }),
+    ).toBeNull();
+  });
+
+  describe('rendered', () => {
+    beforeAll(async () => {
+      await ɵresolveComponentResources(() => Promise.resolve(''));
+    });
+    afterEach(() => TestBed.resetTestingModule());
+
+    it('shows the cause and what Resume does on the panel', () => {
+      TestBed.configureTestingModule({
+        imports: [
+          JobDetailPanelComponent,
+          TranslocoTestingModule.forRoot({
+            langs: {en},
+            translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+          }),
+        ],
+        providers: [provideRouter([])],
+      });
+      const transloco = TestBed.inject(TranslocoService);
+      transloco.setTranslation(en, 'en');
+      transloco.setActiveLang('en');
+      const fixture = TestBed.createComponent(JobDetailPanelComponent);
+      Object.defineProperty(fixture.componentInstance, 'job', {
+        value: signal({
+          id: 'job-oom',
+          description: 'Transcribe the talk',
+          status: 'paused',
+          created_at: '2026-11-20T08:00:00Z',
+          error_message: reason,
+        } as unknown as JobSummary),
+      });
+      Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+
+      fixture.detectChanges();
+
+      const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+      expect(text).toContain('Why it is paused');
+      expect(text).toContain('workspace ran out of memory (limit 4 GiB)');
+      expect(text).toContain("Resume raises the job's memory limit to 8 GiB.");
+    });
+  });
+});
+
 describe('costDisplay', () => {
   it('shows a complete price plainly', () => {
     expect(costDisplay(usage())).toEqual({amount: 0.94, isFloor: false, reasonKey: null});
@@ -516,6 +595,78 @@ describe('jobExpertLabel', () => {
       expect(expert?.querySelector('.fact-value')?.textContent?.trim()).toBe(
         'Küppelsmühle Empfang (Demo)',
       );
+    });
+  });
+});
+
+describe('jobPhasesFactKey', () => {
+  it('says Yes or No for the value the server returned, preferring the loaded detail', () => {
+    expect(jobPhasesFactKey({phases: true}, null)).toBe('jobs.detail.phasesYes');
+    expect(jobPhasesFactKey({phases: false}, null)).toBe('jobs.detail.phasesNo');
+    expect(jobPhasesFactKey({phases: false}, {phases: true})).toBe('jobs.detail.phasesYes');
+    expect(jobPhasesFactKey({phases: true}, {phases: null})).toBe('jobs.detail.phasesYes');
+  });
+
+  it('has no value for an unknown job: null, missing or not a boolean', () => {
+    expect(jobPhasesFactKey({phases: null}, null)).toBeNull();
+    expect(jobPhasesFactKey({} as JobSummary, null)).toBeNull();
+    expect(jobPhasesFactKey(null, {phases: null})).toBeNull();
+    expect(jobPhasesFactKey({phases: 'on'} as unknown as JobSummary, null)).toBeNull();
+  });
+
+  it('never derives the value from config_override', () => {
+    const detail = {config_override: {phases: true}} as unknown as Job;
+    expect(jobPhasesFactKey({phases: null}, detail)).toBeNull();
+  });
+
+  describe('rendered', () => {
+    beforeAll(async () => {
+      await ɵresolveComponentResources(() => Promise.resolve(''));
+    });
+    afterEach(() => TestBed.resetTestingModule());
+
+    function facts(phases: boolean | null | undefined): {labels: string[]; value: string | undefined} {
+      TestBed.configureTestingModule({
+        imports: [JobDetailPanelComponent, TranslocoTestingModule.forRoot({
+          langs: {en}, translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+        })],
+        providers: [provideRouter([])],
+      });
+      const transloco = TestBed.inject(TranslocoService);
+      transloco.setTranslation(en, 'en');
+      transloco.setActiveLang('en');
+      const fixture = TestBed.createComponent(JobDetailPanelComponent);
+      Object.defineProperty(fixture.componentInstance, 'job', {value: signal({
+        id: 'job-4', description: 'Rename the heading', status: 'completed',
+        created_at: '2026-11-16T08:00:00Z', config_name: 'developer',
+        ...(phases === undefined ? {} : {phases}),
+      } as JobSummary)});
+      Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+      fixture.detectChanges();
+      const root = fixture.nativeElement as HTMLElement;
+      return {
+        labels: [...root.querySelectorAll('.detail-grid .fact-label')].map((el) => el.textContent?.trim() ?? ''),
+        value: root.querySelector('[data-testid="job-phases-fact"] .fact-value')?.textContent?.trim(),
+      };
+    }
+
+    it('shows "Plans in phases: Yes" right after the Expert fact', () => {
+      const {labels, value} = facts(true);
+      expect(value).toBe(en.jobs.detail.phasesYes);
+      expect(labels.indexOf(en.jobs.detail.phases)).toBe(labels.indexOf(en.jobs.detail.expert) + 1);
+    });
+
+    it('shows "No" for a job that does its task directly', () => {
+      expect(facts(false).value).toBe(en.jobs.detail.phasesNo);
+    });
+
+    it('shows no row when the value is unknown', () => {
+      for (const phases of [null, undefined]) {
+        const {labels} = facts(phases);
+        expect(labels).not.toContain(en.jobs.detail.phases);
+        expect(labels).toContain(en.jobs.detail.expert);
+        TestBed.resetTestingModule();
+      }
     });
   });
 });

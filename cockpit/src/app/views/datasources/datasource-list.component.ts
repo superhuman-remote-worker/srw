@@ -1,4 +1,5 @@
 import {Component, computed, DestroyRef, inject, isDevMode, OnInit, signal} from '@angular/core';
+import {NgTemplateOutlet} from '@angular/common';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {forkJoin, timer} from 'rxjs';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -17,12 +18,14 @@ import {
     DatasourceScopeMode,
     EmailAccessTier,
     LinkableDatasourceProject,
+    McpServerQuestionsChoice,
     RepositoryForge,
 } from '../../core/models/api.model';
 import {AppButtonComponent} from '../../ui/button';
 import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppChipComponent} from '../../ui/chip';
+import {AppCheckboxComponent} from '../../ui/checkbox';
 import {AppInputComponent} from '../../ui/input';
 import {AppSelectComponent} from '../../ui/select';
 import {AppTextareaComponent} from '../../ui/textarea';
@@ -35,8 +38,10 @@ import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {ViewportService} from '../../core/services/viewport.service';
 import {UserService} from '../../core/services/user.service';
+import {AdminUsersService} from '../../core/services/admin-users.service';
 import {ActivatedRoute, RouterLink} from '@angular/router';
 import {ConnectorDriversService} from '../../core/services/connector-drivers.service';
+import {connectorTypeIcon} from '../../core/models/connector-icons';
 import {
   ConnectorDriver,
   liveConnectorDrivers, managedConnectorDrivers,
@@ -45,12 +50,24 @@ import {
   publicReadWrite,
 } from '../../core/models/connector-driver.model';
 import {
+  CLOUD_OUTBOX,
   isPlatformOwned,
+  PROJECT_CLOUD,
+  PROJECT_CLOUD_CHECKOUT,
   PROJECT_KB,
+  platformConnectorOwner,
+  platformConnectorOwnerId,
+  platformKindLabelKey,
   platformManagedLabelKey,
   platformOwnedKind,
+  USER_CLOUD_ROOT,
 } from '../../core/models/platform-connector';
 import {LiveConnectorWebhookComponent} from './live-connector-webhook.component';
+import {
+  ConnectorFilterBarComponent,
+  ConnectorFilterToken,
+  ConnectorTypeChip,
+} from './connector-filter-bar.component';
 import {GenericConnectorFormComponent} from './connector-forms/generic-connector-form.component';
 import {CloudRootCardComponent} from './cloud-root-card.component';
 import {bespokeFormFor} from './connector-forms/connector-form-registry';
@@ -62,7 +79,74 @@ import {
 } from './connector-forms/schema-form';
 
 type McpTransport = 'http' | 'sse';
+/** One group of the "Kept by SRW" list: a project's connectors, or a
+ *  person's own (My cloud, session outboxes). */
+export interface KeptGroup {
+  key: string;
+  /** The project it belongs to, for the heading's link. */
+  projectId: string | null;
+  /** A project's name, as the heading. */
+  label: string;
+  /** The heading's translation key when there is no project name. */
+  labelKey: string;
+  rows: Datasource[];
+}
+
+/** The order a project's or person's connectors are listed in. */
+const KEPT_KIND_ORDER: readonly string[] = [
+  PROJECT_CLOUD,
+  PROJECT_CLOUD_CHECKOUT,
+  PROJECT_KB,
+  USER_CLOUD_ROOT,
+  CLOUD_OUTBOX,
+];
+
+function keptKindRank(ds: Datasource): number {
+  const at = KEPT_KIND_ORDER.indexOf(platformOwnedKind(ds) ?? '');
+  return at < 0 ? KEPT_KIND_ORDER.length : at;
+}
+
+/** The type strip's order: the types people make, then the ones SRW keeps;
+ *  a type not named here (a registered driver's) goes last, by name. */
+const TYPE_ORDER: readonly string[] = [
+  'credentials',
+  'generic',
+  'repository',
+  'kb',
+  'postgresql',
+  'neo4j',
+  'mongodb',
+  'webdav',
+  'email',
+  'mcp',
+  'kubeconfig',
+  'ssh_key',
+  'generic_file',
+  'gpt_live_sip',
+  'cloud_folder',
+  'cloud_folder_checkout',
+  'cloud_outbox',
+];
+
+function addCounts(target: Record<string, number>, counts: Record<string, number>): void {
+  for (const [type, n] of Object.entries(counts)) target[type] = (target[type] ?? 0) + n;
+}
+
+function countTypes(rows: readonly Datasource[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const ds of rows) counts[ds.type] = (counts[ds.type] ?? 0) + 1;
+  return counts;
+}
 type KeyValueRow = {key: string; value: string};
+
+/** A stored MCP connector's server-questions choice; anything else follows
+ *  the installation default. */
+export function storedServerQuestions(
+  config: DatasourceConfig | null | undefined,
+): 'inherit' | McpServerQuestionsChoice {
+  const value = config?.server_questions;
+  return value === 'decline' || value === 'accept' ? value : 'inherit';
+}
 
 /**
  * Datasource management panel with full CRUD, type filtering, and connection testing.
@@ -76,6 +160,9 @@ type KeyValueRow = {key: string; value: string};
     AppIconButtonComponent,
     AppBadgeComponent,
     AppChipComponent,
+    AppCheckboxComponent,
+    ConnectorFilterBarComponent,
+    NgTemplateOutlet,
     AppInputComponent,
     AppSelectComponent,
     AppTextareaComponent,
@@ -96,36 +183,8 @@ type KeyValueRow = {key: string; value: string};
     <div class="ds-container" [class.form-open]="showForm()">
       <!-- Header -->
       <div class="header-bar">
-        <span class="title">{{ 'datasources.title' | transloco }}</span>
-        <div class="filter-chips">
-          @for (filter of typeFilters; track filter.value) {
-            <app-chip
-              size="sm"
-              [selected]="typeFilter() === filter.value"
-              (clicked)="onTypeFilter(filter.value)"
-            >
-              {{ filter.labelKey | transloco }}
-            </app-chip>
-          }
-        </div>
+        <h1 class="title">{{ 'datasources.title' | transloco }}</h1>
         <div class="header-actions">
-          <app-button
-            variant="primary"
-            size="sm"
-            [disabled]="showForm()"
-            (clicked)="openCreateForm()"
-          >
-            <app-icon size="sm">add</app-icon> {{ 'datasources.new' | transloco }}
-          </app-button>
-          <app-icon-button
-            variant="ghost"
-            size="sm"
-            [ariaLabel]="'datasources.refresh' | transloco"
-            [disabled]="isLoading()"
-            (clicked)="refresh()"
-          >
-            <app-icon size="sm">refresh</app-icon>
-          </app-icon-button>
           <a
             class="drivers-link"
             routerLink="/settings/connector-drivers"
@@ -134,6 +193,23 @@ type KeyValueRow = {key: string; value: string};
             <app-icon size="sm">fact_check</app-icon>
             <span class="drivers-link-text">{{ 'datasources.driversLink' | transloco }}</span>
           </a>
+          <app-icon-button
+            variant="ghost"
+            size="sm"
+            [ariaLabel]="'datasources.refresh' | transloco"
+            [tooltip]="'datasources.refresh' | transloco"
+            [disabled]="isLoading()"
+            (clicked)="refresh()"
+          >
+            <app-icon size="sm">refresh</app-icon>
+          </app-icon-button>
+          <app-button
+            variant="primary"
+            [disabled]="showForm()"
+            (clicked)="openCreateForm()"
+          >
+            {{ 'datasources.new' | transloco }}
+          </app-button>
         </div>
       </div>
 
@@ -141,14 +217,28 @@ type KeyValueRow = {key: string; value: string};
            connection is theirs to make, here (main cloud slice 4). -->
       <app-cloud-root-card />
 
-      @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-        <div class="catalog-filter-bar">
-          <app-input
-            size="sm"
-            [value]="catalogSearch()"
-            (valueChange)="onCatalogSearch($event)"
-            [placeholder]="'datasources.catalog.search' | transloco"
-          />
+      <!-- The filters, shaped like the jobs list's: a type strip with
+           counts, then search, Filters and a token per applied filter. The
+           connectors SRW keeps for projects are hidden by default and say
+           so with a token, like the jobs of archived projects. -->
+      <app-connector-filter-bar
+        class="catalog-toolbar"
+        [chips]="typeChips()"
+        [selectedType]="typeFilter()"
+        [searchable]="capabilities.datasourceScopeAutoAttachAvailable()"
+        [search]="catalogSearch()"
+        [tokens]="filterTokens()"
+        [panelOpen]="filtersOpen()"
+        (typeSelect)="onTypeFilter($event)"
+        (searchInput)="onCatalogSearch($event)"
+        (togglePanel)="toggleFilters()"
+        (removeToken)="removeFilterToken($event)"
+        (clearAll)="clearFilters()"
+      />
+
+      @if (filtersOpen()) {
+        <div class="catalog-filter-bar" data-catalog-filters>
+          @if (capabilities.datasourceScopeAutoAttachAvailable()) {
           <div class="catalog-project-filter">
             <app-input
               size="sm"
@@ -197,6 +287,13 @@ type KeyValueRow = {key: string; value: string};
             <option value="private">{{ 'datasources.catalog.private' | transloco }}</option>
             <option value="public">{{ 'datasources.catalog.public' | transloco }}</option>
           </app-select>
+          }
+          <div class="kept-toggle">
+            <app-checkbox size="sm" data-show-kept [checked]="showKept()" (changed)="setShowKept($event)">
+              {{ 'datasources.kept.show' | transloco }}
+            </app-checkbox>
+            <p class="kept-toggle__hint">{{ 'datasources.kept.showHint' | transloco }}</p>
+          </div>
         </div>
       }
 
@@ -1375,6 +1472,44 @@ type KeyValueRow = {key: string; value: string};
                 </app-form-field>
               </div>
             }
+
+            <!-- MCP connectors (remote and managed): what a question the
+                 server asks mid-call gets by itself. "Follow the default"
+                 stores nothing, so a change of the installation default
+                 moves this connector too. -->
+            @if (isMcpForm()) {
+              <div class="form-row">
+                <app-form-field
+                  class="flex-1"
+                  [label]="'datasources.form.serverQuestionsLabel' | transloco"
+                  [hint]="'datasources.form.serverQuestionsHint' | transloco"
+                >
+                  <div class="access-radio server-questions-radio" data-testid="server-questions">
+                    <label data-server-questions="inherit">
+                      <input type="radio" name="ds-server-questions"
+                        [checked]="formData.serverQuestions === 'inherit'"
+                        (change)="formData.serverQuestions = 'inherit'"
+                        [disabled]="isSaving()">
+                      {{ serverQuestionsInheritKey() | transloco }}
+                    </label>
+                    <label data-server-questions="decline">
+                      <input type="radio" name="ds-server-questions"
+                        [checked]="formData.serverQuestions === 'decline'"
+                        (change)="formData.serverQuestions = 'decline'"
+                        [disabled]="isSaving()">
+                      {{ 'datasources.form.serverQuestionsDecline' | transloco }}
+                    </label>
+                    <label data-server-questions="accept">
+                      <input type="radio" name="ds-server-questions"
+                        [checked]="formData.serverQuestions === 'accept'"
+                        (change)="formData.serverQuestions = 'accept'"
+                        [disabled]="isSaving()">
+                      {{ 'datasources.form.serverQuestionsAccept' | transloco }}
+                    </label>
+                  </div>
+                </app-form-field>
+              </div>
+            }
           </div>
 
           <div class="form-footer-bar">
@@ -1440,277 +1575,61 @@ type KeyValueRow = {key: string; value: string};
       }
 
       <!-- Loading State -->
-      @if (isLoading() && filteredDatasources().length === 0 && !showForm()) {
+      @if (isLoading() && filteredDatasources().length === 0 && !showForm() && !showKept()) {
         <div class="center-state">
           <app-spinner size="lg" tone="accent" />
           <span>{{ 'datasources.table.loading' | transloco }}</span>
         </div>
       }
 
-      <!-- Empty State -->
+      <!-- Your connectors. With the kept ones shown below, a heading tells
+           the two lists apart and an empty one is a single line. -->
+      @if (showKept() && !showForm()) {
+        <h2 class="list-title" data-own-title>{{ 'datasources.kept.yoursTitle' | transloco }}</h2>
+      }
       @if (!isLoading() && filteredDatasources().length === 0 && !showForm()) {
-        <div class="center-state">
-          <app-icon size="inherit" class="empty-icon">database</app-icon>
-          <span>{{ 'datasources.table.empty' | transloco }}</span>
-          <span class="hint">{{ 'datasources.table.emptyHint' | transloco }}</span>
-        </div>
+        @if (showKept()) {
+          <p class="list-empty" data-empty [attr.data-empty-kind]="emptyKind()">
+            {{ 'datasources.empty.' + emptyKind() + '.title' | transloco }}
+          </p>
+        } @else {
+          <!-- Nothing matches the filters, or nothing made yet (the one case
+               that offers to make the first). -->
+          <div class="center-state" data-empty [attr.data-empty-kind]="emptyKind()">
+            <app-icon size="inherit" class="empty-icon">{{ emptyKind() === 'filtered' ? 'filter_alt_off' : 'cable' }}</app-icon>
+            <span class="empty-title">{{ 'datasources.empty.' + emptyKind() + '.title' | transloco }}</span>
+            <span class="hint">{{ 'datasources.empty.' + emptyKind() + '.hint' | transloco }}</span>
+            @if (emptyKind() === 'filtered') {
+              <app-button variant="secondary" size="sm" (clicked)="clearFilters()">
+                {{ 'datasources.catalog.clearFilters' | transloco }}
+              </app-button>
+            } @else {
+              <app-button variant="primary" size="sm" (clicked)="openCreateForm()">
+                {{ 'datasources.new' | transloco }}
+              </app-button>
+            }
+          </div>
+        }
       }
 
-      <!-- Table -->
       @if (filteredDatasources().length > 0) {
         <div class="table-container">
           <div class="table-inner">
-            <table class="ds-table app-table">
+            <table class="ds-table app-table" data-own-table>
               <thead>
                 <tr>
-                  <th>{{ 'datasources.table.colType' | transloco }}</th>
                   <th>{{ 'datasources.table.colName' | transloco }}</th>
                   <th class="col-url">{{ 'datasources.table.colUrl' | transloco }}</th>
                   <th class="col-scope">{{ 'datasources.table.colVisibility' | transloco }}</th>
                   @if (capabilities.datasourceScopeAutoAttachAvailable()) {
                     <th class="col-availability">{{ 'datasources.table.colAvailability' | transloco }}</th>
                   }
-                  <th>{{ 'datasources.table.colActions' | transloco }}</th>
+                  <th class="col-actions"><span class="sr-only">{{ 'datasources.table.colActions' | transloco }}</span></th>
                 </tr>
               </thead>
               <tbody>
                 @for (ds of filteredDatasources(); track ds.id) {
-                  <tr>
-                    <td>
-                      <app-badge [tone]="dsTypeTone(ds.type)" size="sm">
-                        <app-icon size="sm">{{ getTypeIcon(ds.type) }}</app-icon>
-                        {{ 'datasources.filter.' + ds.type | transloco }}
-                      </app-badge>
-                    </td>
-                    <td class="name-cell">
-                      <span class="ds-name">{{ ds.name }}</span>
-                      @if (ds.description) {
-                        <span class="ds-desc">{{ ds.description }}</span>
-                      }
-                      @if (ds.driver_env_names?.length) {
-                        <span class="ds-desc" data-driver-env>
-                          {{ 'datasources.driverEnvNames' | transloco }}
-                          <code>{{ ds.driver_env_names!.join(', ') }}</code>
-                        </span>
-                      }
-                      @if (ds.type === 'kb' && indexStatuses()[ds.id]; as indexStatus) {
-                        <div class="index-status-row">
-                          <app-badge [tone]="indexStatusTone(indexStatus.status)" size="xs">
-                            {{ indexStatusLabel(indexStatus) }}
-                          </app-badge>
-                          @if (indexStatus.status === 'indexing' && indexStatus.notes_total) {
-                            <span
-                              class="index-progress"
-                              [title]="
-                                'datasources.table.indexProgressTitle'
-                                  | transloco
-                                    : {
-                                        done: indexStatus.notes_done ?? 0,
-                                        total: indexStatus.notes_total
-                                      }
-                              "
-                            >
-                              <span class="index-progress-count">
-                                {{ indexStatus.notes_done ?? 0 }}/{{ indexStatus.notes_total }}
-                              </span>
-                              <span class="index-progress-track">
-                                <span
-                                  class="index-progress-fill"
-                                  [style.width.%]="indexProgressPercent(indexStatus)"
-                                ></span>
-                              </span>
-                            </span>
-                          }
-                          @if (indexStatus.last_success_at) {
-                            <span
-                              class="index-status-detail"
-                              [title]="indexStatus.last_success_at"
-                            >
-                              {{ 'datasources.table.lastSuccess' | transloco }}:
-                              {{ formatIndexDate(indexStatus.last_success_at) }}
-                            </span>
-                          }
-                          @if (indexStatus.last_error) {
-                            <span
-                              class="index-status-error"
-                              [title]="redactIndexError(indexStatus.last_error)"
-                            >
-                              {{ redactIndexError(indexStatus.last_error) }}
-                            </span>
-                          }
-                        </div>
-                      }
-                      @if (viewport.isMobile()) {
-                        <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
-                          {{ scopeLabelKey(ds) | transloco }}
-                        </app-badge>
-                        @if (ds.is_global && isPublicReadWrite(ds)) {
-                          <app-badge class="ds-scope-inline" tone="warning" size="xs">
-                            {{ 'datasources.table.badgeRw' | transloco }}
-                          </app-badge>
-                        } @else if (isPrivateReadOnly(ds)) {
-                          <app-badge class="ds-scope-inline" tone="info" size="xs" data-creator-read-only>
-                            {{ 'datasources.table.badgeRo' | transloco }}
-                          </app-badge>
-                        }
-                        @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-                          <app-badge class="ds-scope-inline" [tone]="availabilityTone(ds)" size="xs">
-                            {{ availabilityLabel(ds) }}
-                          </app-badge>
-                          @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
-                            <app-badge class="ds-scope-inline" tone="accent" size="xs">
-                              {{ 'datasources.table.badgeAuto' | transloco }}
-                            </app-badge>
-                          }
-                        }
-                      }
-                    </td>
-                    <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
-                    <td class="col-scope">
-                      <app-badge [tone]="scopeTone(ds)" size="xs">
-                        {{ scopeLabelKey(ds) | transloco }}
-                      </app-badge>
-                      @if (ds.is_global && isPublicReadWrite(ds)) {
-                        <app-badge tone="warning" size="xs">
-                          {{ 'datasources.table.badgeRw' | transloco }}
-                        </app-badge>
-                      } @else if (isPrivateReadOnly(ds)) {
-                        <app-badge tone="info" size="xs" data-creator-read-only>
-                          {{ 'datasources.table.badgeRo' | transloco }}
-                        </app-badge>
-                      }
-                    </td>
-                    @if (capabilities.datasourceScopeAutoAttachAvailable()) {
-                      <td class="col-availability">
-                        <app-badge [tone]="availabilityTone(ds)" size="xs">
-                          {{ availabilityLabel(ds) }}
-                        </app-badge>
-                        @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
-                          <app-badge tone="accent" size="xs">
-                            {{ 'datasources.table.badgeAuto' | transloco }}
-                          </app-badge>
-                        }
-                      </td>
-                    }
-                    <td class="actions-cell">
-                      @if (canManage(ds) && viewport.isMobile()) {
-                        <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
-                             cell is just the kebab and the table fits without h-scroll
-                             (mirrors the Jobs list). -->
-                        <app-icon-button
-                          variant="ghost"
-                          size="sm"
-                          [ariaLabel]="'datasources.table.moreActions' | transloco"
-                          [loading]="testingIds().has(ds.id) || reindexingIds().has(ds.id)"
-                          [appMenuTrigger]="rowMenu"
-                          menuPlacement="bottom-end"
-                        >
-                          <app-icon size="sm">more_vert</app-icon>
-                        </app-icon-button>
-                        <app-menu #rowMenu>
-                          <app-menu-item (activated)="testDatasource(ds.id)">
-                            {{ 'datasources.table.testTooltip' | transloco }}
-                          </app-menu-item>
-                          @if (ds.type === 'kb') {
-                            <app-menu-item (activated)="reindexDatasource(ds)">
-                              {{ 'datasources.table.reindexTooltip' | transloco }}
-                            </app-menu-item>
-                          }
-                          @if (ds.type === 'kb') {
-                            <app-menu-item (activated)="reindexDatasource(ds, true)">
-                              {{ 'datasources.table.fullReindexTooltip' | transloco }}
-                            </app-menu-item>
-                          }
-                          @if (canEditRow(ds)) {
-                            <app-menu-item (activated)="openEditForm(ds)">
-                              {{ 'datasources.table.editTooltip' | transloco }}
-                            </app-menu-item>
-                          }
-                          @if (canDeleteRow(ds)) {
-                            <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
-                              {{ 'datasources.table.deleteTooltip' | transloco }}
-                            </app-menu-item>
-                          }
-                        </app-menu>
-                      } @else if (canManage(ds)) {
-                        <app-icon-button
-                          variant="ghost"
-                          size="sm"
-                          [ariaLabel]="'datasources.table.testTooltip' | transloco"
-                          [tooltip]="'datasources.table.testTooltip' | transloco"
-                          [loading]="testingIds().has(ds.id)"
-                          (clicked)="testDatasource(ds.id)"
-                        >
-                          <app-icon size="sm">cable</app-icon>
-                        </app-icon-button>
-                        @if (ds.type === 'kb') {
-                          <app-icon-button
-                            variant="ghost"
-                            size="sm"
-                            [ariaLabel]="'datasources.table.reindexTooltip' | transloco"
-                            [tooltip]="'datasources.table.reindexTooltip' | transloco"
-                            [loading]="reindexingIds().has(ds.id)"
-                            (clicked)="reindexDatasource(ds)"
-                          >
-                            <app-icon size="sm">sync</app-icon>
-                          </app-icon-button>
-                          <app-icon-button
-                            variant="ghost"
-                            size="sm"
-                            [ariaLabel]="'datasources.table.fullReindexTooltip' | transloco"
-                            [tooltip]="'datasources.table.fullReindexTooltip' | transloco"
-                            [disabled]="reindexingIds().has(ds.id)"
-                            (clicked)="reindexDatasource(ds, true)"
-                          >
-                            <app-icon size="sm">restart_alt</app-icon>
-                          </app-icon-button>
-                        }
-                        @if (canEditRow(ds)) {
-                          <app-icon-button
-                            variant="ghost"
-                            size="sm"
-                            [ariaLabel]="'datasources.table.editTooltip' | transloco"
-                            [tooltip]="'datasources.table.editTooltip' | transloco"
-                            (clicked)="openEditForm(ds)"
-                          >
-                            <app-icon size="sm">edit</app-icon>
-                          </app-icon-button>
-                        }
-                        @if (canDeleteRow(ds)) {
-                          <app-icon-button
-                            variant="danger"
-                            size="sm"
-                            [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
-                            [tooltip]="'datasources.table.deleteTooltip' | transloco"
-                            (clicked)="deleteDatasource(ds)"
-                          >
-                            <app-icon size="sm">delete</app-icon>
-                          </app-icon-button>
-                        }
-                      }
-                      <!-- SRW provisions and manages a platform-owned row
-                           (a project's knowledge base or cloud folder, a
-                           user's own): nobody deletes or re-points it here. -->
-                      @if (managedLabelKey(ds); as managedKey) {
-                        <span class="managed-note" data-managed>
-                          <app-icon size="xs">lock</app-icon>
-                          {{ managedKey | transloco }}
-                        </span>
-                      }
-
-                      @if (canManage(ds) && testResults()[ds.id]; as result) {
-                        <span
-                          class="inline-test"
-                          [class.test-ok]="result.status === 'ok'"
-                          [class.test-error]="result.status === 'error'"
-                          [class.test-unsupported]="result.status === 'unsupported'"
-                          title="{{ result.message }}"
-                        >
-                          <app-icon size="sm">{{ testResultIcon(result) }}</app-icon>
-                        </span>
-                      }
-                    </td>
-                  </tr>
+                  <ng-container *ngTemplateOutlet="connectorRow; context: {$implicit: ds, kept: false}" />
                 }
               </tbody>
             </table>
@@ -1724,7 +1643,340 @@ type KeyValueRow = {key: string; value: string};
           </div>
         </div>
       }
+
+      <!-- What SRW keeps for projects and people, one group per project
+           (main_cloud_as_connectors: every folder an execution receives is a
+           connector its user can see). -->
+      @if (showKept() && !showForm()) {
+        <section class="kept-section" data-kept-section>
+          <h2 class="list-title">{{ 'datasources.kept.title' | transloco }}</h2>
+          <p class="list-hint">{{ 'datasources.kept.hint' | transloco }}</p>
+          @if (keptLoading() && keptRows().length === 0) {
+            <div class="list-empty"><app-spinner size="sm" /></div>
+          } @else if (keptGroups().length === 0) {
+            <p class="list-empty" data-kept-empty>{{ 'datasources.kept.none' | transloco }}</p>
+          } @else {
+            <div class="table-container">
+              <div class="table-inner">
+                <table class="ds-table app-table" data-kept-table>
+                  <thead>
+                <tr>
+                  <th>{{ 'datasources.table.colName' | transloco }}</th>
+                  <th class="col-url">{{ 'datasources.table.colUrl' | transloco }}</th>
+                  <th class="col-scope">{{ 'datasources.table.colVisibility' | transloco }}</th>
+                  @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+                    <th class="col-availability">{{ 'datasources.table.colAvailability' | transloco }}</th>
+                  }
+                  <th class="col-actions"><span class="sr-only">{{ 'datasources.table.colActions' | transloco }}</span></th>
+                </tr>
+              </thead>
+                  @for (group of keptGroups(); track group.key) {
+                    <tbody [attr.data-kept-group]="group.key">
+                      <tr class="group-row">
+                        <th [attr.colspan]="columnCount()" scope="colgroup">
+                          @if (group.projectId) {
+                            <a class="group-link" [routerLink]="['/projects', group.projectId]">{{ group.label }}</a>
+                          } @else {
+                            {{ group.labelKey | transloco }}
+                          }
+                        </th>
+                      </tr>
+                      @for (ds of group.rows; track ds.id) {
+                        <ng-container *ngTemplateOutlet="connectorRow; context: {$implicit: ds, kept: true}" />
+                      }
+                    </tbody>
+                  }
+                </table>
+                @if (capabilities.datasourceScopeAutoAttachAvailable() && keptNextCursor()) {
+                  <div class="load-more-row">
+                    <app-button variant="secondary" size="sm" [loading]="keptLoadingMore()" (clicked)="loadMoreKept()">
+                      {{ 'datasources.catalog.loadMore' | transloco }}
+                    </app-button>
+                  </div>
+                }
+              </div>
+            </div>
+          }
+        </section>
+      }
     </div>
+
+    <!-- One row of either list. -->
+    <ng-template #connectorRow let-ds let-kept="kept">
+      <tr>
+        <!-- One cell says what the connector is: its icon, its
+             name with the type beside it, then what it is for. -->
+        <td class="name-cell">
+          <div class="name-row">
+          <span class="ds-icon" [attr.data-type]="ds.type">
+            <app-icon size="md">{{ getTypeIcon(ds.type) }}</app-icon>
+          </span>
+          <div class="name-text">
+          <span class="ds-title">
+            <!-- A connector SRW keeps is named for what it is to its
+                 project; its stored name repeats the project's and carries
+                 an id. -->
+            @if (kept) {
+              <span class="ds-name" [title]="ds.name">{{ typeLabelKey(ds) | transloco }}</span>
+            } @else {
+              <span class="ds-name">{{ ds.name }}</span>
+              <span class="ds-type">{{ typeLabelKey(ds) | transloco }}</span>
+            }
+          </span>
+          @if (ds.description) {
+            <span class="ds-desc">{{ ds.description }}</span>
+          }
+          @if (ds.driver_env_names?.length) {
+            <span class="ds-desc" data-driver-env>
+              {{ 'datasources.driverEnvNames' | transloco }}
+              <code>{{ ds.driver_env_names!.join(', ') }}</code>
+            </span>
+          }
+          @if (ds.type === 'kb' && indexStatuses()[ds.id]; as indexStatus) {
+            <div class="index-status-row">
+              <app-badge [tone]="indexStatusTone(indexStatus.status)" size="xs">
+                {{ indexStatusLabel(indexStatus) }}
+              </app-badge>
+              @if (indexStatus.status === 'indexing' && indexStatus.notes_total) {
+                <span
+                  class="index-progress"
+                  [title]="
+                    'datasources.table.indexProgressTitle'
+                      | transloco
+                        : {
+                            done: indexStatus.notes_done ?? 0,
+                            total: indexStatus.notes_total
+                          }
+                  "
+                >
+                  <span class="index-progress-count">
+                    {{ indexStatus.notes_done ?? 0 }}/{{ indexStatus.notes_total }}
+                  </span>
+                  <span class="index-progress-track">
+                    <span
+                      class="index-progress-fill"
+                      [style.width.%]="indexProgressPercent(indexStatus)"
+                    ></span>
+                  </span>
+                </span>
+              }
+              @if (indexStatus.last_success_at) {
+                <span
+                  class="index-status-detail"
+                  [title]="indexStatus.last_success_at"
+                >
+                  {{ 'datasources.table.lastSuccess' | transloco }}:
+                  {{ formatIndexDate(indexStatus.last_success_at) }}
+                </span>
+              }
+              @if (indexStatus.last_error) {
+                <span
+                  class="index-status-error"
+                  [title]="redactIndexError(indexStatus.last_error)"
+                >
+                  {{ redactIndexError(indexStatus.last_error) }}
+                </span>
+              }
+            </div>
+          }
+          @if (viewport.isMobile()) {
+            <!-- Visibility and availability, whose columns a phone hides. -->
+            <div class="ds-scope-row">
+            <app-badge class="ds-scope-inline" [tone]="scopeTone(ds)" size="xs">
+              {{ scopeLabelKey(ds) | transloco }}
+            </app-badge>
+            @if (ds.is_global && isPublicReadWrite(ds)) {
+              <app-badge class="ds-scope-inline" tone="warning" size="xs">
+                {{ 'datasources.table.badgeRw' | transloco }}
+              </app-badge>
+            } @else if (isPrivateReadOnly(ds)) {
+              <app-badge class="ds-scope-inline" tone="info" size="xs" data-creator-read-only>
+                {{ 'datasources.table.badgeRo' | transloco }}
+              </app-badge>
+            }
+            @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+              <app-badge class="ds-scope-inline" [tone]="availabilityTone(ds)" size="xs">
+                {{ availabilityLabel(ds) }}
+              </app-badge>
+              @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
+                <app-badge class="ds-scope-inline" tone="accent" size="xs">
+                  {{ 'datasources.table.badgeAuto' | transloco }}
+                </app-badge>
+              }
+            }
+            </div>
+          }
+          </div>
+          </div>
+        </td>
+        <td class="url-cell mono col-url">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
+        <td class="col-scope">
+          <app-badge [tone]="scopeTone(ds)" size="xs">
+            {{ scopeLabelKey(ds) | transloco }}
+          </app-badge>
+          @if (ds.is_global && isPublicReadWrite(ds)) {
+            <app-badge tone="warning" size="xs">
+              {{ 'datasources.table.badgeRw' | transloco }}
+            </app-badge>
+          } @else if (isPrivateReadOnly(ds)) {
+            <app-badge tone="info" size="xs" data-creator-read-only>
+              {{ 'datasources.table.badgeRo' | transloco }}
+            </app-badge>
+          }
+        </td>
+        @if (capabilities.datasourceScopeAutoAttachAvailable()) {
+          <td class="col-availability">
+            <app-badge [tone]="availabilityTone(ds)" size="xs">
+              {{ availabilityLabel(ds) }}
+            </app-badge>
+            @if (isOwnedByCurrentUser(ds) && ds.auto_attach) {
+              <app-badge tone="accent" size="xs">
+                {{ 'datasources.table.badgeAuto' | transloco }}
+              </app-badge>
+            }
+          </td>
+        }
+        <td class="actions-cell">
+          @if (canManage(ds) && viewport.isMobile()) {
+            <!-- Mobile: collapse the row actions into a ⋯ overflow menu so the
+                 cell is just the kebab and the table fits without h-scroll
+                 (mirrors the Jobs list). -->
+            <app-icon-button
+              variant="ghost"
+              size="sm"
+              [ariaLabel]="'datasources.table.moreActions' | transloco"
+              [loading]="testingIds().has(ds.id) || reindexingIds().has(ds.id)"
+              [appMenuTrigger]="rowMenu"
+              menuPlacement="bottom-end"
+            >
+              <app-icon size="sm">more_vert</app-icon>
+            </app-icon-button>
+            <app-menu #rowMenu>
+              <app-menu-item (activated)="testDatasource(ds.id)">
+                {{ 'datasources.table.testTooltip' | transloco }}
+              </app-menu-item>
+              @if (ds.type === 'kb') {
+                <app-menu-item (activated)="reindexDatasource(ds)">
+                  {{ 'datasources.table.reindexTooltip' | transloco }}
+                </app-menu-item>
+              }
+              @if (ds.type === 'kb') {
+                <app-menu-item (activated)="reindexDatasource(ds, true)">
+                  {{ 'datasources.table.fullReindexTooltip' | transloco }}
+                </app-menu-item>
+              }
+              @if (canEditRow(ds)) {
+                <app-menu-item (activated)="openEditForm(ds)">
+                  {{ 'datasources.table.editTooltip' | transloco }}
+                </app-menu-item>
+              }
+              @if (canDeleteRow(ds)) {
+                <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
+                  {{ 'datasources.table.deleteTooltip' | transloco }}
+                </app-menu-item>
+              }
+            </app-menu>
+          } @else if (canManage(ds)) {
+            <!-- Two actions in view, the rest behind one menu: a
+                 knowledge base used to show five icons in a row. -->
+            <app-icon-button
+              variant="ghost"
+              size="sm"
+              [ariaLabel]="'datasources.table.testTooltip' | transloco"
+              [tooltip]="'datasources.table.testTooltip' | transloco"
+              [loading]="testingIds().has(ds.id)"
+              (clicked)="testDatasource(ds.id)"
+            >
+              <app-icon size="sm">cable</app-icon>
+            </app-icon-button>
+            @if (canEditRow(ds)) {
+              <app-icon-button
+                variant="ghost"
+                size="sm"
+                [ariaLabel]="'datasources.table.editTooltip' | transloco"
+                [tooltip]="'datasources.table.editTooltip' | transloco"
+                (clicked)="openEditForm(ds)"
+              >
+                <app-icon size="sm">edit</app-icon>
+              </app-icon-button>
+            }
+            @if (hasRowMenu(ds)) {
+              <app-icon-button
+                variant="ghost"
+                size="sm"
+                data-row-menu
+                [ariaLabel]="'datasources.table.moreActions' | transloco"
+                [tooltip]="'datasources.table.moreActions' | transloco"
+                [loading]="reindexingIds().has(ds.id)"
+                [appMenuTrigger]="rowMoreMenu"
+                menuPlacement="bottom-end"
+              >
+                <app-icon size="sm">more_vert</app-icon>
+              </app-icon-button>
+              <!-- One item per block: a block with two roots is
+                   not projected into the menu. -->
+              <app-menu #rowMoreMenu>
+                @if (ds.type === 'kb') {
+                  <app-menu-item (activated)="reindexDatasource(ds)">
+                    {{ 'datasources.table.reindexTooltip' | transloco }}
+                  </app-menu-item>
+                }
+                @if (ds.type === 'kb') {
+                  <app-menu-item (activated)="reindexDatasource(ds, true)">
+                    {{ 'datasources.table.fullReindexTooltip' | transloco }}
+                  </app-menu-item>
+                }
+                @if (canDeleteRow(ds)) {
+                  <app-menu-item tone="danger" (activated)="deleteDatasource(ds)">
+                    {{ 'datasources.table.deleteTooltip' | transloco }}
+                  </app-menu-item>
+                }
+              </app-menu>
+            }
+          }
+          <!-- SRW provisions and manages a platform-owned row
+               (a project's knowledge base or cloud folder, a
+               user's own): nobody deletes or re-points it here. -->
+          @if (managedLabelKey(ds); as managedKey) {
+            <span
+              class="managed-note"
+              data-managed
+              role="img"
+              [attr.aria-label]="managedKey | transloco"
+              [title]="managedKey | transloco"
+            >
+              <app-icon size="sm">lock</app-icon>
+            </span>
+          }
+
+          @if (canManage(ds) && testResults()[ds.id]; as result) {
+            <span
+              class="inline-test"
+              [class.test-ok]="result.status === 'ok'"
+              [class.test-error]="result.status === 'error'"
+              [class.test-unsupported]="result.status === 'unsupported'"
+              title="{{ result.message }}"
+            >
+              <app-icon size="sm">{{ testResultIcon(result) }}</app-icon>
+            </span>
+          }
+        </td>
+      </tr>
+    </ng-template>
+
+    <!-- Delete confirmation: the name typed, as for a read-write publish. -->
+    <app-confirm-name-dialog
+      [open]="pendingDelete() !== null"
+      [title]="'datasources.deleteDialog.title' | transloco: { name: pendingDelete()?.name ?? '' }"
+      [message]="'datasources.deleteDialog.message' | transloco"
+      [requiredName]="pendingDelete()?.name ?? null"
+      [namePrompt]="'datasources.deleteDialog.namePrompt' | transloco"
+      [confirmLabel]="'datasources.deleteDialog.confirm' | transloco"
+      [cancelLabel]="'datasources.deleteDialog.cancel' | transloco"
+      confirmVariant="danger"
+      (confirmed)="confirmDelete()"
+      (dismissed)="pendingDelete.set(null)"
+    />
 
     <!-- Publish confirmation (two tiers: warn / type-the-name) -->
     <app-confirm-name-dialog
@@ -1810,47 +2062,44 @@ type KeyValueRow = {key: string; value: string};
         display: block;
         height: 100%;
         overflow: hidden;
+        /* The page gutter, the same 1.5rem the other Customize tabs use. */
+        --ds-gutter: 1.5rem;
       }
 
       .ds-container {
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, var(--panel-bg));
       }
 
-      /* Header */
+      /* Browsing (no form open): the page scrolls as one, so the header, the
+         cloud card and the filters scroll away and the list gets the whole
+         height. Before, only the table scrolled, in whatever height the blocks
+         above it left over (three rows on a 720px-tall window). With a form
+         open the column stays fixed: the form panel is its own scroll region
+         (see .form-panel). */
+      .ds-container:not(.form-open) {
+        overflow-y: auto;
+      }
+
+      /* Header: the same shape as the other Customize tabs (h1, actions at the
+         right edge, filters on the row below). */
       .header-bar {
         display: flex;
         align-items: center;
         gap: 12px;
-        padding: 10px 12px;
-        background: var(--panel-header-bg);
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        padding: 1rem var(--ds-gutter) 0.75rem;
         flex-shrink: 0;
         flex-wrap: wrap;
       }
 
       .title {
-        font-weight: 600;
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      /* Thirteen type chips never fit beside the title, so they take their
-         own row (order + full basis) and the actions stay on the title row —
-         the same shape the Jobs header uses. */
-      .filter-chips {
-        display: flex;
-        gap: 4px;
-        flex-wrap: wrap;
-        order: 1;
-        flex-basis: 100%;
-        min-width: 0;
+        margin: 0;
       }
 
       .header-actions {
         display: flex;
-        gap: 6px;
+        gap: 8px;
         margin-left: auto;
         align-items: center;
       }
@@ -1876,14 +2125,132 @@ type KeyValueRow = {key: string; value: string};
         }
       }
 
+      /* The filter bar (connector-filter-bar) on the page gutter. */
+      .catalog-toolbar {
+        display: block;
+        padding: 0 var(--ds-gutter) 0.75rem;
+        flex-shrink: 0;
+      }
+
+      /* A grid, so a control left alone on the last row keeps the width of
+         the others instead of stretching across the page. */
       .catalog-filter-bar {
         display: grid;
-        grid-template-columns: minmax(220px, 1fr) minmax(300px, 1.2fr) repeat(4, minmax(130px, auto));
+        grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+        align-items: center;
         gap: 8px;
-        padding: 8px 12px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        background: var(--panel-header-bg);
+        margin: 0 var(--ds-gutter) 0.75rem;
+        padding: 10px;
+        border: 1px solid var(--border-hairline);
+        border-radius: var(--radius-surface);
+        background: var(--panel-bg);
         flex-shrink: 0;
+      }
+
+      .catalog-filter-bar > .catalog-project-filter {
+        grid-column: span 2;
+      }
+
+      .catalog-filter-bar > app-select {
+        min-width: 0;
+      }
+
+      /* The switch for what SRW keeps, under the selects, with its hint. */
+      .kept-toggle {
+        grid-column: 1 / -1;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding-top: 4px;
+      }
+
+      .kept-toggle__hint {
+        margin: 0 0 0 26px;
+        font-size: 12px;
+        line-height: 1.45;
+        color: var(--text-muted);
+      }
+
+      /* With what SRW keeps shown, each list has a heading. */
+      .list-title {
+        margin: 0;
+        padding: 0.5rem var(--ds-gutter) 0.5rem;
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--text-primary);
+        flex-shrink: 0;
+      }
+
+      .list-hint {
+        margin: -0.25rem 0 0.75rem;
+        padding: 0 var(--ds-gutter);
+        max-width: 78ch;
+        font-size: 13px;
+        line-height: 1.45;
+        color: var(--text-muted);
+      }
+
+      .list-empty {
+        margin: 0 0 1rem;
+        padding: 0 var(--ds-gutter);
+        font-size: 13px;
+        color: var(--text-muted);
+      }
+
+      .kept-section {
+        display: flex;
+        flex-direction: column;
+        flex-shrink: 0;
+        margin-top: 0.75rem;
+      }
+
+      /* A group of the kept list: the project's name over its rows. Not the
+         column headers' small capitals; it reads as a sub-heading. */
+      .ds-table .group-row th {
+        text-align: left;
+        padding: 14px 12px 6px;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: normal;
+        text-transform: none;
+        color: var(--text-primary);
+        background: transparent;
+        border-bottom: 1px solid var(--border-hairline);
+      }
+
+      .group-link {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      .group-link:hover {
+        color: var(--accent-color);
+        text-decoration: underline;
+      }
+
+      .group-link:focus-visible {
+        outline: 2px solid var(--accent-color);
+        outline-offset: 2px;
+        border-radius: var(--radius-tag);
+      }
+
+      /* Authoring: the form has the page. The browse controls filter a list
+         the open form has taken the place of, so they step aside (they keep
+         their state) and return when it closes. */
+      .form-open app-cloud-root-card,
+      .form-open .catalog-toolbar,
+      .form-open .catalog-filter-bar,
+      .form-open .table-container {
+        display: none;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
       }
 
       .catalog-project-filter {
@@ -1902,7 +2269,7 @@ type KeyValueRow = {key: string; value: string};
         align-items: center;
         justify-content: space-between;
         padding: 8px 12px;
-        margin: 8px 12px 0;
+        margin: 8px var(--ds-gutter) 0;
         border-radius: var(--radius-control);
         font-size: 12px;
         flex-shrink: 0;
@@ -1928,32 +2295,56 @@ type KeyValueRow = {key: string; value: string};
          the panel take only the space left over and hand the overflow to
          .form-body, keeping the title and the Test/Cancel/Create bar pinned. */
       .form-panel {
-        margin: 8px 12px 0;
+        margin: 0 var(--ds-gutter) 1rem;
         border: 1px solid var(--border-color, var(--surface-1));
         border-radius: var(--radius-surface);
-        background: rgba(0, 0, 0, 0.2);
+        background: var(--panel-bg);
         display: flex;
         flex-direction: column;
         flex: 0 1 auto;
         min-height: 0;
+        /* A form reads badly at the full width of a wide window. */
+        width: min(100% - 2 * var(--ds-gutter), 860px);
       }
 
       .form-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 10px 14px;
+        padding: 12px 16px;
         border-bottom: 1px solid var(--border-color, var(--surface-0));
         font-weight: 600;
-        font-size: 13px;
+        font-size: 15px;
         color: var(--text-primary, var(--text-primary));
         flex-shrink: 0;
       }
 
+      /* The fields stood edge to edge; a column with one gap spaces every
+         field and row alike. */
       .form-body {
-        padding: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        padding: 16px;
         overflow-y: auto;
         min-height: 0;
+      }
+
+      /* The column scrolls; nothing in it gives up height. Without this a
+         row that clips its overflow (.form-row) shrinks to nothing once the
+         form is taller than the panel. */
+      .form-body > * {
+        flex-shrink: 0;
+      }
+
+      /* A note or a row of buttons that follows a field belongs to it: it
+         keeps its own small distance instead of the gap between fields. */
+      .form-body > .form-hint,
+      .form-body > .credential-retain-hint,
+      .form-body > .trust-notice,
+      .form-body > .ssh-key-actions,
+      .form-body > .cred-file-actions {
+        margin-top: -8px;
       }
 
       .form-row {
@@ -2129,6 +2520,12 @@ type KeyValueRow = {key: string; value: string};
         gap: 20px;
       }
 
+      /* Three choices with longer labels: they wrap on a narrow screen. */
+      .server-questions-radio {
+        flex-wrap: wrap;
+        row-gap: 8px;
+      }
+
       .generic-preview-toggle {
         display: flex;
         align-items: flex-start;
@@ -2225,7 +2622,7 @@ type KeyValueRow = {key: string; value: string};
         cursor: pointer;
       }
 
-      .project-option:hover { background: rgba(255, 255, 255, 0.03); }
+      .project-option:hover { background: var(--hover); }
       .project-option.retained-only { color: var(--warning); }
       .project-option small { margin-left: auto; }
 
@@ -2322,7 +2719,7 @@ type KeyValueRow = {key: string; value: string};
         line-height: 1.4;
         padding: 10px 36px 10px 12px;
         margin: 0;
-        background: rgba(0, 0, 0, 0.25);
+        background: var(--surface-1);
         border: 1px solid var(--border-color, var(--surface-1));
         border-radius: var(--radius-tag);
         white-space: pre-wrap;
@@ -2371,6 +2768,13 @@ type KeyValueRow = {key: string; value: string};
         flex: 1;
         color: var(--text-muted);
         font-size: 13px;
+        text-align: center;
+      }
+
+      .empty-title {
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--text-primary);
       }
 
       .empty-icon {
@@ -2379,8 +2783,9 @@ type KeyValueRow = {key: string; value: string};
       }
 
       .hint {
-        font-size: 11px;
-        opacity: 0.7;
+        max-width: 56ch;
+        font-size: 13px;
+        line-height: 1.45;
       }
 
       /* Table
@@ -2396,8 +2801,26 @@ type KeyValueRow = {key: string; value: string};
         min-height: 0;
       }
 
+      /* Browsing: the page is the scroll box (see .ds-container), so the table
+         keeps its natural height and only scrolls sideways when it must. */
+      .ds-container:not(.form-open) .table-container {
+        flex: none;
+        overflow-x: auto;
+        overflow-y: visible;
+      }
+
       .table-inner {
-        padding: 8px;
+        padding: 0 var(--ds-gutter) 1rem;
+        container-type: inline-size;
+      }
+
+      /* The URL column goes first when the table is short of room: it is masked,
+         truncated and empty for most connector types, and the form shows the
+         full value. Same call the phone layout makes below. */
+      @container (max-width: 1000px) {
+        .col-url {
+          display: none;
+        }
       }
 
       .load-more-row {
@@ -2410,32 +2833,91 @@ type KeyValueRow = {key: string; value: string};
         margin-right: 4px;
       }
 
-      /* Name cell */
+      /* Name cell: icon, then the name with its type beside it, then what the
+         connector is for. The same anatomy as a row of a project's Connectors
+         tab. */
       .name-cell {
-        max-width: 200px;
+        min-width: 260px;
+      }
+
+      .name-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+      }
+
+      /* As tall as the icon at least, so a row with a name and nothing under
+         it sits level with its icon rather than above it. */
+      .name-text {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        flex: 1;
+        min-width: 0;
+        min-height: 32px;
+      }
+
+      .ds-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        flex-shrink: 0;
+        border-radius: var(--radius-control);
+        background: var(--surface-1);
+        color: var(--text-secondary);
+      }
+
+      .ds-icon[data-type='kb'] { color: var(--accent-color); }
+      .ds-icon[data-type='postgresql'],
+      .ds-icon[data-type='repository'],
+      .ds-icon[data-type='mcp'],
+      .ds-icon[data-type^='cloud_'] { color: var(--info); }
+      .ds-icon[data-type='neo4j'] { color: var(--success); }
+      .ds-icon[data-type='email'],
+      .ds-icon[data-type='webdav'] { color: var(--warning); }
+
+      .ds-title {
+        display: flex;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 0 8px;
       }
 
       .ds-name {
-        display: block;
-        font-weight: 500;
+        font-weight: 600;
+        overflow-wrap: anywhere;
+      }
+
+      .ds-type {
+        font-size: 12px;
+        color: var(--text-muted);
+        white-space: nowrap;
       }
 
       .ds-desc {
-        display: block;
-        font-size: 10px;
-        color: var(--text-muted);
-        white-space: nowrap;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        line-clamp: 2;
         overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 200px;
+        margin-top: 2px;
+        max-width: 72ch;
+        font-size: 12px;
+        line-height: 1.45;
+        color: var(--text-muted);
       }
 
+      /* contain: the row fills the name cell but never sets its width. Its
+         nowrap status text would otherwise claim 360px of table width. */
       .index-status-row {
         display: flex;
         align-items: center;
         gap: 6px;
         margin-top: 5px;
         max-width: 360px;
+        contain: inline-size;
       }
 
       .index-status-detail,
@@ -2444,7 +2926,7 @@ type KeyValueRow = {key: string; value: string};
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        font-size: 10px;
+        font-size: 11px;
       }
 
       .index-status-detail {
@@ -2473,7 +2955,7 @@ type KeyValueRow = {key: string; value: string};
         width: 64px;
         height: 4px;
         border-radius: var(--radius-tag);
-        background: var(--surface-3, rgba(127, 127, 127, 0.25));
+        background: var(--surface-2);
         overflow: hidden;
       }
 
@@ -2523,11 +3005,10 @@ type KeyValueRow = {key: string; value: string};
       .managed-note {
         display: inline-flex;
         align-items: center;
-        gap: 4px;
-        margin-left: 4px;
-        font-size: 12px;
+        margin-left: 6px;
         color: var(--text-muted);
         vertical-align: middle;
+        cursor: help;
       }
 
       .inline-test.test-ok { color: var(--success); }
@@ -2535,108 +3016,57 @@ type KeyValueRow = {key: string; value: string};
       .inline-test.test-unsupported { color: var(--text-muted); }
 
       /* ===== Mobile (≤768px) =====
-         This page never had a responsive pass. Mirror the Jobs header (a single
-         horizontally-scrollable chip strip with a right edge-fade) and shrink the
-         table so it fits without horizontal scroll (the row actions collapse into a
-         ⋯ overflow menu in the template). 768px matches ViewportService.isMobile(). */
+         The toolbar wraps onto two rows and the table shrinks to the name and a
+         kebab, so nothing scrolls sideways (the row actions collapse into a ⋯
+         overflow menu in the template). 768px matches ViewportService.isMobile(). */
       @media (max-width: 768px) {
+        :host {
+          --ds-gutter: 12px;
+        }
+
         .catalog-filter-bar {
           grid-template-columns: 1fr 1fr;
         }
 
-        /* The browse controls cost ~215px of an 800px phone viewport (a 165px
-           3-row filter grid + the 32px chip strip), which came straight out of
-           the form's scroll window. They filter a list the open form has already
-           squeezed to nothing, so drop them while authoring and give the height
-           to the fields. Everything returns when the form closes. */
-        .form-open .catalog-filter-bar,
-        .form-open .filter-chips {
-          display: none;
-        }
-        /* Filter chips: scroll sideways instead of overflowing 599px and getting
-           clipped by :host{overflow:hidden}. order:1 + flex-basis:100% drops the
-           strip onto its own row below the title + actions. */
-        .filter-chips {
-          order: 1;
-          flex-basis: 100%;
-          min-width: 0;
-          flex-wrap: nowrap;
-          overflow-x: auto;
-          -webkit-overflow-scrolling: touch;
-          scrollbar-width: none;
-          padding-bottom: 2px;
-          -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
-          mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+        .form-panel {
+          width: auto;
         }
 
-        .filter-chips::-webkit-scrollbar {
-          display: none;
-        }
-
-        .filter-chips app-chip {
-          flex-shrink: 0;
-        }
-
-        /* Trailing space so the last chip clears the fade when scrolled fully right. */
-        .filter-chips app-chip:last-child {
-          margin-right: 28px;
-        }
-
-        /* Compact the chips for the scroll strip (the global mobile rule gives
-           selectable chips a chunky 44px target). Scoped local to this strip. */
-        .filter-chips ::ng-deep .app-chip__btn[data-selectable] {
-          min-height: 0;
-          height: 30px;
-          padding: 0 7px;
-          font-size: 10px;
-        }
-
-        /* Drop the low-value (masked + truncated) URL column, and the Scope column
-           (scope is folded into the name cell as a badge below) so Type / Name +
-           the kebab fit without horizontal scroll. URL stays editable in the form. */
+        /* Drop the low-value (masked + truncated) URL column, and the Visibility
+           and Availability columns (both fold into the name cell as badges
+           below), so the name and the kebab fit without horizontal scroll. */
         .col-url,
         .col-scope,
         .col-availability {
           display: none;
         }
 
-        /* Fixed layout so the three remaining columns share the phone width:
-           under auto layout the type badge alone took 183px and pushed the
-           actions column (the kebab) off-screen (measured 461px in 390px). */
+        /* Fixed layout: the name takes what the 48px kebab column leaves. */
         .ds-table {
           table-layout: fixed;
         }
 
-        .ds-table th:first-child,
-        .ds-table td:first-child {
-          width: 32%;
+        .name-cell {
+          min-width: 0;
         }
 
-        .ds-table th:last-child,
+        .ds-table thead th:last-child,
         .ds-table td:last-child {
           width: 48px;
           padding-inline: 4px;
         }
 
-        /* A lone kebab column: the "Actions" label doesn't fit 48px and clipped
-           at the screen edge (same trick as the jobs table; the text stays in
-           the accessibility tree). */
-        .ds-table th:last-child {
-          font-size: 0;
+        /* The kebab is the whole 48px actions column. A managed row's menu
+           simply has no edit or delete entry. */
+        .managed-note {
+          display: none;
         }
 
-        /* The type badge wraps to a second line in its narrower column
-           (same treatment the project cards give their badges). */
-        .ds-table td:first-child app-badge {
-          white-space: normal;
-          height: auto;
-          min-height: 20px;
-          padding-block: 2px;
-          line-height: 1.25;
-        }
-
-        /* Scope shown inline under the name on mobile (its own column is hidden). */
-        .ds-scope-inline {
+        /* Scope shown under the name on mobile (its own column is hidden). */
+        .ds-scope-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 4px;
           margin-top: 4px;
         }
 
@@ -2660,6 +3090,10 @@ export class DatasourceListComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly transloco = inject(TranslocoService);
   private readonly userService = inject(UserService);
+  /** The installation default for MCP server questions, read for an admin
+   *  (the endpoint is admin-only) to name it on "Follow the default". */
+  private readonly adminSettings = inject(AdminUsersService);
+  private serverQuestionsDefaultRequested = false;
   private readonly route = inject(ActivatedRoute, {optional: true});
   protected readonly viewport = inject(ViewportService);
   protected readonly capabilities = inject(CapabilitiesService);
@@ -2793,6 +3227,24 @@ export class DatasourceListComponent implements OnInit {
   // State signals
   readonly datasources = signal<Datasource[]>([]);
   readonly isLoading = signal(false);
+  /** Whether the connectors SRW keeps (a project's folders and knowledge
+   *  base, a person's own cloud) are listed, below the user's own. Off by
+   *  default: on an installation with a few projects they outnumber the
+   *  user's own many times over. */
+  readonly showKept = signal(false);
+  /** The kept connectors, a list of their own with its own paging. */
+  readonly keptDatasources = signal<Datasource[]>([]);
+  readonly keptNextCursor = signal<string | null>(null);
+  readonly keptLoading = signal(false);
+  readonly keptLoadingMore = signal(false);
+  private keptRequestSerial = 0;
+  /** How many connectors of each type there are, under every filter but
+   *  the type: the server's first-page counts, per list. */
+  readonly ownTypeCounts = signal<Record<string, number>>({});
+  readonly keptTypeCounts = signal<Record<string, number>>({});
+  /** Whether the less used filters (project, availability, default,
+   *  ownership, visibility) are shown. */
+  readonly filtersOpen = signal(false);
   readonly typeFilter = signal<string>('all');
   readonly catalogSearch = signal('');
   readonly scopeFilter = signal<'all' | 'scope-all' | 'projects' | 'unavailable'>('all');
@@ -2936,10 +3388,152 @@ export class DatasourceListComponent implements OnInit {
   // Computed filtered list
   readonly filteredDatasources = computed(() => {
     const filter = this.typeFilter();
-    const all = this.datasources();
-    if (filter === 'all') return all;
-    return all.filter((ds) => ds.type === filter);
+    // The server sends the user's own (managed=false); the same split here
+    // covers the unpaged legacy list and an orchestrator that predates it.
+    const own = this.datasources().filter((ds) => !isPlatformOwned(ds));
+    if (filter === 'all') return own;
+    return own.filter((ds) => ds.type === filter);
   });
+
+  /** The kept connectors under the type filter (the server applies the
+   *  others; the legacy list has none). */
+  readonly keptRows = computed(() => {
+    const filter = this.typeFilter();
+    const kept = this.keptDatasources().filter((ds) => isPlatformOwned(ds));
+    return filter === 'all' ? kept : kept.filter((ds) => ds.type === filter);
+  });
+
+  /** The kept connectors in groups: one per project, named after it, then
+   *  the user's own and (for an administrator) other people's. Groups keep
+   *  the order they first appear in (newest first), rows a fixed order. */
+  readonly keptGroups = computed<KeptGroup[]>(() => {
+    const me = this.userService.currentUser()?.id ?? null;
+    const groups = new Map<string, KeptGroup>();
+    for (const ds of this.keptRows()) {
+      const owner = platformConnectorOwner(ds);
+      const ownerId = platformConnectorOwnerId(ds);
+      let group: Omit<KeptGroup, 'rows'>;
+      if (owner === 'project' && ownerId) {
+        group = {
+          key: `project:${ownerId}`,
+          projectId: ownerId,
+          label: ds.native_project_name?.trim() || '',
+          labelKey: 'datasources.kept.unnamedProject',
+        };
+      } else if (owner === 'user' && ownerId === me) {
+        group = {key: 'yours', projectId: null, label: '', labelKey: 'datasources.kept.yours'};
+      } else {
+        group = {key: 'others', projectId: null, label: '', labelKey: 'datasources.kept.others'};
+      }
+      const existing = groups.get(group.key);
+      if (existing) existing.rows.push(ds);
+      else groups.set(group.key, {...group, rows: [ds]});
+    }
+    for (const group of groups.values()) {
+      group.rows.sort((a, b) => keptKindRank(a) - keptKindRank(b));
+      // A project the catalog sent no name for: say "Project" and its id.
+      if (group.projectId && !group.label) {
+        group.label = this.transloco.translate(group.labelKey, {id: group.projectId.slice(0, 8)});
+      }
+    }
+    return [...groups.values()];
+  });
+
+  /** Columns a group heading spans: the ones on screen. A phone shows the
+   *  name and the menu only; spanning hidden columns too would leave the
+   *  fixed table layout room for columns nobody sees, squeezing the name. */
+  readonly columnCount = computed(() => {
+    if (this.viewport.isMobile()) return 2;
+    return this.capabilities.datasourceScopeAutoAttachAvailable() ? 5 : 4;
+  });
+
+  /** How many connectors of each type the lists hold, under every filter but
+   *  the type. The legacy list counts what it loaded. */
+  readonly typeCounts = computed<Record<string, number>>(() => {
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) {
+      const rows = this.datasources().filter((ds) => !isPlatformOwned(ds));
+      if (this.showKept()) rows.push(...this.keptDatasources().filter((ds) => isPlatformOwned(ds)));
+      return countTypes(rows);
+    }
+    const counts: Record<string, number> = {};
+    addCounts(counts, this.ownTypeCounts());
+    if (this.showKept()) addCounts(counts, this.keptTypeCounts());
+    return counts;
+  });
+
+  /** The type strip: all, then each type there are connectors of, and the
+   *  selected one even at none (so it can be cleared). */
+  readonly typeChips = computed<ConnectorTypeChip[]>(() => {
+    const counts = this.typeCounts();
+    const selected = this.typeFilter();
+    const types = new Set(Object.keys(counts).filter((type) => counts[type] > 0));
+    if (selected !== 'all') types.add(selected);
+    const rank = (type: string) => {
+      const at = TYPE_ORDER.indexOf(type);
+      return at < 0 ? TYPE_ORDER.length : at;
+    };
+    const ordered = [...types].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+    const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
+    return [
+      {value: 'all', count: total},
+      ...ordered.map((type) => ({value: type, count: counts[type] ?? 0})),
+    ];
+  });
+
+  /** A removable token for every applied filter but the type (the strip
+   *  shows that one), including the default one that hides what SRW keeps. */
+  readonly filterTokens = computed<ConnectorFilterToken[]>(() => {
+    const t = (key: string) => this.transloco.translate(key);
+    const tokens: ConnectorFilterToken[] = [];
+    const search = this.catalogSearch().trim();
+    if (search) {
+      tokens.push({id: 'search', labelKey: 'datasources.catalog.token.search', labelParams: {term: search}});
+    }
+    const projectId = this.catalogProjectId();
+    if (projectId) {
+      const name = this.catalogProjects().find((project) => project.id === projectId)?.name ?? projectId.slice(0, 8);
+      tokens.push({id: 'project', labelKey: 'datasources.catalog.token.project', labelParams: {name}});
+    }
+    const availability = {
+      'scope-all': 'datasources.catalog.everywhere',
+      projects: 'datasources.catalog.projectScoped',
+      unavailable: 'datasources.catalog.unavailable',
+    }[this.scopeFilter() as string];
+    if (availability) {
+      tokens.push({
+        id: 'availability',
+        labelKey: 'datasources.catalog.token.availability',
+        labelParams: {value: t(availability)},
+      });
+    }
+    if (this.automaticFilter() !== 'all') {
+      tokens.push({id: 'automatic', labelKey: `datasources.catalog.token.${this.automaticFilter()}`});
+    }
+    if (this.ownershipFilter() !== 'all') {
+      tokens.push({id: 'ownership', labelKey: `datasources.catalog.token.${this.ownershipFilter()}`});
+    }
+    if (this.visibilityFilter() !== 'all') {
+      tokens.push({id: 'visibility', labelKey: `datasources.catalog.token.${this.visibilityFilter()}`});
+    }
+    if (!this.showKept()) {
+      tokens.push({id: 'kept', labelKey: 'datasources.catalog.token.keptHidden'});
+    }
+    return tokens;
+  });
+
+  /** Why the user's own list is empty: something narrows it, or they have
+   *  made no connector yet. */
+  readonly emptyKind = computed<'filtered' | 'none'>(() =>
+    this.catalogSearch().trim() ||
+    this.typeFilter() !== 'all' ||
+    this.catalogProjectId() !== '' ||
+    this.scopeFilter() !== 'all' ||
+    this.automaticFilter() !== 'all' ||
+    this.ownershipFilter() !== 'all' ||
+    this.visibilityFilter() !== 'all'
+      ? 'filtered'
+      : 'none',
+  );
 
   // URL placeholder based on type
   readonly urlPlaceholder = computed(() => {
@@ -3055,6 +3649,8 @@ export class DatasourceListComponent implements OnInit {
     mcpTransport: McpTransport;
     mcpToken: string;
     mcpHeaders: KeyValueRow[];
+    /** MCP connectors: `config.server_questions`; 'inherit' stores none. */
+    serverQuestions: 'inherit' | McpServerQuestionsChoice;
     is_global: boolean;
     /** The creator's read-only tag; null until chosen (see formReadOnly). */
     read_only: boolean | null;
@@ -3073,6 +3669,7 @@ export class DatasourceListComponent implements OnInit {
     mcpTransport: 'http',
     mcpToken: '',
     mcpHeaders: [],
+    serverQuestions: 'inherit',
     is_global: false,
     read_only: null,
     scope_mode: null,
@@ -3228,8 +3825,19 @@ export class DatasourceListComponent implements OnInit {
     );
   }
 
-  /** What Test must reach while editing: the endpoint as typed, unsaved. */
-  private sshTestEdits(): DatasourceTestEdits | undefined {
+  /** What Test must reach while editing: the form as typed, unsaved. An
+   *  SSH connector's endpoint; an MCP server's URL and credentials, so a
+   *  token typed and not yet saved is the one sent. Blank fields keep the
+   *  saved values, as they do on Save. */
+  private formTestEdits(): DatasourceTestEdits | undefined {
+    if (this.formData.type === 'mcp') {
+      const edits: DatasourceTestEdits = {};
+      const url = this.connectionUrlForPayload();
+      if (url) edits.connection_url = url;
+      const credentials = this.buildCredentials();
+      if (credentials) edits.credentials = credentials;
+      return Object.keys(edits).length > 0 ? edits : undefined;
+    }
     if (!this.isSshEndpointForm()) return undefined;
     if (this.formData.type === 'repository') {
       return {connection_url: this.connectionUrlForPayload(), config: this.buildTypeConfig()};
@@ -3300,16 +3908,18 @@ export class DatasourceListComponent implements OnInit {
   refresh(): void {
     const serial = ++this.catalogRequestSerial;
     this.isLoading.set(true);
+    this.indexStatuses.set({});
     if (!this.capabilities.datasourceScopeAutoAttachAvailable()) {
+      // The legacy list is unpaged and unfiltered: it holds both lists, and
+      // the type filter and its counts work on what it loaded.
       this.catalogNextCursor.set(null);
+      this.keptNextCursor.set(null);
       this.isLoadingMore.set(false);
-      const type = this.typeFilter() === 'all'
-        ? undefined
-        : this.typeFilter() as DatasourceType;
-      this.api.getDatasources(undefined, type).subscribe({
+      this.api.getDatasources().subscribe({
         next: (rows) => {
           if (serial !== this.catalogRequestSerial) return;
-          this.applyCatalogRows(rows, false);
+          this.applyCatalogRows(rows.filter((ds) => !isPlatformOwned(ds)), false);
+          this.applyKeptRows(rows.filter((ds) => isPlatformOwned(ds)), false);
           this.isLoading.set(false);
         },
         error: () => {
@@ -3320,11 +3930,13 @@ export class DatasourceListComponent implements OnInit {
       });
       return;
     }
-    this.api.getDatasourceCatalog(this.catalogFilters()).subscribe({
+    this.api.getDatasourceCatalog(this.catalogFilters(false)).subscribe({
       next: (response) => {
         if (serial !== this.catalogRequestSerial) return;
         this.applyCatalogRows(response.items, false);
         this.catalogNextCursor.set(response.next_cursor);
+        // An orchestrator that predates the counts: what this page holds.
+        this.ownTypeCounts.set(response.type_counts ?? countTypes(response.items));
         this.isLoading.set(false);
       },
       error: () => {
@@ -3333,6 +3945,7 @@ export class DatasourceListComponent implements OnInit {
         this.errorMessage.set(this.transloco.translate('datasources.catalog.loadFailed'));
       },
     });
+    if (this.showKept()) this.loadKept();
   }
 
   loadMoreCatalog(): void {
@@ -3341,7 +3954,7 @@ export class DatasourceListComponent implements OnInit {
     if (!cursor || this.isLoadingMore()) return;
     const serial = ++this.catalogRequestSerial;
     this.isLoadingMore.set(true);
-    this.api.getDatasourceCatalog({...this.catalogFilters(), cursor}).subscribe({
+    this.api.getDatasourceCatalog({...this.catalogFilters(false), cursor}).subscribe({
       next: (response) => {
         if (serial !== this.catalogRequestSerial) return;
         this.applyCatalogRows(response.items, true);
@@ -3356,7 +3969,51 @@ export class DatasourceListComponent implements OnInit {
     });
   }
 
-  private catalogFilters(): DatasourceCatalogFilters {
+  /** The first page of what SRW keeps, under the same filters. The legacy
+   *  list loaded it with everything else. */
+  private loadKept(): void {
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) return;
+    const serial = ++this.keptRequestSerial;
+    this.keptLoading.set(true);
+    this.keptLoadingMore.set(false);
+    this.api.getDatasourceCatalog(this.catalogFilters(true)).subscribe({
+      next: (response) => {
+        if (serial !== this.keptRequestSerial) return;
+        this.applyKeptRows(response.items, false);
+        this.keptNextCursor.set(response.next_cursor);
+        this.keptTypeCounts.set(response.type_counts ?? countTypes(response.items));
+        this.keptLoading.set(false);
+      },
+      error: () => {
+        if (serial !== this.keptRequestSerial) return;
+        this.keptLoading.set(false);
+        this.errorMessage.set(this.transloco.translate('datasources.catalog.loadFailed'));
+      },
+    });
+  }
+
+  loadMoreKept(): void {
+    if (!this.capabilities.datasourceScopeAutoAttachAvailable()) return;
+    const cursor = this.keptNextCursor();
+    if (!cursor || this.keptLoadingMore()) return;
+    const serial = ++this.keptRequestSerial;
+    this.keptLoadingMore.set(true);
+    this.api.getDatasourceCatalog({...this.catalogFilters(true), cursor}).subscribe({
+      next: (response) => {
+        if (serial !== this.keptRequestSerial) return;
+        this.applyKeptRows(response.items, true);
+        this.keptNextCursor.set(response.next_cursor);
+        this.keptLoadingMore.set(false);
+      },
+      error: () => {
+        if (serial !== this.keptRequestSerial) return;
+        this.keptLoadingMore.set(false);
+        this.errorMessage.set(this.transloco.translate('datasources.catalog.loadMoreFailed'));
+      },
+    });
+  }
+
+  private catalogFilters(managed: boolean): DatasourceCatalogFilters {
     const filters: DatasourceCatalogFilters = {limit: 50};
     const q = this.catalogSearch().trim();
     if (q) filters.q = q;
@@ -3372,6 +4029,7 @@ export class DatasourceListComponent implements OnInit {
     if (ownership !== 'all') filters.ownership = ownership;
     const visibility = this.visibilityFilter();
     if (visibility !== 'all') filters.visibility = visibility;
+    filters.managed = managed;
     return filters;
   }
 
@@ -3380,15 +4038,97 @@ export class DatasourceListComponent implements OnInit {
       ? [...this.datasources(), ...rows.filter(row => !this.datasources().some(old => old.id === row.id))]
       : rows;
     this.datasources.set(merged);
-    if (!append) this.indexStatuses.set({});
+    for (const ds of rows) {
+      if (ds.type === 'kb') this.loadIndexStatus(ds.id);
+    }
+  }
+
+  private applyKeptRows(rows: Datasource[], append: boolean): void {
+    const current = this.keptDatasources();
+    this.keptDatasources.set(
+      append ? [...current, ...rows.filter((row) => !current.some((old) => old.id === row.id))] : rows,
+    );
     for (const ds of rows) {
       if (ds.type === 'kb') this.loadIndexStatus(ds.id);
     }
   }
 
   onTypeFilter(value: string): void {
+    if (value === this.typeFilter()) return;
     this.typeFilter.set(value);
+    // The legacy list filters what it holds.
+    if (this.capabilities.datasourceScopeAutoAttachAvailable()) this.refresh();
+  }
+
+  /** Show or hide what SRW keeps. Showing loads it; the user's own list is
+   *  not touched either way. */
+  setShowKept(show: boolean): void {
+    if (show === this.showKept()) return;
+    this.showKept.set(show);
+    if (show) this.loadKept();
+  }
+
+  toggleFilters(): void {
+    this.filtersOpen.update((open) => !open);
+  }
+
+  /** Remove one applied filter, the way its token says. */
+  removeFilterToken(id: string): void {
+    switch (id) {
+      case 'kept':
+        this.setShowKept(true);
+        return;
+      case 'search':
+        if (this.catalogSearchTimer) clearTimeout(this.catalogSearchTimer);
+        this.catalogSearch.set('');
+        break;
+      case 'project':
+        this.catalogProjectId.set('');
+        break;
+      case 'availability':
+        this.scopeFilter.set('all');
+        break;
+      case 'automatic':
+        this.automaticFilter.set('all');
+        break;
+      case 'ownership':
+        this.ownershipFilter.set('all');
+        break;
+      case 'visibility':
+        this.visibilityFilter.set('all');
+        break;
+      default:
+        return;
+    }
     this.refresh();
+  }
+
+  /** Back to the defaults: no search, every type, no filter, and what SRW
+   *  keeps hidden again (as the jobs list's "Clear all" hides archived
+   *  projects again). One request, not one per filter. */
+  clearFilters(): void {
+    if (this.catalogSearchTimer) clearTimeout(this.catalogSearchTimer);
+    this.catalogSearch.set('');
+    this.typeFilter.set('all');
+    this.catalogProjectId.set('');
+    this.scopeFilter.set('all');
+    this.automaticFilter.set('all');
+    this.ownershipFilter.set('all');
+    this.visibilityFilter.set('all');
+    this.showKept.set(false);
+    this.refresh();
+  }
+
+  /** What a row is, beside its name: what a connector SRW keeps is to its
+   *  project or user ("Project folder"), else the connector type. */
+  typeLabelKey(ds: Datasource): string {
+    return platformKindLabelKey(ds) ?? 'datasources.filter.' + ds.type;
+  }
+
+  /** Whether a row has anything behind its menu: the two reindex actions of
+   *  a knowledge base, and Delete where the row may be deleted. */
+  hasRowMenu(ds: Datasource): boolean {
+    return ds.type === 'kb' || this.canDeleteRow(ds);
   }
 
   onCatalogSearch(value: string): void {
@@ -3529,6 +4269,7 @@ export class DatasourceListComponent implements OnInit {
       mcpTransport: 'http',
       mcpToken: '',
       mcpHeaders: [],
+      serverQuestions: storedServerQuestions(ds.config),
       is_global: ds.is_global ?? false,
       read_only: ds.read_only ?? null,
       scope_mode: ds.scope_mode ?? 'all',
@@ -3536,6 +4277,7 @@ export class DatasourceListComponent implements OnInit {
       policy_revision: ds.policy_revision ?? 1,
     };
     this.connectionUrlDirty = false;
+    this.ensureServerQuestionsDefault();
     this.formProjectIds.set(new Set(ds.project_ids ?? []));
     this.scopeSelectionInitialized = (ds.project_ids?.length ?? 0) > 0;
     // F3 (knowledge-base/knowledge/multi_tenancy.md): credentials never come back from the
@@ -3881,7 +4623,55 @@ export class DatasourceListComponent implements OnInit {
       // Mailboxes are private-only; the server rejects is_global for email.
       if (value === 'email') this.formData.is_global = false;
       this.onTypeChange();
+      this.ensureServerQuestionsDefault();
     }
+  }
+
+  /** Whether the form edits an MCP connector: the remote type, or a driver
+   *  (managed or registered) whose tools are an MCP server's. */
+  isMcpForm(): boolean {
+    return this.formData.type === 'mcp' || this.formDriver()?.tool_category === 'mcp';
+  }
+
+  /** "Follow the default", naming the default when this user may read it. */
+  serverQuestionsInheritKey(): string {
+    switch (this.adminSettings.mcpServerQuestions()?.default) {
+      case 'decline':
+        return 'datasources.form.serverQuestionsInheritDecline';
+      case 'accept':
+        return 'datasources.form.serverQuestionsInheritAccept';
+      default:
+        return 'datasources.form.serverQuestionsInherit';
+    }
+  }
+
+  /** Read the installation default once, for an admin opening an MCP form. */
+  private ensureServerQuestionsDefault(): void {
+    if (this.serverQuestionsDefaultRequested || !this.isMcpForm()) return;
+    if (!this.userService.currentUser()?.is_admin) return;
+    if (this.adminSettings.mcpServerQuestions()) return;
+    this.serverQuestionsDefaultRequested = true;
+    this.adminSettings.loadMcpServerQuestions();
+  }
+
+  /**
+   * An MCP connector's config with its server-questions choice: the key
+   * beside the driver's own config (a managed server's url and access),
+   * left out when the connector follows the default. A remote server has
+   * no other config, so it sends one only for a choice, or to clear a
+   * stored one on edit.
+   */
+  private withServerQuestions(config: DatasourceConfig | undefined): DatasourceConfig | undefined {
+    // The generic form has not reported yet: leave the column untouched
+    // rather than replace a managed server's config with this key alone.
+    if (config === undefined && this.useGenericForm()) return undefined;
+    const base: DatasourceConfig = {...(config ?? {})};
+    delete base.server_questions;
+    const chosen = this.formData.serverQuestions;
+    if (chosen !== 'inherit') return {...base, server_questions: chosen};
+    if (config !== undefined) return base;
+    const stored = this.editingId() !== null ? this.editingOriginal?.config : null;
+    return stored?.server_questions ? base : undefined;
   }
 
   onMcpTransportSelect(value: string | null): void {
@@ -3981,7 +4771,10 @@ export class DatasourceListComponent implements OnInit {
     if (!canSeeCompleteScope || (ds.project_count === undefined && ds.project_ids === undefined)) {
       return this.transloco.translate('datasources.table.availabilityScoped');
     }
-    return this.transloco.translate('datasources.table.availabilityProjects', {count});
+    return this.transloco.translate(
+      count === 1 ? 'datasources.table.availabilityProject' : 'datasources.table.availabilityProjects',
+      {count},
+    );
   }
 
   availabilityTone(ds: Datasource): BadgeTone {
@@ -4103,9 +4896,12 @@ export class DatasourceListComponent implements OnInit {
         [...previousProjectIds].some(id => !currentProjectIds.has(id));
       const update: DatasourceUpdateRequest = {
         name: this.formData.name,
-        description: this.formData.description || undefined,
+        // Sent as typed, an empty field included: undefined would mean
+        // "unchanged", and a description or hint could never be cleared
+        // (the description is what the agent's README says it is for).
+        description: (this.formData.description ?? '').trim(),
         credentials: creds,
-        cli_hint: this.formData.cli_hint || undefined,
+        cli_hint: this.isEnvType() ? (this.formData.cli_hint ?? '').trim() : undefined,
         default_branch: this.formData.default_branch || undefined,
         config: this.buildTypeConfig(),
         is_global: this.formData.is_global,
@@ -4196,15 +4992,18 @@ export class DatasourceListComponent implements OnInit {
   }
 
   testFromForm(): void {
-    // For forms we need to save first to test, or test an existing one
+    // An existing connector is tested as the form edits it (formTestEdits);
+    // a new one is saved first, then tested.
     const editId = this.editingId();
     if (editId) {
       this.isTesting.set(true);
       this.formTestResult.set(null);
-      this.api.testDatasource(editId, this.sshTestEdits()).subscribe({
+      this.api.testDatasource(editId, this.formTestEdits()).subscribe({
         next: (result) => {
           this.isTesting.set(false);
-          this.formTestResult.set(result);
+          this.formTestResult.set(
+            result ?? {status: 'error', message: this.transloco.translate('datasources.messages.testFailed')},
+          );
         },
         error: () => {
           this.isTesting.set(false);
@@ -4342,7 +5141,23 @@ export class DatasourceListComponent implements OnInit {
     });
   }
 
+  /** The connector whose Delete waits for the user to type its name. */
+  readonly pendingDelete = signal<Datasource | null>(null);
+
+  /** Delete asks first: it removes the connector, its stored credentials
+   *  and every project's link to it, and cannot be undone. */
   deleteDatasource(ds: Datasource): void {
+    if (!this.canDeleteRow(ds)) return;
+    this.pendingDelete.set(ds);
+  }
+
+  confirmDelete(): void {
+    const ds = this.pendingDelete();
+    this.pendingDelete.set(null);
+    if (ds) this.performDelete(ds);
+  }
+
+  private performDelete(ds: Datasource): void {
     this.clearMessages();
     this.api.deleteDatasource(ds.id).subscribe({
       next: (result) => {
@@ -4362,24 +5177,7 @@ export class DatasourceListComponent implements OnInit {
   // ===== Helpers =====
 
   getTypeIcon(type: DatasourceType | string): string {
-    const icons: Record<string, string> = {
-      credentials: 'key',
-      generic: 'settings_input_component',
-      repository: 'code',
-      kb: 'menu_book',
-      postgresql: 'database',
-      neo4j: 'hub',
-      mongodb: 'eco',
-      webdav: 'cloud',
-      email: 'mail',
-      kubeconfig: 'rocket_launch',
-      ssh_key: 'key',
-      generic_file: 'description',
-      cloud_folder: 'folder',
-      cloud_folder_checkout: 'folder_copy',
-      cloud_outbox: 'outbox',
-    };
-    return icons[type] || 'storage';
+    return connectorTypeIcon(type);
   }
 
   maskUrl(url: string): string {
@@ -4524,6 +5322,12 @@ export class DatasourceListComponent implements OnInit {
   /** Non-secret, type-specific config for the create/update/test payloads.
    *  `undefined` for types without config so the column stays untouched. */
   private buildTypeConfig(): DatasourceConfig | undefined {
+    const config = this.buildDriverConfig();
+    return this.isMcpForm() ? this.withServerQuestions(config) : config;
+  }
+
+  /** The driver's own config, as its form holds it. */
+  private buildDriverConfig(): DatasourceConfig | undefined {
     if (this.useGenericForm()) {
       return this.genericFormValue()?.config as DatasourceConfig | undefined;
     }
@@ -4743,6 +5547,7 @@ export class DatasourceListComponent implements OnInit {
       mcpTransport: 'http',
       mcpToken: '',
       mcpHeaders: [],
+      serverQuestions: 'inherit',
       is_global: false,
       read_only: null,
       scope_mode: null,

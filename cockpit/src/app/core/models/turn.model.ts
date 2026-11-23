@@ -1,6 +1,7 @@
 import {ChatAttachment, ToolCallInfo} from '../services/persistent-chat.service';
 import {SubagentRecoveryContinuation, SubagentRecoveryResult} from './subagent-recovery.model';
 import type {ToolResultState} from './tool-result-state.model';
+import type {McpQuestionOutcome} from './mcp-question.model';
 import {DELEGATE_TOOL, JOB_TOOL, NOTIFY_USER_TOOL, SLEEP_TOOL} from './tool-card.model';
 
 /**
@@ -81,6 +82,12 @@ export interface ToolCallEvent extends ToolCallInfo {
      * of "completed".
      */
     resultState?: ToolResultState;
+    /**
+     * The last question the call's MCP server asked the user, once settled
+     * (`question.resolved`): the transcript says, under the card, whether
+     * the user accepted, declined, or did not answer it.
+     */
+    question?: {server: string; outcome: McpQuestionOutcome};
 }
 
 /**

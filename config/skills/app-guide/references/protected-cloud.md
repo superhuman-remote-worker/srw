@@ -20,7 +20,7 @@ applies the whole diff.
 This is different from the folder's **Read-only** level, which prevents
 writes; Protected lets the agent prepare writes for review. There is no
 read-only switch in project Settings: a folder's levels are set on the
-project's **Connectors** tab under **Cloud folders** (**Default access**). It
+project's **Connectors** tab under **Kept by SRW** (**Default access**). It
 is also different from a project job's pending-review diff, which uses the job
 workflow and retains git history.
 

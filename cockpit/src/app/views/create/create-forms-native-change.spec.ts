@@ -13,6 +13,7 @@ import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {ModelService} from '../../core/services/model.service';
 import {UserService} from '../../core/services/user.service';
+import {ViewportService} from '../../core/services/viewport.service';
 import {SessionCreateComponent} from '../session-create/session-create.component';
 import {JobCreateComponent} from './job-create.component';
 
@@ -103,6 +104,7 @@ function providers(stubApi: ReturnType<typeof api>) {
     {provide: UserService, useValue: {currentUserId: signal('user-1'), currentUser: signal(null)}},
     {provide: ErrorMessageService, useValue: {translate: (_e: unknown, k?: string) => k ?? ''}},
     {provide: ModelService, useValue: {load: vi.fn()}},
+    {provide: ViewportService, useValue: {isMobile: signal(false)}},
     {
       provide: CapabilitiesService,
       useValue: {datasourceScopeAutoAttachAvailable: () => false, protectedCloudAvailable: signal(false), grants: signal(null)},
@@ -135,11 +137,9 @@ describe('Create Job: a native change from a projected field starts no settings 
   });
 
   it.each([
-    ['the description', '.task-fields app-textarea:nth-of-type(1) textarea'],
-    ['the kickoff message', '.task-fields app-form-field:nth-of-type(3) textarea'],
+    ['the task box', '.task-fields textarea'],
     ['the file input', 'input[type="file"]'],
-    ['the project select', '.task-fields app-select'],
-    ['the priority select', '[settingsTopAside] app-select'],
+    ['the priority select', '[settingsTopAside] #job-priority'],
   ])('a bubbling change from %s reaches no handler', (_label, selector) => {
     const {host, onSettingsChange, api: stub} = mount();
     const field = host.querySelector(selector);
@@ -149,6 +149,66 @@ describe('Create Job: a native change from a projected field starts no settings 
 
     expect(onSettingsChange).not.toHaveBeenCalled();
     expect(stub.previewToolGroups).not.toHaveBeenCalled();
+  });
+
+  it('a project change starts its own preview, never through the settings host', () => {
+    // The project is a grant scope, so picking one legitimately re-reads the
+    // tool preview. That is the select's own handler; the host still hears
+    // nothing, and a select fires `change` only when its value really changed.
+    const {host, onSettingsChange, api: stub} = mount();
+    const project = host.querySelector('[settingsTopAside] #job-project');
+    expect(project).not.toBeNull();
+
+    bubblingChange(project!);
+
+    expect(onSettingsChange).not.toHaveBeenCalled();
+    expect(stub.previewToolGroups).toHaveBeenCalledOnce();
+  });
+
+  it('the form offers no phases choice: that is the Expert\'s setting', () => {
+    const {host} = mount();
+    const labels = [...host.querySelectorAll('[settingsTopAside] label')].map((l) => l.textContent?.trim());
+    expect(labels).not.toContain(en.experts.editor.phases);
+    expect(host.textContent).not.toContain(en.experts.editor.phases);
+  });
+
+  it('the form asks for one text: there is no second message field', () => {
+    const {host} = mount();
+    expect(host.querySelectorAll('textarea')).toHaveLength(1);
+  });
+
+  it('the project list selects the chosen project once it has loaded', () => {
+    const {fixture, host} = mount();
+    fixture.detectChanges();
+    const project = host.querySelector('#job-project') as HTMLSelectElement;
+    expect(project.value).toBe('proj-1');
+  });
+
+  it('typing in the task box enables Create, and Ctrl+Enter creates the job', async () => {
+    const {fixture, host, api: stub} = mount();
+    const task = host.querySelector('.task-fields textarea') as HTMLTextAreaElement;
+    const create = fixture.nativeElement.querySelector('app-button[type="submit"]') as HTMLElement & {disabled: boolean};
+    expect(create.disabled).toBe(true);
+
+    task.value = 'Summarise the logs';
+    task.dispatchEvent(new Event('input', {bubbles: true}));
+    fixture.detectChanges();
+    expect(create.disabled).toBe(false);
+
+    const enter = new KeyboardEvent('keydown', {key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true});
+    task.dispatchEvent(enter);
+    await fixture.whenStable();
+
+    expect(enter.defaultPrevented).toBe(true);
+    expect(stub.createJob).toHaveBeenCalledOnce();
+    expect(stub.createJob.mock.calls[0][0].description).toBe('Summarise the logs');
+  });
+
+  it('Create sits in the task box, not below the settings', () => {
+    const {fixture} = mount();
+    const root = fixture.nativeElement as HTMLElement;
+    expect(root.querySelector('.composer app-button[type="submit"]')).not.toBeNull();
+    expect(root.querySelector('.form-actions app-button[type="submit"]')).toBeNull();
   });
 
   it('the settings output still reaches onSettingsChange and starts a preview', () => {
@@ -172,7 +232,7 @@ describe('Create Job: a native change from a projected field starts no settings 
     expect(stub.createJob).not.toHaveBeenCalled();
   });
 
-  it('Enter in the description keeps its newline', () => {
+  it('Enter in the task box keeps its newline', () => {
     const {host} = mount();
     const description = host.querySelector('.task-fields textarea')!;
 

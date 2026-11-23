@@ -336,6 +336,12 @@ data:
   AUDIT_POSTGRES_PORT: {{ include "srw.auditPostgresPort" . | quote }}
   AUDIT_POSTGRES_DB: {{ include "srw.auditPostgresDb" . | quote }}
   AUDIT_POSTGRES_SSLMODE: {{ .Values.databases.audit.sslMode | default "prefer" | quote }}
+  # Tool steps keep their full arguments and result in agent_audit when on
+  # (agent.core.archiver.full_tool_io_enabled).
+  AUDIT_FULL_TOOL_IO: {{ .Values.agent.auditFullToolIo | default "false" | quote }}
+  # synchronous_commit of the agents' audit writer sessions
+  # (agent.database.audit_writer._synchronous_commit).
+  AUDIT_SYNCHRONOUS_COMMIT: {{ .Values.agent.auditSynchronousCommit | default "off" | quote }}
 
   # App-DB asyncpg pool sizing for provisioned agent pods, which inherit this
   # ConfigMap via envFrom. Kept SMALL on purpose: the connection multiplier is
@@ -367,6 +373,9 @@ data:
   SESSION_REWIND_IDLE_CONVERSATION_ENABLED: {{ .Values.agent.stateless.rewind.idleConversationEnabled | default false | quote }}
   STATELESS_WORKER_ENABLED: {{ .Values.agent.stateless.worker.enabled | default false | quote }}
   STATELESS_WORKER_DEFAULT_ENABLED: {{ .Values.agent.stateless.worker.defaultEnabled | default false | quote }}
+  # Base wait after a worker batch that ended in a recoverable failure; it
+  # grows with each failed try in a row (agent.stateless.worker.errorBackoffSeconds).
+  STATELESS_WORKER_ERROR_BACKOFF_SECONDS: {{ .Values.agent.stateless.worker.errorBackoffSeconds | default 5 | quote }}
   # Hold-aware workers and the orchestrator read the same default-off protocol
   # gate. Recovery budgets remain visible even while automation is disabled so
   # an enable is one coordinated Pod rollout rather than an implicit default.
@@ -476,9 +485,6 @@ data:
   # ConfigMap for compatibility. Enabled because root creation resolves DB pointers;
   # false is retained only as an emergency compatibility switch.
   EXPERTS_DB_ENABLED: {{ .Values.agent.expertsDbEnabled | default "true" | quote }}
-  # DB-backed Agent Skills (skills + skill_files). Read by the orchestrator's
-  # skill CRUD/list endpoints. Default-off chart-wide (prod-safe); dev turns it on.
-  SKILLS_DB_ENABLED: {{ .Values.agent.skillsDbEnabled | default "false" | quote }}
   # Emergency operator-only withdrawal of the immutable App Guide + reader.
   # Negative/default-off by design; provisioned agent pods inherit this value
   # via envFrom and expose operator_break_glass in persistent-agent health.
@@ -858,6 +864,9 @@ data:
   WORKSPACE_DEFAULTS: {{ include "srw.workspaceDefaultsJson" . | quote }}
   WORKSPACE_CUSTOM_IMAGES_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.customImages.privileged | quote }}
   WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS: {{ .Values.workspace.imagePullTimeoutSeconds | int | quote }}
+  # A memory-killed Job's next Resume doubles its memory limit once, up to this.
+  # Empty switches it off.
+  WORKSPACE_MEMORY_GROW_MAX: {{ .Values.workspace.memoryGrowth.max | default "" | quote }}
 
   # PR 3 — one-time seed knob for the homelab operator. Empty in SaaS deployments.
   # When set, orchestrator init flips this user's default project from

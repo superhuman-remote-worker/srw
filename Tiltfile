@@ -139,6 +139,10 @@ docker_build(
     'srw-cockpit',
     context='.',
     dockerfile='cockpit/Dockerfile.cockpit.dev',
+    # The Dockerfile copies cockpit/ and nothing else. Without this list a
+    # change anywhere else in the repository (cli/, docs/, a linter's cache)
+    # matched no sync, stopped the live update and rebuilt the image.
+    only=['cockpit/'],
     live_update=[
         fall_back_on([
             'cockpit/Dockerfile.cockpit.dev',
@@ -163,23 +167,6 @@ docker_build(
         'cockpit/src/assets/env.js',
         # Monaco assets are built once into the image; don't sync over them.
         'cockpit/public/monaco/',
-        # Cross-component dirs the cockpit build doesn't care about.
-        'src/',
-        'config/',
-        'pyproject.toml',
-        'init.py',
-        'helm/',
-        'knowledge-base/',
-        'knowledge-history/',
-        'deployment/',
-        'scripts/',
-        'tests/',
-        'docker/',
-        'workspace/',
-        '*.md',
-        '.git/',
-        '.playwright-mcp/',
-        '.tilt-state/',
     ],
 )
 
@@ -289,6 +276,8 @@ docker_build(
         'docker/check-browser-stream.py',
         'docker/assert-browser-stack.sh',
         'docker/assert-workspace-contract.sh',
+        'docker/assert-office-stack.sh',
+        'docker/workspace-office-requirements.txt',
         'docker/link-playwright-browsers',
         'docker/write-agent-environment',
     ],

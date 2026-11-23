@@ -20,16 +20,16 @@ from agent.tools.registry import (
 ECHO_SERVER = textwrap.dedent(
     """
     import sys
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
-    mcp = FastMCP("echo", host="127.0.0.1", port=int(sys.argv[1]), log_level="ERROR")
+    mcp = MCPServer("echo", log_level="ERROR")
 
     @mcp.tool()
     def echo(text: str) -> str:
         \"\"\"Echo the input back.\"\"\"
         return f"echo: {text}"
 
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http", host="127.0.0.1", port=int(sys.argv[1]))
     """
 )
 
@@ -105,9 +105,12 @@ async def test_full_job_path_slice(tmp_path):
         assert datasource["_mcp_status"] == "connected"
 
         names = expand_tool_wildcards(["*"])
-        assert names == ["mcp__echo__echo"]
+        # The server's tool, and the two resource tools every server that
+        # offers resources shares (the test server declares resources).
+        assert names == ["mcp__echo__echo", "read_mcp_resource", "save_mcp_resource"]
 
         tools = load_tools(names, ToolContext(datasources={"mcp": manager}))
+        assert [tool.name for tool in tools] == names
         result = await tools[0].coroutine(text="hi")
         assert "echo: hi" in str(result)
     finally:

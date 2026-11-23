@@ -143,13 +143,16 @@ class Session:
         self.tools = [
             harness._session_tool(t["function"]["name"]) for t in harness.SESSION_TOOLS
         ]
-        self.tool_context = SimpleNamespace(knowledge_bindings=[], citation_engine=None)
+        self.knowledge_store = MagicMock()
+        self.knowledge_store.get_charter_note = AsyncMock(return_value=harness.CHARTER)
+        self.tool_context = SimpleNamespace(
+            knowledge_bindings=harness.attach_project_knowledge(self.knowledge_store),
+            citation_engine=None,
+        )
         if subagents is not None:
             self.tool_context.subagent_runtime = SimpleNamespace(
                 active_subagents_block=subagents
             )
-        self.knowledge_store = MagicMock()
-        self.knowledge_store.get_charter_note = AsyncMock(return_value=harness.CHARTER)
         self.memory_service = harness.RecordingMemoryManager()
         self.messages: List[BaseMessage] = []
         self.persisted: List[BaseMessage] = []

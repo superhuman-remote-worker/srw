@@ -22,6 +22,7 @@ For contribution scope and pull-request expectations, read
 | `src/vm_controller/` | Workspace VM lifecycle controller |
 | `src/shared/` | Framework-free contracts and helpers; `runtime/` holds common configuration, LLM, memory, and transport support for agent and orchestrator |
 | `cockpit/` | Angular web application |
+| `cli/` | `srw`, the command-line client: a Go module of its own that calls the public API |
 | `config/` | Expert, role, prompt, tool, and skill configuration |
 | `helm/` | Kubernetes deployment artifact and values schema |
 | `docs/`, `docs-site/` | Public documentation and the Astro Starlight site that publishes it |
@@ -377,6 +378,64 @@ libraries; local browser checks need the matching engines and dependencies.
 For user-visible changes, exercise the running Cockpit as well as the unit
 test. Angular signal mocks must remain callable and expose `.set()` or
 `.update()` when production code uses those methods.
+
+### srw CLI
+
+`cli/` is a Go module of its own; its Go version is the `go` line in
+`cli/go.mod`. It imports nothing from the Python tree and talks to the API
+over HTTP only.
+
+```bash
+cd cli
+go build -o /tmp/srw .           # a local binary
+go vet ./...
+go test -race ./...              # unit tests against scripted HTTP answers
+
+# After changing a command, a flag or a help text
+go run ./cmd/gen-docs > ../docs/cli-reference.md
+```
+
+`docs/cli-reference.md` is generated and committed; a test fails when it
+differs from what the program prints, and when the program reads an
+environment variable the page does not list. Every route the client calls is
+named in `cli/internal/routes` with the scope it needs, and a test compares
+that table with `policy/endpoint_inventory.txt`, so a route that changes on
+the server fails here first. `cli/THIRD_PARTY_NOTICES.md` must list every
+module of `go.mod` at its exact version; a dependency bump updates both.
+
+Two checks run the built binary:
+
+```bash
+# Against the real routers and a disposable PostgreSQL (no cluster); builds srw from cli/
+python -m pytest tests/test_srw_cli_wire.py -x -q
+
+# Against the local k3d cluster, as an admin and as an ordinary user.
+# Without the two flags it only prints what it would do.
+python scripts/k3d-cli-gate.py
+python scripts/k3d-cli-gate.py --run --confirm LOCAL-K3D-DISPOSABLE
+```
+
+The k3d gate creates its own tokens, an expert, a workspace template, a
+project and three small jobs, named after a gate id it prints, and removes
+them at the end. It needs an admin, an ordinary user and an enabled cheap
+model on the cluster; `--admin`, `--user` and `--model` name them. After an
+interrupted run, pass the gate id to clean up:
+`--gate-id clig-<id> --sweep --run --confirm LOCAL-K3D-DISPOSABLE`. Run it
+after a change to a job, manifest or token route that the client calls: the
+API has no typed responses, so only a run against a real installation shows
+that the two still fit.
+
+The release archives are built by `scripts/release/build_cli.sh VERSION
+COMMIT OUT_DIR` (six archives, `checksums.txt` and the installer). The same
+sources, version, commit and Go toolchain give the same bytes.
+
+In CI the `test-cli` job checks formatting, runs `go vet` for Linux, Windows
+and macOS, the Go tests and `govulncheck`, builds every target and runs the
+installer against that build. It runs on every push to `main`, and on
+`develop` when `cli/` or a file it depends on changed. The wire test runs
+with the Python tests. The k3d gate runs nowhere in CI; run it locally. On
+`main`, `build-cli` builds the archives and the `srw-cli` image for the
+release.
 
 ### VM base reuse in CI
 

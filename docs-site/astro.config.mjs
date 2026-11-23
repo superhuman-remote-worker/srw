@@ -90,6 +90,8 @@ export default defineConfig({
 						'vm-capacity',
 						'vm-workspace-recovery',
 						'project-loops',
+						'api',
+						'cli',
 					],
 				},
 				{
@@ -109,6 +111,7 @@ export default defineConfig({
 					label: 'Reference',
 					items: [
 						'architecture',
+						'cli-reference',
 						{ label: 'Helm values', link: '/reference/helm-values/' },
 						{
 							label: 'Helm chart guide',

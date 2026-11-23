@@ -139,9 +139,11 @@ def _log_legacy_tool_names_once(
     if len(_ALIAS_LOG_SEEN) >= _ALIAS_LOG_SEEN_MAX:
         _ALIAS_LOG_SEEN.clear()
     _ALIAS_LOG_SEEN.add(key)
+    # Design: knowledge-base/knowledge/features/
+    # universal_experts_and_subagents.md §0 D1/D2.
     logger.warning(
-        "config: legacy tool name(s) %s in tools.%s of %s → %s (deleted in U3; "
-        "see universal_experts_and_subagents.md §0 D1/D2)",
+        "config: legacy tool name(s) %s in tools.%s of %s → %s (the old tools "
+        "were removed; write the new name(s) in this config instead)",
         sorted(renamed),
         category,
         source,
@@ -197,9 +199,10 @@ def _move_relocated_tool_names(tools: dict[str, Any], *, source: str) -> dict[st
         if len(_ALIAS_LOG_SEEN) >= _ALIAS_LOG_SEEN_MAX:
             _ALIAS_LOG_SEEN.clear()
         _ALIAS_LOG_SEEN.add(log_key)
+        # Design: knowledge-base/knowledge/features/skills_tool_category.md D5.
         logger.info(
             "config: %s names %s under an old tool category; moved to %s "
-            "(see skills_tool_category.md D5)",
+            "(list them there instead)",
             source,
             sorted(n for names in moved.values() for n in names),
             sorted(moved),
@@ -217,9 +220,11 @@ def _expand_legacy_true(category: str, *, source: str) -> list[str]:
         if len(_ALIAS_LOG_SEEN) >= _ALIAS_LOG_SEEN_MAX:
             _ALIAS_LOG_SEEN.clear()
         _ALIAS_LOG_SEEN.add(key)
+        # Design: knowledge-base/knowledge/features/
+        # universal_experts_and_subagents.md §0 D7.
         logger.warning(
-            "config: legacy `tools.%s: true` in %s → %s (%s enumerates since U3; "
-            "write {only: %s} — see universal_experts_and_subagents.md §0 D7)",
+            "config: legacy `tools.%s: true` in %s → %s (%s takes an explicit "
+            "list of tools now; write {only: %s})",
             category,
             source,
             names,
@@ -280,15 +285,15 @@ _POLICY_KEYS = ("only", "except")
 
 
 def _enumerate_only_error(category: str, form: str) -> "ToolPolicyError":
+    # Design: knowledge-base/knowledge/features/tool_config_policy_vs_membership.md,
+    # '`shell` accepts `only` and `false`'.
     return ToolPolicyError(
         f"tools.{category}: {form} is not accepted. {category} must enumerate "
         f"its tools — write {{only: [...]}} (or a bare list, the same thing) "
         f"or false. Both `true` and `except` auto-track the registry, so a tool "
         f"added to the {category} category later would land here with no diff "
         f"to review; for a code-execution or delegation category that is the "
-        f"wrong default. "
-        f"See knowledge-base/knowledge/features/tool_config_policy_vs_membership.md, "
-        f"'`shell` accepts `only` and `false`'."
+        f"wrong default."
     )
 
 
@@ -526,11 +531,12 @@ def assert_tool_policy_canonical(tools_data: Any, *, where: str) -> None:
         if category not in known:
             continue
         if not isinstance(value, list):
+            # Design: knowledge-base/knowledge/features/
+            # tool_config_policy_vs_membership.md.
             raise ToolPolicyError(
                 f"tools.{key} reached {where} as {type(value).__name__} "
                 f"({value!r}). Tool policy must be normalised before the "
-                f"dataclass — call normalize_tool_policy() on this fragment. "
-                f"See knowledge-base/knowledge/features/tool_config_policy_vs_membership.md."
+                f"dataclass — call normalize_tool_policy() on this fragment."
             )
 
 

@@ -19,6 +19,7 @@ import {JobListComponent, jobCloudAction} from './job-list.component';
 // template asks for actually exist — a key missing from BOTH locales passes
 // the i18n parity gate and ships as the raw key string.
 import en from '../../../assets/i18n/en.json';
+import de from '../../../assets/i18n/de-DE.json';
 
 @Pipe({name: 'transloco', standalone: true})
 class WorkspaceCreationTranslocoPipe implements PipeTransform {
@@ -169,6 +170,44 @@ describe('typed workspace creation on job rows', () => {
     fixture.detectChanges();
     expect((fixture.nativeElement as HTMLElement).textContent)
       .toContain('The cluster may also have stopped it, for example when it ran out of memory: try a template with more memory.');
+  });
+});
+
+describe('phases badge on job rows', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('marks jobs that plan in phases only; direct and unknown jobs carry no badge', async () => {
+    const {fixture} = mountLogic({rendered: true, api: {
+      getJobsPage: vi.fn().mockReturnValue(of(page([
+        job('phased-job', {phases: true}),
+        job('direct-job', {phases: false}),
+        job('unknown-job', {phases: null}),
+        job('older-job'),
+      ]))),
+    }});
+    fixture.detectChanges();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fixture.detectChanges();
+
+    const rows = [...(fixture.nativeElement as HTMLElement).querySelectorAll('tr:not(.detail-row)')]
+      .filter((row) => row.querySelector('.job-id'));
+    const badgeFor = (id: string) => rows
+      .find((row) => row.querySelector('.job-id')?.textContent?.includes(id))
+      ?.querySelector('[data-testid="job-phases-badge"]');
+    expect(rows).toHaveLength(4);
+    const badge = badgeFor('phased-job');
+    // The stub pipe renders the key; the real one renders en.jobs.phasesBadge.
+    expect(badge?.textContent?.trim()).toBe('jobs.phasesBadge');
+    expect(badge?.getAttribute('title')).toBe('jobs.tooltip.phasesBadge');
+    expect(en.jobs.phasesBadge).toBe('Phases');
+    expect(de.jobs.phasesBadge).toBe('Phasen');
+    expect(badge?.classList.contains('config-badge')).toBe(true);
+    expect(badgeFor('direct-job')).toBeNull();
+    expect(badgeFor('unknown-job')).toBeNull();
+    expect(badgeFor('older-job')).toBeNull();
   });
 });
 
@@ -1436,5 +1475,158 @@ describe('jobCloudAction', () => {
     expect(
       jobCloudAction({...base, exported_at: '2026-08-20T00:00:00Z'} as JobSummary),
     ).toBe('exported');
+  });
+});
+
+describe('a job is listed by its name and renamed from its row', () => {
+  afterEach(() => TestBed.resetTestingModule());
+
+  function mountWith(jobs: Partial<JobSummary>[], renameJob = vi.fn()) {
+    const ctx = mountLogic({
+      api: {getJobsPage: vi.fn().mockReturnValue(of(page(jobs))), renameJob} as Partial<ApiService>,
+    });
+    ctx.fixture.detectChanges();
+    return {...ctx, renameJob};
+  }
+
+  it('shows the task text until someone names the job, then the name', () => {
+    const {component} = mountWith([
+      job('j1', {description: 'Summarise the attached contract', title: null}),
+      job('j2', {description: 'Summarise the attached contract', title: 'Lease review'}),
+    ]);
+
+    expect(component.jobs().map((j) => component.jobName(j))).toEqual([
+      'Summarise the attached contract',
+      'Lease review',
+    ]);
+  });
+
+  it('starts the rename editor from a short first line, not the whole task', () => {
+    const {component} = mountWith([
+      job('j1', {description: 'Summarise the attached contract\n\nThen list every risk you find.', title: null}),
+    ]);
+
+    expect(component.jobNameSuggestion(component.jobs()[0])).toBe('Summarise the attached contract');
+  });
+
+  it('a rename shows at once and keeps the title the server stored', () => {
+    const answer = new Subject<{job_id: string; title: string | null} | null>();
+    const {component, renameJob} = mountWith(
+      [job('j1', {description: 'Summarise the attached contract', title: null})],
+      vi.fn().mockReturnValue(answer),
+    );
+
+    component.onRenameJob(component.jobs()[0], 'Lease  review');
+
+    expect(renameJob).toHaveBeenCalledExactlyOnceWith('j1', 'Lease  review');
+    expect(component.jobs()[0].title).toBe('Lease  review');
+
+    // The server collapses whitespace; its answer is what the row keeps.
+    answer.next({job_id: 'j1', title: 'Lease review'});
+    expect(component.jobs()[0].title).toBe('Lease review');
+    expect(component.jobs()[0].description).toBe('Summarise the attached contract');
+  });
+
+  it('a refused rename puts the previous name back', () => {
+    const {component} = mountWith(
+      [job('j1', {description: 'Summarise the attached contract', title: 'Lease review'})],
+      vi.fn().mockReturnValue(of(null)),
+    );
+
+    component.onRenameJob(component.jobs()[0], 'Something else');
+
+    expect(component.jobs()[0].title).toBe('Lease review');
+  });
+
+  it('a refused first rename leaves the job unnamed', () => {
+    const {component} = mountWith(
+      [job('j1', {description: 'Summarise the attached contract'})],
+      vi.fn().mockReturnValue(of(null)),
+    );
+
+    component.onRenameJob(component.jobs()[0], 'Lease review');
+
+    expect(component.jobs()[0].title).toBeNull();
+    expect(component.jobName(component.jobs()[0])).toBe('Summarise the attached contract');
+  });
+});
+
+describe('JobListComponent — a new job gets its name without a reload', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    TestBed.resetTestingModule();
+  });
+
+  const TASK = 'Read every pull request merged this week and write the release notes';
+  const secondsAgo = (seconds: number) => new Date(Date.now() - seconds * 1000).toISOString();
+
+  function mountWithServerRow(row: Partial<JobSummary>) {
+    const server = {row};
+    const getJobsPage = vi.fn(() => of(page([server.row])));
+    const ctx = mountLogic({api: {getJobsPage} as Partial<ApiService>});
+    ctx.fixture.detectChanges();
+    return {...ctx, server, getJobsPage, afterLoad: getJobsPage.mock.calls.length};
+  }
+
+  it('shows the name seconds after the server stored it, not at the next 30 s poll', async () => {
+    const created_at = secondsAgo(2);
+    const {component, server} = mountWithServerRow(job('new', {description: TASK, title: null, created_at}));
+    expect(component.jobName(component.jobs()[0])).toBe(TASK);
+
+    // The auxiliary model has answered by now.
+    server.row = job('new', {description: TASK, title: 'Weekly release notes', created_at});
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    expect(component.jobName(component.jobs()[0])).toBe('Weekly release notes');
+    expect(component.jobs()[0].description).toBe(TASK);
+  });
+
+  it('looks twice and then leaves it to the ordinary poll', async () => {
+    const {getJobsPage, afterLoad} = mountWithServerRow(
+      job('new', {description: TASK, title: null, created_at: secondsAgo(2)}),
+    );
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad + 1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad + 2);
+    // Nothing more until the 30 s poll.
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad + 2);
+  });
+
+  it('does not look again when no row is waiting for a name', async () => {
+    const {getJobsPage, afterLoad} = mountWithServerRow(
+      job('old', {description: TASK, title: null, created_at: secondsAgo(600)}),
+    );
+
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad);
+  });
+
+  it('does not look again for a job that already has its name', async () => {
+    const {getJobsPage, afterLoad} = mountWithServerRow(
+      job('named', {description: TASK, title: 'Weekly release notes', created_at: secondsAgo(2)}),
+    );
+
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad);
+  });
+
+  it('respects the pause switch like every other refresh', async () => {
+    const {component, getJobsPage, afterLoad} = mountWithServerRow(
+      job('new', {description: TASK, title: null, created_at: secondsAgo(2)}),
+    );
+    component.toggleLive();
+
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(getJobsPage.mock.calls.length).toBe(afterLoad);
   });
 });

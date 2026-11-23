@@ -129,6 +129,13 @@
   min-height: 28px;
 }
 
+/* The pill sat flush on the suggestion grid (neither had a margin on that
+   side). Scoped to the adjacent pair so `recovery`, which has no grid, keeps
+   its spacing to the retry button. */
+.draft-connectors + .suggestion-grid {
+  margin-top: clamp(12px, 2vh, 20px);
+}
+
 .draft-connectors-toggle,
 .draft-connectors-state {
   display: inline-flex;

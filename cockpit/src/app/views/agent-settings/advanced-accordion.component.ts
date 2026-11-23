@@ -635,6 +635,7 @@ function validVmSizeGiB(value: number | null): value is number {
       border: none;
       background: var(--surface-0, var(--surface-0));
       color: var(--text-primary, var(--text-primary));
+      font-family: inherit;
       font-size: 13px;
       font-weight: 500;
       cursor: pointer;
@@ -642,7 +643,7 @@ function validVmSizeGiB(value: number | null): value is number {
       transition: background 0.15s;
     }
     .accordion-header:hover {
-      background: rgba(255, 255, 255, 0.05);
+      background: var(--hover);
     }
     .accordion-icon {
       color: var(--text-muted);
@@ -813,7 +814,7 @@ function validVmSizeGiB(value: number | null): value is number {
       height: 20px;
       border: none;
       border-radius: 50%;
-      background: rgba(255, 255, 255, 0.08);
+      background: var(--hover);
       color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;

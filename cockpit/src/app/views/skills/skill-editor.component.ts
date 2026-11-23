@@ -8,7 +8,7 @@ import {AppInputComponent} from '../../ui/input';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppIconComponent} from '../../ui/icon';
-import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
+import {EditorHeaderComponent} from '../../shell/editor-header/editor-header.component';
 import {
   filesToRecord,
   hasSkillMd,
@@ -27,28 +27,32 @@ import {
     AppTextareaComponent,
     AppFormFieldComponent,
     AppIconComponent,
-    SidebarToggleComponent,
+    EditorHeaderComponent,
   ],
   template: `
-    <div class="editor">
-      <header class="head">
-        <!-- Full-page route (no page shell), so carry the mobile sidebar toggle
-             here too — otherwise the off-canvas nav is unreachable on mobile.
-             Renders nothing on desktop (sidebar always expanded). -->
-        <app-sidebar-toggle />
-        <div class="head-row">
-          <h1>{{ (isEdit() ? 'skills.editTitle' : 'skills.newTitle') | transloco }}</h1>
-          <div class="head-actions">
-            <app-button variant="secondary" (clicked)="cancel()">
-              {{ 'skills.cancel' | transloco }}
-            </app-button>
-            <app-button variant="primary" [disabled]="saving()" (clicked)="save()">
-              {{ 'skills.save' | transloco }}
-            </app-button>
-          </div>
-        </div>
-      </header>
+    <!-- The same top edge as the expert and workspace editors: back to the
+         list, the skill's name, the actions, and a save error where it stays
+         in view. -->
+    <app-editor-header [heading]="heading()" [backLabel]="'skills.title' | transloco" backLink="/skills">
+      @if (isEdit()) {
+        <span editorIcon class="title-icon" [style.color]="form.color" aria-hidden="true">
+          <app-icon size="lg">{{ form.icon || 'extension' }}</app-icon>
+        </span>
+      }
+      <div editorActions class="head-actions">
+        <app-button variant="secondary" (clicked)="cancel()">
+          {{ 'skills.cancel' | transloco }}
+        </app-button>
+        <app-button variant="primary" [disabled]="saving()" (clicked)="save()">
+          {{ 'skills.save' | transloco }}
+        </app-button>
+      </div>
+      @if (errorMessage()) {
+        <div editorAlert class="banner err" role="alert">{{ errorMessage() }}</div>
+      }
+    </app-editor-header>
 
+    <div class="editor">
       <section class="meta">
         <app-form-field [label]="'skills.displayName' | transloco">
           <app-input [value]="form.display_name" (valueChange)="form.display_name = $event" />
@@ -82,6 +86,7 @@ import {
           </app-button>
         </div>
         <app-textarea
+          class="mono"
           [value]="currentContent()"
           [rows]="22"
           (valueChange)="setContent($event)"
@@ -95,10 +100,6 @@ import {
           </div>
         }
       </section>
-
-      @if (errorMessage()) {
-        <div class="banner err">{{ errorMessage() }}</div>
-      }
     </div>
   `,
   styles: [
@@ -107,27 +108,17 @@ import {
         display: block;
         height: 100%;
         overflow-y: auto;
+        /* Wider than the other editors: the body is a file. */
+        --editor-width: 1100px;
       }
       .editor {
-        padding: 1rem 1.5rem;
-        max-width: 1100px;
+        padding: 1rem 1.5rem 3rem;
+        max-width: var(--editor-width);
         margin: 0 auto;
       }
-      .head {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 0.5rem;
-        margin-bottom: 1rem;
-      }
-      .head-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        width: 100%;
-      }
-      .head h1 {
-        margin: 0;
+      .title-icon {
+        display: inline-flex;
+        flex-shrink: 0;
       }
       .head-actions {
         display: flex;
@@ -138,6 +129,22 @@ import {
         grid-template-columns: 1fr 1fr;
         gap: 0.75rem 1rem;
         margin-bottom: 1.25rem;
+        padding: 1.25rem;
+        background: var(--panel-bg);
+        border: 1px solid var(--border-hairline);
+        border-radius: var(--radius-surface);
+      }
+      .mono {
+        font-family: var(--font-mono, monospace);
+      }
+      @media (max-width: 640px) {
+        .editor {
+          padding: 0.75rem 1rem 3rem;
+        }
+        .meta {
+          grid-template-columns: 1fr;
+          padding: 1rem;
+        }
       }
       .hint {
         color: var(--text-muted);
@@ -161,16 +168,16 @@ import {
         font-size: 0.85rem;
       }
       .file-tab.active {
-        border-color: var(--primary, #6b7280);
-        background: var(--primary-tint, rgba(107, 114, 128, 0.12));
+        border-color: var(--accent-color);
+        background: color-mix(in srgb, var(--accent-color) 12%, transparent);
       }
       .file-remove {
         margin-top: 0.5rem;
       }
       .banner {
-        margin-top: 1rem;
         padding: 0.5rem 0.75rem;
         border-radius: var(--radius-control);
+        font-size: 0.875rem;
       }
       .banner.err {
         background: var(--danger-tint);
@@ -194,6 +201,13 @@ export class SkillEditorComponent implements OnInit {
   form = {display_name: '', icon: 'extension', color: '#6B7280', tags: ''};
 
   isEdit = computed(() => this.editingId() !== null);
+
+  /** The page title: the skill's own name once it has one. */
+  heading(): string {
+    if (!this.isEdit()) return this.transloco.translate('skills.newTitle');
+    return this.form.display_name.trim() || this.transloco.translate('skills.editTitle');
+  }
+
   currentContent = computed(() => this.files()[this.selected()]?.content ?? '');
   canRemoveCurrent = computed(() => this.files()[this.selected()]?.path !== 'SKILL.md');
 

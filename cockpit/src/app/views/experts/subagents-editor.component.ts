@@ -1,5 +1,4 @@
 import {Component, computed, inject, input, output, signal} from '@angular/core';
-import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {forkJoin, map} from 'rxjs';
 import {ApiService} from '../../core/services/api.service';
@@ -174,7 +173,6 @@ export function mergeExpertsById(first: Expert[], second: Expert[]): Expert[] {
   selector: 'app-subagents-editor',
   standalone: true,
   imports: [
-    FormsModule,
     TranslocoPipe,
     AppButtonComponent,
     AppFormFieldComponent,
@@ -192,7 +190,50 @@ export function mergeExpertsById(first: Expert[], second: Expert[]): Expert[] {
       }
 
       @for (draft of entries(); track draft.key) {
-        <div class="entry" [class.invalid]="issuesFor(draft.key).length > 0">
+        <div class="entry" [class.invalid]="issuesFor(draft.key).length > 0" [class.open]="isOpen(draft.key)">
+          <!-- One line per subagent: who it is and what it runs on. The fields
+               open under it, so a roster of six is six lines, not six forms. -->
+          <div class="entry-bar">
+            <button
+              type="button"
+              class="entry-toggle"
+              [attr.aria-expanded]="isOpen(draft.key)"
+              [attr.aria-controls]="'subagent-entry-' + draft.key"
+              (click)="toggle(draft.key)"
+            >
+              <app-icon size="sm" class="entry-chevron">expand_more</app-icon>
+              <span class="entry-name" [class.unnamed]="!draft.name.trim()">
+                {{ draft.name.trim() || ('experts.subagents.unnamed' | transloco) }}
+              </span>
+              <span class="entry-meta">
+                @if (draft.kind === 'reference') {
+                  {{ referenceLabel(draft.ref) || ('experts.subagents.kindReferenceShort' | transloco) }}
+                } @else {
+                  {{ 'experts.subagents.kindInlineShort' | transloco }}
+                }
+                @if (draft.model) {
+                  · {{ draft.model }}
+                }
+              </span>
+              @if (issuesFor(draft.key).length > 0) {
+                <app-icon size="sm" class="entry-warn" [attr.aria-label]="'experts.subagents.needsAttention' | transloco">error</app-icon>
+              }
+            </button>
+            @if (!disabled()) {
+              <app-icon-button
+                class="remove"
+                variant="danger"
+                size="sm"
+                [ariaLabel]="'experts.subagents.remove' | transloco"
+                [tooltip]="'experts.subagents.remove' | transloco"
+                (clicked)="remove(draft.key)"
+              >
+                <app-icon size="sm">delete</app-icon>
+              </app-icon-button>
+            }
+          </div>
+
+          <div class="entry-body" [id]="'subagent-entry-' + draft.key" [hidden]="!isOpen(draft.key)">
           <div class="entry-head">
             <app-form-field
               class="grow"
@@ -213,17 +254,6 @@ export function mergeExpertsById(first: Expert[], second: Expert[]): Expert[] {
                 <option value="reference">{{ 'experts.subagents.kindReference' | transloco }}</option>
               </app-select>
             </app-form-field>
-            <app-icon-button
-              class="remove"
-              variant="danger"
-              size="sm"
-              [disabled]="disabled()"
-              [ariaLabel]="'experts.subagents.remove' | transloco"
-              [tooltip]="'experts.subagents.remove' | transloco"
-              (clicked)="remove(draft.key)"
-            >
-              <app-icon size="sm">delete</app-icon>
-            </app-icon-button>
           </div>
 
           @if (draft.kind === 'reference') {
@@ -272,21 +302,20 @@ export function mergeExpertsById(first: Expert[], second: Expert[]): Expert[] {
               />
             </app-form-field>
             <app-form-field [label]="'experts.subagents.model' | transloco">
-              <select
-                class="model-select"
+              <app-select
+                [value]="draft.model"
                 [disabled]="disabled() || modelGated()"
-                [ngModel]="draft.model"
-                (ngModelChange)="patch(draft.key, {model: $event})"
+                (valueChange)="patch(draft.key, {model: $event ?? ''})"
               >
-                <option [ngValue]="''">{{ 'experts.subagents.modelInherit' | transloco }}</option>
+                <option value="">{{ 'experts.subagents.modelInherit' | transloco }}</option>
                 @for (g of models(); track g.group) {
                   <optgroup [label]="g.group">
                     @for (m of g.models; track m) {
-                      <option [ngValue]="m" [disabled]="!modelAllowed()(m)">{{ modelLabel(g, m) }}</option>
+                      <option [value]="m" [disabled]="!modelAllowed()(m)">{{ modelLabel(g, m) }}</option>
                     }
                   </optgroup>
                 }
-              </select>
+              </app-select>
             </app-form-field>
             <app-form-field [label]="'experts.subagents.isolation' | transloco">
               <app-select [value]="draft.isolation" [disabled]="disabled()" (valueChange)="setIsolation(draft.key, $event)">
@@ -322,14 +351,17 @@ export function mergeExpertsById(first: Expert[], second: Expert[]): Expert[] {
           @for (issue of issuesFor(draft.key); track issue) {
             <p class="issue" role="alert">{{ issue | transloco }}</p>
           }
+          </div>
         </div>
       }
 
       <div class="roster-foot">
-        <app-button variant="secondary" size="sm" [disabled]="disabled()" (clicked)="add()">
-          <app-icon size="sm">add</app-icon>
-          {{ 'experts.subagents.add' | transloco }}
-        </app-button>
+        @if (!disabled()) {
+          <app-button class="add" variant="secondary" size="sm" (clicked)="add()">
+            <app-icon size="sm">add</app-icon>
+            {{ 'experts.subagents.add' | transloco }}
+          </app-button>
+        }
         @if (entries().length > 0) {
           <app-form-field
             class="default-field"
@@ -363,17 +395,87 @@ export function mergeExpertsById(first: Expert[], second: Expert[]): Expert[] {
         font-size: 0.85rem;
       }
       .entry {
-        display: flex;
-        flex-direction: column;
-        gap: 0.5rem;
-        padding: 0.75rem;
         border: 1px solid var(--border-color);
-        border-left: 2px solid var(--accent-color);
         border-radius: var(--radius-control);
         background: var(--surface-0);
       }
       .entry.invalid {
-        border-left-color: var(--danger);
+        border-color: var(--danger);
+      }
+      .entry-bar {
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding-right: 0.375rem;
+      }
+      .entry-toggle {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.625rem 0.5rem 0.625rem 0.625rem;
+        border: 0;
+        background: none;
+        color: var(--text-primary);
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+        border-radius: var(--radius-control);
+      }
+      .entry-toggle:hover {
+        background: var(--hover);
+      }
+      .entry-toggle:focus-visible {
+        outline: 2px solid var(--accent-color);
+        outline-offset: -2px;
+      }
+      .entry-chevron {
+        flex-shrink: 0;
+        color: var(--text-muted);
+        transition: transform 0.15s ease;
+      }
+      .entry.open .entry-chevron {
+        transform: rotate(180deg);
+      }
+      .entry-name {
+        flex-shrink: 0;
+        font-family: var(--font-mono, monospace);
+        font-size: 0.85rem;
+        font-weight: 600;
+      }
+      .entry-name.unnamed {
+        font-family: inherit;
+        font-weight: 400;
+        color: var(--text-muted);
+      }
+      .entry-meta {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--text-muted);
+        font-size: 0.8125rem;
+      }
+      .entry-warn {
+        flex-shrink: 0;
+        margin-left: auto;
+        color: var(--danger);
+      }
+      .entry-body {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        padding: 0.75rem;
+        border-top: 1px solid var(--border-hairline);
+      }
+      .entry-body[hidden] {
+        display: none;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .entry-chevron {
+          transition: none;
+        }
       }
       .entry-head {
         display: flex;
@@ -383,9 +485,6 @@ export function mergeExpertsById(first: Expert[], second: Expert[]): Expert[] {
       }
       .entry-head .grow {
         flex: 1 1 200px;
-      }
-      .entry-head .remove {
-        margin-top: 1.6rem;
       }
       .reference-row {
         display: flex;
@@ -404,19 +503,6 @@ export function mergeExpertsById(first: Expert[], second: Expert[]): Expert[] {
       .entry-grid .span-2 {
         grid-column: 1 / -1;
       }
-      .model-select {
-        width: 100%;
-        padding: 7px 10px;
-        border: 1px solid var(--border-color);
-        border-radius: var(--radius-control);
-        background: var(--surface-0);
-        color: var(--text-primary);
-        font: inherit;
-      }
-      .model-select:disabled {
-        opacity: 0.55;
-        cursor: not-allowed;
-      }
       .issue {
         margin: 0;
         font-size: 0.8rem;
@@ -424,12 +510,13 @@ export function mergeExpertsById(first: Expert[], second: Expert[]): Expert[] {
       }
       .roster-foot {
         display: flex;
+        flex-direction: column;
         gap: 1rem;
-        align-items: flex-end;
-        flex-wrap: wrap;
+      }
+      .roster-foot .add {
+        align-self: flex-start;
       }
       .roster-foot .default-field {
-        flex: 1 1 220px;
         max-width: 360px;
       }
     `,
@@ -451,6 +538,9 @@ export class SubagentsEditorComponent {
   settingsChange = output<void>();
 
   readonly entries = signal<RosterEntryDraft[]>([]);
+  /** Draft keys whose fields are showing. A stored roster loads collapsed (a
+   *  line per subagent); a newly added entry opens, since it is all blanks. */
+  private readonly opened = signal<ReadonlySet<number>>(new Set());
   /** `subagents.default`; '' = none. */
   readonly defaultEntry = signal('');
   /** Keys of the stored block other than `default` / `roster` (the host owns
@@ -508,6 +598,28 @@ export class SubagentsEditorComponent {
     return this.issues().get(key) ?? [];
   }
 
+  /** An entry with a problem is always open: its message is inside. */
+  isOpen(key: number): boolean {
+    return this.opened().has(key) || this.issues().has(key);
+  }
+
+  toggle(key: number): void {
+    this.opened.update((set) => {
+      const next = new Set(set);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  /** The referenced expert's display name for the summary line, or the raw
+   *  `$ref` while the list is loading or does not carry it. */
+  referenceLabel(ref: string): string {
+    if (!ref) return '';
+    const known = this.referenceExperts().find((e) => referenceSpelling(e) === ref);
+    return known?.display_name || ref;
+  }
+
   isKnownReference(ref: string): boolean {
     return this.referenceOptions().some((o) => o.value === ref);
   }
@@ -520,6 +632,7 @@ export class SubagentsEditorComponent {
         draftFromEntry(name, isPlainObject(entry) ? entry : {}, this.nextKey++),
       ),
     );
+    this.opened.set(new Set());
     this.defaultEntry.set(typeof config?.default === 'string' ? config.default : '');
     this.passthrough = {};
     if (isPlainObject(config)) {
@@ -552,10 +665,12 @@ export class SubagentsEditorComponent {
   }
 
   add(): void {
+    const key = this.nextKey++;
+    this.opened.update((set) => new Set(set).add(key));
     this.entries.update((list) => [
       ...list,
       {
-        key: this.nextKey++,
+        key,
         name: '',
         kind: 'inline',
         ref: '',

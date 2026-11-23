@@ -2072,7 +2072,7 @@ class VMWorkspaceRecoveryStore:
             ):
                 wake_scope = None
                 if (
-                    owner_kind == "job"
+                    owner_kind in {"job", "thread"}
                     and source == "controller_vm_create"
                     and parent_id is None
                 ):
@@ -2080,9 +2080,16 @@ class VMWorkspaceRecoveryStore:
                         VMCreationRetryStore,
                     )
 
-                    wake_scope = await VMCreationRetryStore(
-                        self.db
-                    ).idle_wake_access_scope_on_conn(
+                    retries = VMCreationRetryStore(self.db)
+                    # Access waiting for the one successor of an idle wake
+                    # cannot use the stopped VM; only that successor may
+                    # ignore it (a Job's and a VM Session's wake alike).
+                    scope_of = (
+                        retries.idle_wake_access_scope_on_conn
+                        if owner_kind == "job"
+                        else retries.thread_idle_wake_access_scope_on_conn
+                    )
+                    wake_scope = await scope_of(
                         conn,
                         owner_id=owner_id,
                         pvc_uid=pvc_uid,

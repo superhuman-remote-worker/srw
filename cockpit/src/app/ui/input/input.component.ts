@@ -17,7 +17,9 @@ export type InputType =
   | 'number'
   | 'search'
   | 'tel'
-  | 'url';
+  | 'url'
+  | 'date'
+  | 'datetime-local';
 export type InputSize = 'sm' | 'md' | 'lg';
 
 @Component({
@@ -40,6 +42,11 @@ export type InputSize = 'sm' | 'md' | 'lg';
       [attr.autocomplete]="autocomplete() || null"
       [attr.inputmode]="inputmode() || null"
       [attr.list]="list() || null"
+      [attr.min]="min() ?? null"
+      [attr.max]="max() ?? null"
+      [attr.step]="step() ?? null"
+      [attr.minlength]="minLength() ?? null"
+      [attr.maxlength]="maxLength() ?? null"
       [attr.data-size]="size()"
       [attr.data-invalid]="invalid() || null"
       (input)="onInput($event)"
@@ -71,6 +78,13 @@ export class AppInputComponent {
   inputmode = input<string>('');
   /** Optional <datalist> id for combobox-style preset suggestions (free entry still allowed). */
   list = input<string>('');
+  /** Native bounds, unset by default: `min`/`max`/`step` for number and
+   *  date types, `minlength`/`maxlength` for text. */
+  min = input<number | string | null>(null);
+  max = input<number | string | null>(null);
+  step = input<number | string | null>(null);
+  minLength = input<number | null>(null);
+  maxLength = input<number | null>(null);
 
   changed = output<string>();
   focused = output<FocusEvent>();

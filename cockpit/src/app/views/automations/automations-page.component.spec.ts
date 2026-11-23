@@ -326,6 +326,80 @@ describe('AutomationsPageComponent', () => {
 });
 
 
+describe('automation config_override', () => {
+  const stored = (configOverride: unknown, triggerType: 'cron' | 'live' = 'cron') => ({
+    id: 'a-7', trigger_type: triggerType, cron_expr: '0 9 * * *', timezone: 'UTC', name: 'Daily',
+    expert: 'scholar', prompt: 'Review', enabled: true, autonomy: 'review', priority: 5, max_fires_per_day: 100,
+    catchup_window_seconds: 3600, project_id: null, config_override: configOverride,
+  }) as unknown as Automation;
+
+  function create() {
+    const result = createComponent();
+    result.component.ngOnInit();
+    return result;
+  }
+
+  it('a new automation sends no config_override and no phases', () => {
+    const {component, automationsServiceMock} = create();
+    component.openNewEditor();
+    component.updateEditor('name', 'Daily review');
+    component.updateEditor('prompt', 'Review the project.');
+
+    component.saveEditor();
+
+    const body = automationsServiceMock.create.mock.calls[0][0];
+    expect(body).not.toHaveProperty('config_override');
+    expect(body).not.toHaveProperty('phases');
+  });
+
+  it('a save keeps config_override.phases: the PATCH leaves the stored override alone', () => {
+    const {component, automationsServiceMock} = create();
+    component.openEditor(stored({phases: true, tools: {web: true}, llm: {model: 'm1'}}));
+    component.updateEditor('prompt', 'Review it again');
+    component.updateEditor('autonomy', 'full');
+
+    component.saveEditor();
+
+    expect(automationsServiceMock.update.mock.calls[0][0]).toBe('a-7');
+    const body = automationsServiceMock.update.mock.calls[0][1];
+    // A PATCH replaces a config_override it is given, so leaving it out is
+    // what keeps phases and every other stored key.
+    expect(body).not.toHaveProperty('config_override');
+    expect(body).not.toHaveProperty('phases');
+    expect(body).toMatchObject({prompt: 'Review it again', autonomy: 'full'});
+  });
+
+  it('keeps phases: false, and an override that arrived as JSON text', () => {
+    const {component, automationsServiceMock} = create();
+    component.openEditor(stored({phases: false}));
+    component.saveEditor();
+    component.openEditor(stored('{"phases": true, "autonomy": "full"}'));
+    component.saveEditor();
+
+    expect(automationsServiceMock.update).toHaveBeenCalledTimes(2);
+    for (const [, body] of automationsServiceMock.update.mock.calls) {
+      expect(body).not.toHaveProperty('config_override');
+    }
+  });
+
+  it('a live automation\'s save keeps its stored override too', () => {
+    const {component, automationsServiceMock, apiServiceMock} = createComponent();
+    apiServiceMock.getEligibleDatasources.mockReturnValue(of([{id: 'phone-1', name: 'Empfang', type: 'gpt_live_sip'}]));
+    component.ngOnInit();
+    component.openEditor({
+      ...stored({phases: true}, 'live'),
+      trigger_connector_id: 'phone-1',
+      job_shape: {execution: {connectors: {empfang: {ref: {uid: 'phone-1'}}}}, primary_connector: 'empfang'},
+    } as unknown as Automation);
+
+    component.saveEditor();
+
+    expect(automationsServiceMock.update).toHaveBeenCalledOnce();
+    expect(automationsServiceMock.update.mock.calls[0][1]).not.toHaveProperty('config_override');
+  });
+});
+
+
 describe('live automations', () => {
   const line = {id: 'phone-1', name: 'Empfang', type: 'gpt_live_sip'};
   const extra = {id: 'kb-1', name: 'Empfang', type: 'kb'};
@@ -605,6 +679,19 @@ describe('live automation rendering', () => {
     expect(link?.textContent).toContain('Clinic');
     expect(link?.getAttribute('href')).toBe('/projects/p1');
     expect(field.textContent).toContain(en.automations.editor.projectFixed);
+  });
+
+  it('offers no phases choice, on a schedule or a live trigger', () => {
+    const {fixture, component, host} = mount();
+    component.openNewEditor();
+    fixture.detectChanges();
+    const labels = () => [...host.querySelectorAll('.editor-grid .field-label')].map((el) => el.textContent?.trim());
+    expect(labels()).toContain(en.automations.editor.expert);
+    expect(labels()).not.toContain(en.experts.editor.phases);
+    expect(host.textContent).not.toContain(en.experts.editor.phasesHint);
+    component.updateEditor('triggerType', 'live');
+    fixture.detectChanges();
+    expect(labels()).not.toContain(en.experts.editor.phases);
   });
 
   it('tells a live trigger without a project that project lines appear once one is chosen', () => {

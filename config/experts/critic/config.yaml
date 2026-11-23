@@ -35,6 +35,9 @@ spec:
 
         agent_id: critic
         display_name: Critic
+        # This expert plans in phases (shared/job_phases.py; false by default).
+        # A critic's tools are the phase tools and it ends with a verdict.
+        phases: true
         description: |
           Quality gatekeeper. Reviews code diffs, evaluates Scholar proposals,
           audits the codebase for tech debt, and runs tests. Nothing passes

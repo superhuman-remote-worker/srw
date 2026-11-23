@@ -164,8 +164,10 @@ export function delegationOverride(
   imports: [FormsModule, TranslocoPipe, AppIconComponent],
   template: `
     <div class="settings-group">
-      <div class="group-header">
-        <span class="group-label">{{ 'agentSettings.tools.group' | transloco }}</span>
+      <div class="group-header" [class.label-hidden]="!showGroupLabel()">
+        @if (showGroupLabel()) {
+          <span class="group-label">{{ 'agentSettings.tools.group' | transloco }}</span>
+        }
         <button
           type="button"
           class="select-all-btn"
@@ -356,6 +358,12 @@ export function delegationOverride(
       padding-bottom: 6px;
       border-bottom: 1px solid var(--border-color, var(--surface-0));
     }
+    .group-header.label-hidden {
+      justify-content: flex-end;
+      margin-bottom: 8px;
+      padding-bottom: 0;
+      border-bottom: none;
+    }
     .group-label {
       font-size: 11px;
       font-weight: 600;
@@ -390,7 +398,7 @@ export function delegationOverride(
       padding: 6px 10px;
       border-radius: var(--radius-control);
       border-left: 2px solid var(--border-color, var(--surface-1));
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--hover);
       font-size: 11px;
       line-height: 1.4;
       color: var(--text-muted);
@@ -423,7 +431,7 @@ export function delegationOverride(
       transition: background 0.15s, border-color 0.15s;
     }
     .tool-toggle:hover:not(.disabled) {
-      background: rgba(255, 255, 255, 0.03);
+      background: var(--hover);
     }
     .tool-toggle.modified {
       border-left-color: var(--accent-color, var(--accent-color));
@@ -489,7 +497,7 @@ export function delegationOverride(
       height: 20px;
       border: none;
       border-radius: 50%;
-      background: rgba(255, 255, 255, 0.08);
+      background: var(--hover);
       color: var(--text-muted);
       cursor: pointer;
       flex-shrink: 0;
@@ -563,7 +571,7 @@ export function delegationOverride(
       font-weight: 600;
     }
     .tool-additions-btn:hover:not(:disabled) {
-      background: rgba(255, 255, 255, 0.06);
+      background: var(--hover);
     }
     .tool-additions-btn:disabled {
       border-color: var(--border-color, var(--surface-1));
@@ -607,6 +615,9 @@ export class ToolsGroupComponent {
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
   disabled = input(false);
+  /** The "Tools" label beside Select all. Off where the host already titles
+   *  the block (the expert editor's own section heading). */
+  showGroupLabel = input(true);
   /**
    * The server's resolved answer — a measurement from the running agent, or a
    * labelled prediction. When present it supplies the category set, the three

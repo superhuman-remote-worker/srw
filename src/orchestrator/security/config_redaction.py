@@ -29,6 +29,43 @@ def _is_secret_key(key: str) -> bool:
     return k in _SECRET_KEY_NAMES or k.endswith(_SECRET_KEY_SUFFIX)
 
 
+# Key names (case-insensitive) injected in flight only: an endpoint's pinned
+# TLS certificate (a model section's ``tls_pinned_cert``, ``image`` included,
+# and every ``env_keys.*_TLS_PINNED_CERT``). The value is public, not a
+# credential, but a stored copy must not outlive a re-trust: dispatch writes
+# it from the endpoint row on every injection, so it is never persisted.
+_IN_FLIGHT_ONLY_KEY = "tls_pinned_cert"
+_IN_FLIGHT_ONLY_SUFFIX = "_tls_pinned_cert"
+
+
+def _is_in_flight_only_key(key: str) -> bool:
+    k = key.lower()
+    return k == _IN_FLIGHT_ONLY_KEY or k.endswith(_IN_FLIGHT_ONLY_SUFFIX)
+
+
+def strip_in_flight_only_keys(value: Any) -> None:
+    """Remove every in-flight-only key from ``value`` IN PLACE, at any depth.
+
+    Run at the entry of every dispatch chain, before its injectors. A pin is a
+    trust anchor, so the only pin that may reach an agent is one dispatch
+    writes from the endpoint row an admin trusted. Whatever the override
+    brought is dropped: a project or Expert default, a caller's fragment, or a
+    copy stored before redaction stripped it. That holds wherever it sits: a
+    model section with no model of its own, ``image``, ``env_keys`` or any
+    other flat env block. The key rule is :func:`redact_config_override`'s.
+    """
+    if isinstance(value, dict):
+        for key in [
+            k for k in value if isinstance(k, str) and _is_in_flight_only_key(k)
+        ]:
+            del value[key]
+        for nested in value.values():
+            strip_in_flight_only_keys(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            strip_in_flight_only_keys(nested)
+
+
 def redact_config_override(co: Any) -> Any:
     """Return a deep copy of a ``config_override`` with credential fields removed.
 
@@ -36,7 +73,9 @@ def redact_config_override(co: Any) -> Any:
     name (case-insensitive) is one of api_key/password/secret/token/private_key/
     rclone_spec, or ends with ``_api_key`` — i.e. ``llm.api_key``, phase overrides
     ``llm.{strategic,tactical,summarization}.api_key``, ``auxiliary.api_key``,
-    every ``env_keys.*_API_KEY``, and ``workspace.mounts[].rclone_spec``.
+    every ``env_keys.*_API_KEY``, and ``workspace.mounts[].rclone_spec``. Also
+    removes the in-flight-only pin, ``tls_pinned_cert`` and ``*_tls_pinned_cert``
+    (``llm.tls_pinned_cert``, ``env_keys.EMBEDDING_TLS_PINNED_CERT``, ...).
 
     Non-secret fields are preserved verbatim (``llm.model``/``provider``/
     ``base_url``/``temperature``, ``env_keys.*_MODEL``/``*_BASE_URL``/``*_PROVIDER``,
@@ -51,7 +90,9 @@ def redact_config_override(co: Any) -> Any:
     """
     if isinstance(co, dict):
         return {
-            k: redact_config_override(v) for k, v in co.items() if not _is_secret_key(k)
+            k: redact_config_override(v)
+            for k, v in co.items()
+            if not _is_secret_key(k) and not _is_in_flight_only_key(k)
         }
     if isinstance(co, list):
         return [redact_config_override(v) for v in co]

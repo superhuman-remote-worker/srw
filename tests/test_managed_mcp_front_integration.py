@@ -257,16 +257,10 @@ def _tool(manager: MCPManager, suffix: str):
 
 
 async def _text(tool, **arguments) -> str:
-    """A tool call's text, as the model reads it."""
+    """A tool call's text, as the model reads it: always a plain string."""
     result = await tool.coroutine(**arguments)
-    if isinstance(result, tuple):  # the adapter's (content, artifact)
-        result = result[0]
-    if isinstance(result, list):
-        result = "\n".join(
-            block.get("text", "") if isinstance(block, dict) else str(block)
-            for block in result
-        )
-    return str(result)
+    assert isinstance(result, str), type(result)
+    return result
 
 
 @pytest.mark.asyncio
@@ -276,6 +270,12 @@ async def test_a_session_serves_through_the_front_with_only_a_lease(pod):
     manager = await _connected(entry)
     try:
         assert manager.statuses == {"Notes": "connected"}
+        # The front answers no 2026-07-28 probe, so the client fell back to
+        # the initialize handshake.
+        from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS
+
+        version = manager._handles[0].session.protocol_version
+        assert version in HANDSHAKE_PROTOCOL_VERSIONS
         names = {t.metadata["mcp_tool_name"] for t in manager.get_langchain_tools()}
         assert names == {
             "whoami",
@@ -319,9 +319,9 @@ async def test_read_only_hides_write_tools_and_refuses_them(pod):
         handle = manager._handles[0]
         # A client that asks anyway gets the server's "unknown tool" answer
         # from the front, and its session stays alive.
-        from mcp.shared.exceptions import McpError
+        from mcp.shared.exceptions import MCPError
 
-        with pytest.raises(McpError) as refused:
+        with pytest.raises(MCPError) as refused:
             await handle.session.call_tool("notes_write", {"name": "a", "text": "x"})
         assert "Unknown tool" in str(refused.value)
         assert manager_module._tool_level(refused.value)

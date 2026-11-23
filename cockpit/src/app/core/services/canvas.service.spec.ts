@@ -7,6 +7,7 @@ import {
 import {TestBed} from '@angular/core/testing';
 import {BrowserCapability, CanvasState} from '../models/canvas.model';
 import {
+  BROWSER_CAPABILITY_RECHECK_MS,
   BROWSER_OPEN_TIMEOUT_MS,
   CanvasService,
   browserOpenRetryDelayMs,
@@ -868,6 +869,83 @@ describe('CanvasService', () => {
       browserCapability(),
     );
     expect(service.state()).toBeNull();
+  });
+
+  it('asks again while the workspace is not yet attested, and stops once it can open', () => {
+    vi.useFakeTimers();
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability({can_open_browser: false, workspace_ready: false, reason: 'workspace_unattested'}),
+    );
+    expect(service.browserCapability()?.can_open_browser).toBe(false);
+
+    vi.advanceTimersByTime(BROWSER_CAPABILITY_RECHECK_MS - 1);
+    http.expectNone(req => req.url.endsWith('/thread-1/browser/capability'));
+    vi.advanceTimersByTime(1);
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability(),
+    );
+    expect(service.browserCapability()?.can_open_browser).toBe(true);
+
+    vi.advanceTimersByTime(BROWSER_CAPABILITY_RECHECK_MS * 3);
+    http.expectNone(req => req.url.endsWith('/thread-1/browser/capability'));
+  });
+
+  it('does not poll a workspace that needs an upgrade; refresh and the upgrade ask again', () => {
+    vi.useFakeTimers();
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability({can_open_browser: false, workspace_ready: false, reason: 'workspace_required'}),
+    );
+    vi.advanceTimersByTime(BROWSER_CAPABILITY_RECHECK_MS * 3);
+    http.expectNone(req => req.url.endsWith('/thread-1/browser/capability'));
+
+    // The Canvas refresh button asks again while the browser cannot open.
+    service.reconcile();
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability({can_open_browser: false, workspace_ready: false, reason: 'workspace_required'}),
+    );
+
+    // A finished workspace upgrade asks again (PersistentChatService calls this).
+    service.refreshBrowserCapability();
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability(),
+    );
+    expect(service.browserCapability()?.can_open_browser).toBe(true);
+  });
+
+  it('stops asking again when the thread changes', () => {
+    vi.useFakeTimers();
+    service.selectThread('thread-1');
+    http.expectOne(req => req.url.includes('/thread-1/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-1/browser/capability')).flush(
+      browserCapability({can_open_browser: false, workspace_ready: false, reason: 'workspace_unattested'}),
+    );
+    service.selectThread('thread-2');
+    http.expectOne(req => req.url.includes('/thread-2/canvases/main')).flush(null, {
+      status: 204,
+      statusText: 'No Content',
+    });
+    http.expectOne(req => req.url.endsWith('/thread-2/browser/capability')).flush(
+      browserCapability(),
+    );
+    vi.advanceTimersByTime(BROWSER_CAPABILITY_RECHECK_MS * 2);
+    http.expectNone(req => req.url.endsWith('/thread-1/browser/capability'));
   });
 
   it('refuses to reset app storage without an authoritative state ETag', () => {

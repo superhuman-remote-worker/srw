@@ -278,7 +278,6 @@ def expert_catalog_service(resources: ApplicationResources) -> ExpertCatalogServ
             get_config_dir=catalogue.get_config_dir,
             load_settings_matrix=catalogue.load_settings_matrix,
             experts_enabled=deployment_gates.is_experts_db_enabled,
-            skills_enabled=deployment_gates.is_skills_db_enabled,
             account_defaults_layer=bound(
                 session_config_resolution.account_defaults_layer,
                 preparation_composition.session_config_dependencies,

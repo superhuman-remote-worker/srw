@@ -22,6 +22,7 @@ the site; edit it on GitHub and the site follows.
 | Install SRW and run a first session and job | [Get started](getting-started.md) |
 | Understand experts, workspaces, connectors, sessions and jobs | [Concepts](concepts.md) |
 | Connect model providers | [Models](models.md) |
+| Work from a terminal or a pipeline | [srw CLI](cli.md) |
 | Fix a failing installation | [Troubleshooting](troubleshooting.md) |
 
 ## Guides
@@ -50,6 +51,10 @@ the site; edit it on GitHub and the site follows.
   an immutable image, enable bounded recovery, interpret retained holds.
 - [Project loops](project-loops.md) — bounded, repeated job sequences against
   one project goal.
+- [Automate SRW with the API](api.md) — personal access tokens, jobs and
+  automations from n8n, Zapier, scripts or curl.
+- [srw CLI](cli.md) — install the command-line client, log in, keep
+  configuration as files and run jobs from a terminal or a pipeline.
 
 ## Operations
 
@@ -63,6 +68,9 @@ the site; edit it on GitHub and the site follows.
 
 - [Architecture](architecture.md) — control plane, runtimes, workspaces,
   state, and job and session lifecycles.
+- [srw CLI reference](cli-reference.md) — every command, flag, example and
+  environment variable of the command-line client, generated from the
+  program.
 - [Helm values](https://docs.superhuman-remote-worker.com/reference/helm-values/)
   — every chart value with type, default and description, generated from
   [`helm/values.yaml`](../helm/values.yaml) and

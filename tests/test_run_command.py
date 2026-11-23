@@ -25,7 +25,7 @@ def make_backend():
     backend = MagicMock()
     backend.supports_shell = True
     backend.shell_run.return_value = "Exit code: 0\n--- stdout ---\nok"
-    backend.shell_send.return_value = "Sent"
+    backend.shell_send.return_value = "Sent to 'default'"
     backend.shell_read.return_value = ("output", {"tab": "default"})
     backend.shell_read_with_offset.return_value = (
         "output",
@@ -369,6 +369,85 @@ class TestShellExecuteWorkingDir:
             allow_busy=True,
         )
         backend.shell_run.assert_not_called()
+
+
+class TestShellExecuteReportsRefusedInput:
+    """A send that typed nothing must say so, never show the idle tab.
+
+    k3d, 2026-11-21: a dev server restarted with ``is_async`` on a tab whose
+    guard was still set answered "(no new output)", so the model believed it
+    had started and fell back to ``nohup`` in another tab.
+    """
+
+    COLLIDING = COLLIDING_COMMAND_TEMPLATE.format(tab="api", terminal_state="$ ^C\n$")
+
+    def _get_shell_execute(self, manager):
+        context = _make_context(manager, mode="persistent")
+        tools = create_shell_tools(context)
+        return next(t for t in tools if t.name == "shell_execute")
+
+    def test_async_command_refused_by_busy_tab_reaches_the_result(
+        self, manager, backend
+    ):
+        backend.shell_send.return_value = self.COLLIDING
+        backend.shell_read.return_value = ("(no new output)", {"tab": "api"})
+        backend.shell_format_tab_header.return_value = "[Shells: default | api]"
+        tool = self._get_shell_execute(manager)
+        with patch("agent.tools.shell.shell_tools.time.sleep") as sleep:
+            result = tool.invoke(
+                {
+                    "command": "python -m uvicorn main:app --port 8000",
+                    "name": "api",
+                    "is_async": True,
+                    "working_dir": "app/backend",
+                }
+            )
+        assert result.startswith("[Shells: default | api]\n")
+        assert "your new command was NOT executed" in result
+        assert "(no new output)" not in result
+        sleep.assert_not_called()
+        # Only the cursor snapshot taken before the send read the tab.
+        backend.shell_read.assert_called_once_with("api", lines=1, since_cursor=False)
+
+    def test_async_blocked_command_reaches_the_result(self, manager, backend):
+        tool = self._get_shell_execute(manager)
+        with patch("agent.tools.shell.shell_tools.time.sleep"):
+            result = tool.invoke({"command": "reboot", "is_async": True})
+        assert "Command blocked: 'reboot'" in result
+        backend.shell_send.assert_not_called()
+
+    def test_keys_refusal_reaches_the_result(self, manager, backend):
+        """Keys text on an idle shell is a command and can be blocked."""
+        tool = self._get_shell_execute(manager)
+        with patch("agent.tools.shell.shell_tools.time.sleep"):
+            result = tool.invoke({"command": "halt -p", "keys": True})
+        assert result.startswith(
+            "[Shells: default]\nCommand blocked: 'halt' is not allowed."
+        )
+        backend.shell_send.assert_not_called()
+        backend.shell_read_with_offset.assert_not_called()
+
+    def test_keys_refusal_from_the_backend_reaches_the_result(self, manager, backend):
+        backend.shell_send.return_value = COLLIDING_COMMAND_TEMPLATE.format(
+            tab="default", terminal_state="$"
+        )
+        tool = self._get_shell_execute(manager)
+        with patch("agent.tools.shell.shell_tools.time.sleep"):
+            result = tool.invoke({"command": "yes", "keys": True})
+        assert "your new command was NOT executed" in result
+        backend.shell_read_with_offset.assert_not_called()
+
+    @pytest.mark.parametrize("answer", ["Sent to 'api'", "Sent to 'b3f0-api'"])
+    def test_delivered_input_still_shows_the_tab(self, manager, backend, answer):
+        """A subagent's backend answers with its prefixed tab name."""
+        backend.shell_send.return_value = answer
+        backend.shell_read.return_value = ("Uvicorn running", {"tab": "api"})
+        tool = self._get_shell_execute(manager)
+        with patch("agent.tools.shell.shell_tools.time.sleep"):
+            result = tool.invoke(
+                {"command": "npm run dev", "name": "api", "is_async": True}
+            )
+        assert result == "[Shells: default]\nUvicorn running"
 
 
 class TestToolNameAliasing:

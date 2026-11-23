@@ -1068,7 +1068,7 @@
                 },
                 "rawPathVerified": {
                   "type": "boolean",
-                  "description": "Deprecated (2026-07-14), no effect: raw-path fidelity is an optional property of the operator's edge, not a launch gate. See knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md."
+                  "description": "Deprecated (2026-07-14), no effect: raw-path fidelity is an optional property of the operator's edge, not a launch gate."
                 },
                 "pslBoundaryVerified": {
                   "type": "boolean"
@@ -3183,6 +3183,13 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {"privileged": {"type": "boolean"}}
+        },
+        "memoryGrowth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max": {"type": "string", "pattern": "^$|^[1-9][0-9]*(Mi|Gi|Ti)$"}
+          }
         },
         "builtinTemplates": {
           "type": "object",

@@ -227,7 +227,7 @@ def grant_blocked_categories(grants: Optional[Mapping[str, Any]]) -> dict[str, s
     if grants is None:
         return {}
     # An absent key falls back to the catalog default, read exactly the way the
-    # PDP reads it (``grants.get(key, <default>)`` in ``capability_grants``).
+    # PDP reads it (``_granted`` in ``capability_grants``).
     from shared.runtime.core.capability_grants import CATALOG
 
     blocked: dict[str, str] = {}

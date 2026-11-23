@@ -25,8 +25,10 @@ OTHER_JOB = "30000000-0000-4000-8000-000000000003"
 PROJECT_SQL = (
     "SELECT js.*, jcr.delivery_status, jcr.delivery_ref, "
     "jcr.delivery_sha, jcr.record_type AS change_record_type, "
-    "j.diff_status, j.cloud_diff_baseline_commit, "
-    "j.context->'cloud_checkout' AS cloud_checkout "
+    "j.diff_status, j.cloud_diff_baseline_commit, j.title, "
+    "j.context->'cloud_checkout' AS cloud_checkout, "
+    "CASE j.config_override->>'phases' WHEN 'true' THEN true "
+    "WHEN 'false' THEN false END AS phases "
     "FROM job_summary js "
     "JOIN jobs j ON j.id = js.id "
     "LEFT JOIN job_change_records jcr ON jcr.job_id = js.id "
@@ -109,7 +111,13 @@ async def test_detail_reads_exact_authorized_row_and_preserves_optional_audit(
 
     result = await read_job(job_id=JOB, authorized_job=row, dependencies=reads.deps)
 
-    assert result == {**row, "audit_count": count, "cloud_review_mode": "open_folder"}
+    assert result == {
+        **row,
+        "audit_count": count,
+        "cloud_review_mode": "open_folder",
+        # A row that states no ``phases`` (a job from before the setting).
+        "phases": None,
+    }
     # Existing access-row mutation remains observable to in-process callers.
     assert row["audit_count"] == count
     assert reads.deps.redact_job.call_args.args[0] is row
@@ -121,6 +129,44 @@ async def test_detail_reads_exact_authorized_row_and_preserves_optional_audit(
         reads.audit.get_audit_count.assert_awaited_once_with(JOB)
     else:
         reads.audit.get_audit_count.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_config", "expected"),
+    [
+        ({"config_override": {"phases": False}}, False),
+        ({"config_override": {"phases": True}}, True),
+        (
+            {
+                "resolved_config": {"agent": {"phases": True}},
+                "config_override": {"phases": False},
+            },
+            True,
+        ),
+    ],
+)
+async def test_detail_reports_the_phases_setting_from_the_unredacted_row(
+    reads, row_config, expected
+):
+    """The frozen configuration is what the job runs with, so it wins over the
+    value admission wrote on ``config_override``; both are read before the
+    row is redacted."""
+
+    def redact(job):
+        return {
+            key: value
+            for key, value in job.items()
+            if key not in ("resolved_config", "config_override")
+        }
+
+    reads.deps.redact_job.side_effect = redact
+    row = {"id": JOB, **row_config}
+
+    result = await read_job(job_id=JOB, authorized_job=row, dependencies=reads.deps)
+
+    assert result["phases"] is expected
+    assert "resolved_config" not in result and "config_override" not in result
 
 
 @pytest.mark.asyncio

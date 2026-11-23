@@ -256,6 +256,7 @@ async def create_job(
     ticket: str | None = None,
     work_category: str | None = None,
     workspace: str | dict[str, Any] | None = None,
+    phases: bool | None = None,
 ) -> str:
     """Create a new job for agent execution.
 
@@ -320,6 +321,14 @@ async def create_job(
             or one listed by manifest_list kind=WorkspaceTemplate, is looked up
             in the project, then your own templates, then the shared catalog.
             A child job inherits its parent's workspace and can't set this.
+        phases: Whether the job plans in phases. Omit it to use the expert's
+            own setting (or the project's default when it has one), which
+            is right for most jobs. False: the job does
+            the task directly and ends it with job_complete; right for a
+            task with an obvious end, such as one step of an automation or
+            one unit of a batch. True: the planned procedure (plan, work
+            through todos in phases, review the result); use it for long or
+            open-ended work that will outlive several context compactions.
 
     Returns:
         Created job details with ID
@@ -391,6 +400,7 @@ async def create_job(
             work_category=work_category,
             workspace=workspace_binding,
             workspace_supplied=workspace_supplied,
+            phases=phases,
         )
         return fmt.format_created_job(
             result, choice.config_name, expert=choice.reference

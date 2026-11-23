@@ -35,4 +35,7 @@ async def auth_me(
     can display a "pending approval" message instead of a blank screen.
     """
     user = await dependencies.get_current_user(request, dependencies.store)
-    return {"user": identity.user_dict(user)}
+    return {
+        "user": identity.user_dict(user),
+        "credential": identity.credential_dict(user),
+    }

@@ -16,8 +16,7 @@ config/subagents/
     └── persona.txt     # prompt files next to the config, resolved like an expert's
 ```
 
-Design: `knowledge-base/knowledge/features/universal_experts_and_subagents.md`
-§0 D4/D7 and §1.1. Loader/resolver: `src/shared/runtime/core/subagent_roster.py`.
+Loader/resolver: `src/shared/runtime/core/subagent_roster.py`.
 
 ## Referencing an entry
 

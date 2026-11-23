@@ -199,6 +199,27 @@ class TestJobErrorFormatters:
             assert "blocked_undelivered" in rendered
             assert "Status: cancelled" not in rendered
 
+    @pytest.mark.parametrize(
+        ("phases", "expected"),
+        [
+            (True, ["Plans in phases: yes"]),
+            (False, ["Plans in phases: no"]),
+            # A job from before the setting, or on a custom harness, states
+            # none: no line rather than a guess.
+            (None, []),
+            ("missing", []),
+        ],
+    )
+    def test_job_detail_says_whether_the_job_plans_in_phases(self, phases, expected):
+        job = {"id": "job1", "status": "processing", "config_name": "general-worker"}
+        if phases != "missing":
+            job["phases"] = phases
+        lines = format_job_detail(job).splitlines()
+        assert [line for line in lines if line.startswith("Plans in phases:")] == (
+            expected
+        )
+        assert not any(line.startswith("Mode:") for line in lines)
+
     def test_operator_pause_hold_is_visible_in_job_detail(self):
         held = {
             "id": "job1",
@@ -256,7 +277,12 @@ def test_workspace_recovery_hold_has_accurate_origin():
         }
     )
     assert "Workspace recovery hold" in detail
-    assert "workspace and checkpoints retained" in detail
+    # Written before the kept-and-gone facts: only what is always true.
+    assert (
+        "Workspace recovery hold: retries exhausted; held until an explicit Resume "
+        "or Cancel. The job's saved progress is kept."
+    ) in detail
+    assert "checkpoints" not in detail
     assert "Operator pause hold" not in detail
 
 

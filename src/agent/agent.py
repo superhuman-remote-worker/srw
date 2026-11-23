@@ -73,6 +73,7 @@ from shared.subagent_lifecycle import (
 from agent.tools import ToolContext, load_tools, apply_instruction_enforcement
 from agent.tools.description_manager import (
     apply_description_overrides,
+    apply_job_complete_description,
     apply_phase_description_prefixes,
 )
 from shared.db_url import (
@@ -85,6 +86,13 @@ from shared.db_url import (
 # ensured. AsyncPostgresSaver.setup() is idempotent, but there's no need to run
 # it on every job.
 _PG_CHECKPOINT_SCHEMA_READY = False
+
+
+def _image_max_edge(config: object) -> int | None:
+    """The longest image edge the model is shown (read_file's region hint)."""
+    from agent.services.image_content import safe_image_max_edge
+
+    return safe_image_max_edge(config)
 
 
 def _remote_workspace_authority(
@@ -162,6 +170,27 @@ def _job_owns_its_workspace(metadata: Dict[str, Any], job_id: Any) -> bool:
         return False
     owner_id = metadata.get("workspace_owner_id")
     return not owner_id or str(owner_id) == str(job_id)
+
+
+def _backend_tool_names(config: Any, workspace_manager: Any) -> Optional[set]:
+    """The configured tools the workspace backend admits, before they load.
+
+    The README facts are written before ``load_tools`` runs, so the lines that
+    depend on a bound tool read the same expansion and backend filter the
+    loader applies. None when that cannot be worked out: the caller writes no
+    line rather than a guess.
+    """
+    from agent.tools.registry import expand_tool_wildcards, filter_tools_by_backend
+
+    try:
+        return set(
+            filter_tools_by_backend(
+                expand_tool_wildcards(get_all_tool_names(config)),
+                workspace_manager.backend,
+            )
+        )
+    except Exception:
+        return None
 
 
 # >>> TEMPORARY QUICKFIX (2026-07-30) — delete with the upstream fix.
@@ -338,6 +367,58 @@ def ensure_job_branch(
     except Exception as e:  # noqa: BLE001 - never fail a resume over branch drift
         logger.warning(f"[{job_id}] Resume: branch ensure failed: {e}")
         return None
+
+
+def export_job_env_keys(env_keys: Optional[Dict[str, Any]]) -> None:
+    """Apply one job's dispatched ``env_keys`` block to this process.
+
+    The pod is reused (pool, loop and dual pods serve job after job, and a
+    dual pod may have served a Session before), so each block is applied
+    against whatever the previous one left. KB embedding transport is
+    authoritative per dispatch and replaced as a whole; every other name in
+    the dispatch allow-list is set from the block, and anything else (an
+    arbitrary SDK variable) is dropped.
+    """
+    from shared.runtime.core.transport_resolution import (
+        clear_replaced_endpoint_pins,
+        clear_served_model_env,
+        exportable_env_keys,
+    )
+    from shared.runtime.services.embedding_service import (
+        KB_EMBEDDING_ENV_KEYS,
+        apply_kb_embedding_env,
+    )
+
+    exportable, dropped = exportable_env_keys(env_keys)
+    # A served model string belongs to the block that named it: a later job
+    # that pins its own {PREFIX}_MODEL must not inherit the previous job's
+    # upstream name.
+    clear_served_model_env()
+    # A pin belongs to the URL it came with: a block with a new, unpinned URL
+    # for a slot names no pin, so the previous block's pin is dropped here. A
+    # slot the block leaves alone keeps its URL and pin together.
+    clear_replaced_endpoint_pins(exportable)
+    # Clear every old KB field before applying the new in-flight block: an
+    # omitted BASE_URL/API_KEY must not pair a new model with the previous
+    # endpoint/credential.
+    apply_kb_embedding_env(env_keys)
+    if not env_keys:
+        return
+    if dropped:
+        logger.warning(
+            "Ignored %d env key(s) outside the dispatch allow-list: %s",
+            len(dropped),
+            dropped,
+        )
+    for k, v in exportable.items():
+        if k not in KB_EMBEDDING_ENV_KEYS:
+            os.environ[k] = v
+    # Log the key NAMES (never values) so a missing credential — e.g.
+    # EMBEDDING_API_KEY, which silently disables memory + KB — is greppable
+    # in the agent log.
+    logger.info(
+        f"Applied {len(env_keys)} env key override(s): {sorted(env_keys.keys())}"
+    )
 
 
 class UniversalAgent:
@@ -769,6 +850,10 @@ class UniversalAgent:
                     served_model=served_model_from_env("CITATION_LLM"),
                     base_url=transport.base_url,
                     api_key=transport.api_key,
+                    # The endpoint's pinned certificate travels with its URL.
+                    tls_pinned_cert=(
+                        transport.tls_pin.wire if transport.tls_pin else None
+                    ),
                     temperature=0.0,
                     top_p=model_settings.get("top_p"),
                     top_k=model_settings.get("top_k"),
@@ -1403,6 +1488,7 @@ class UniversalAgent:
                     return dict(final_state)
                 finally:
                     await self._quiesce_subagent_runtime("parent graph ended")
+                    await self._close_audit_record()
                     if not getattr(self, "_defer_job_cleanup", False):
                         self._current_job_id = None
                         self._cleanup_shell_manager()
@@ -2177,6 +2263,15 @@ class UniversalAgent:
                 "env_keys"
             )
         keys = set(env_keys) if isinstance(env_keys, dict) else set()
+        if keys:
+            from shared.runtime.core.transport_resolution import (
+                endpoint_pins_replaced_by,
+                exportable_env_keys,
+            )
+
+            # The export drops the pin of every endpoint the block replaces,
+            # though the block need not name it: restore that one as well.
+            keys.update(endpoint_pins_replaced_by(exportable_env_keys(env_keys)[0]))
         self._worker_env_restore = {key: os.environ.get(key) for key in keys}
 
     def _restore_worker_environment(self) -> None:
@@ -2804,6 +2899,10 @@ class UniversalAgent:
                 except Exception as e:
                     logger.debug(f"Memory drain at job-end failed (non-fatal): {e}")
 
+            # After everything above that still archives (child reports, the
+            # memory drain): flush the audit spool and leave the receipt.
+            await self._close_audit_record()
+
             # Worker claims defer teardown until their driver classifies the
             # exit (rotation/lease loss preserves tmux; genuine end destroys
             # it).  Every other caller keeps the historical eager cleanup.
@@ -2812,6 +2911,30 @@ class UniversalAgent:
                 self._cleanup_shell_manager()
                 self._close_datasource_connections()
                 await self._cleanup_checkpointer()
+
+    async def _close_audit_record(self) -> None:
+        """Flush the audit spool for this job and leave its receipt.
+
+        The audit writer keeps rows it could not write while the store was
+        down; a job that ends must give them their chance before this process
+        moves on or exits, and say whether its record is whole
+        (``LLMArchiver.close_job_record``). Runs in a thread: the flush waits.
+        Never raises.
+        """
+        job_id = self._current_job_id
+        if not job_id:
+            return
+        try:
+            from agent.core.archiver import get_archiver
+
+            archiver = get_archiver()
+            if archiver is None:
+                return
+            await asyncio.to_thread(
+                archiver.close_job_record, str(job_id), self.config.agent_id
+            )
+        except Exception as e:
+            logger.warning(f"[{job_id}] closing the audit record failed: {e}")
 
     async def _poll_job_workspace_ready(
         self, job_id: str, timeout: int = 300, poll_interval: float = 2.0
@@ -3534,45 +3657,9 @@ class UniversalAgent:
             env_keys = ((metadata.get("resolved_config") or {}).get("agent") or {}).get(
                 "env_keys"
             )
-        # KB embedding transport is authoritative per dispatch. Pool/loop agents
-        # can process a later job after the system profile changes (or a job with
-        # no knowledge scope), so clear every old field before applying the new
-        # in-flight block. Otherwise an omitted BASE_URL/API_KEY can survive and
-        # pair a new model with the previous endpoint/credential.
-        import os as _os
-        from shared.runtime.core.transport_resolution import clear_served_model_env
-        from shared.runtime.services.embedding_service import (
-            KB_EMBEDDING_ENV_KEYS,
-            apply_kb_embedding_env,
-        )
-
-        # A served model string belongs to the block that named it: a later
-        # job that pins its own {PREFIX}_MODEL must not inherit the previous
-        # job's upstream name (this pod is reused).
-        clear_served_model_env()
-        apply_kb_embedding_env(env_keys)
-        if env_keys:
-            from shared.runtime.core.transport_resolution import exportable_env_keys
-
-            # Only the names the orchestrator's dispatch injectors write reach
-            # os.environ; any other name (an arbitrary SDK variable) is dropped.
-            exportable, dropped = exportable_env_keys(env_keys)
-            if dropped:
-                logger.warning(
-                    "Ignored %d env key(s) outside the dispatch allow-list: %s",
-                    len(dropped),
-                    dropped,
-                )
-            for k, v in exportable.items():
-                if k not in KB_EMBEDDING_ENV_KEYS:
-                    _os.environ[k] = v
-            # Log the key NAMES (never values) so a missing credential — e.g.
-            # EMBEDDING_API_KEY, which silently disables memory + KB — is
-            # greppable in the agent log.
-            logger.info(
-                f"Applied {len(env_keys)} env key override(s): "
-                f"{sorted(env_keys.keys())}"
-            )
+        # The pod is reused: export_job_env_keys applies this block against
+        # whatever the previous job (or Session) left in os.environ.
+        export_job_env_keys(env_keys)
 
         # Recreate LLMs if config was modified for this job. On resume we
         # always recreate when frozen config was loaded — frozen config has
@@ -4294,38 +4381,19 @@ class UniversalAgent:
                 updated_metadata["document_path"] = copied_paths[0]
                 updated_metadata["original_document_path"] = original_paths[0]
 
-        # Handle single document (document_path) - backwards compatibility
-        elif metadata.get("document_path"):
-            source_path = Path(metadata["document_path"])
-            if source_path.exists():
-                # Ensure documents directory exists (use backend for remote compat)
-                backend = self._workspace_manager.backend
-                backend.mkdir("documents")
-
-                # Check if zip - extract instead of copy
-                if source_path.suffix.lower() == ".zip":
-                    extracted = self._extract_zip(source_path, "documents", logger)
-                    if extracted:
-                        updated_metadata["document_paths"] = extracted
-                        updated_metadata["original_document_paths"] = [
-                            str(source_path)
-                        ] * len(extracted)
-                        updated_metadata["document_path"] = extracted[0]
-                        updated_metadata["original_document_path"] = str(source_path)
-                    logger.info(
-                        f"Processed zip file: {source_path.name} ({len(extracted)} files extracted)"
-                    )
-                else:
-                    # Regular file - copy via backend to documents/ folder
-                    dest_relative = f"documents/{source_path.name}"
-                    backend.write_file(dest_relative, source_path.read_bytes())
-                    logger.info(f"Copied document to workspace: {dest_relative}")
-
-                    # Update metadata to use workspace-relative path
-                    updated_metadata["document_path"] = dest_relative
-                    updated_metadata["original_document_path"] = str(source_path)
-            else:
-                logger.warning(f"Document not found: {source_path}")
+        # A job's documents arrive only as an upload. The agent never reads a
+        # path a job names on its own filesystem: the agent pod is not the
+        # workspace, and copying a caller-chosen path from it put the agent's
+        # own files (its environment, its tokens) into a workspace the
+        # caller can read. ``context`` reaches this metadata too, so the
+        # orchestrator refusing the fields is not enough on its own.
+        elif metadata.get("document_path") or metadata.get("document_dir"):
+            logger.warning(
+                "Ignoring document_path/document_dir: a job's documents "
+                "arrive as an upload (upload_id)"
+            )
+            updated_metadata.pop("document_path", None)
+            updated_metadata.pop("document_dir", None)
 
         # Write requirement data to workspace if provided (for validator agent)
         if metadata.get("requirement_data"):
@@ -4351,6 +4419,45 @@ class UniversalAgent:
         logger.debug(f"Workspace created at {self._workspace_manager.path}")
 
         return updated_metadata
+
+    def _workspace_home_is_persistent(self) -> bool:
+        """Whether the README tells this job which paths survive a restart.
+
+        Only a home on a persistent volume (a ``k8s-pvc:`` binding in the job
+        context) and only with a shell tool bound. The context reaches a start
+        and every stateless lease; a pinned resume carries none, so it gets no
+        line rather than a guess.
+        knowledge-base/knowledge/issues/workspace_loss_pause_text_and_liveness_time_mislead.md
+        """
+        from shared.runtime.core.loader import _has_shell_tools
+        from shared.workspace_disk import volume_kept_from_backing
+
+        binding = (self._job_metadata or {}).get("_workspace_binding")
+        if not isinstance(binding, dict) or (
+            volume_kept_from_backing(binding.get("backing_id")) is not True
+        ):
+            return False
+        tool_names = _backend_tool_names(self.config, self._workspace_manager)
+        return tool_names is not None and _has_shell_tools(tool_names)
+
+    def _readme_names_tool_only_files(self) -> bool:
+        """Whether the README tells this job its shell cannot read the virtual files.
+
+        ``instructions.md``, ``task_brief.md`` and ``tools/`` are served by the
+        file tools only. A worker with a shell is told so, and how to copy one
+        to disk; the line names ``copy_file``, so it needs that tool bound too.
+        Every worker registers both files, phased or not, so the gate is the
+        tools alone.
+        knowledge-base/knowledge/issues/blocked_worker_cycles_phases_instead_of_stopping.md
+        """
+        from shared.runtime.core.loader import _has_shell_tools
+
+        tool_names = _backend_tool_names(self.config, self._workspace_manager)
+        return (
+            tool_names is not None
+            and "copy_file" in tool_names
+            and _has_shell_tools(tool_names)
+        )
 
     async def _setup_job_tools(self) -> None:
         """Set up tools for the current job.
@@ -4438,6 +4545,8 @@ class UniversalAgent:
                 ssh_identity_status=getattr(
                     self, "_workspace_ssh_identity_status", None
                 ),
+                persistent_home=self._workspace_home_is_persistent(),
+                tool_only_files=self._readme_names_tool_only_files(),
             )
             if readme:
                 self._agent_seed_files["README.md"] = readme
@@ -4448,6 +4557,9 @@ class UniversalAgent:
             **self.config.extra,
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,  # For vision-aware file reading
+            # The longest edge the model is shown, so read_file can say "you
+            # see this at W×H; use region" (image_generation.md WP5).
+            "image_max_edge": _image_max_edge(self.config),
             # Lets bulk readers cap a single tool result relative to the main
             # model's window (session_silent_failure_audit.md #5).
             "model_max_context_tokens": self.config.limits.model_max_context_tokens,
@@ -4758,6 +4870,13 @@ class UniversalAgent:
         context._resolved_tool_names = loaded_tool_names
         context._limits = self.config.limits
 
+        # The todo list's header and footer name todo_complete only when the
+        # job has it; the manager was built before the tools loaded.
+        if self._todo_manager is not None:
+            from agent.core.bound_tools import binds_todo_tool
+
+            self._todo_manager.todo_tool_bound = binds_todo_tool(loaded_tool_names)
+
         # Built-in subagents (U3): the parent host + per-job runtime behind
         # delegate_agent. Installed after load_tools so the runtime sees the
         # resolved tool names; the tool reads it lazily at call time.
@@ -4936,6 +5055,10 @@ class UniversalAgent:
             [t for t in self._tools if t.name in union],
             both_phases=self.config.phase_settings.strategic_tools,
         )
+        # Without todo_complete, job_complete closes the job's one task: its
+        # bound copy says so instead of describing a final strategic phase
+        # (this replaces its phase prefix too).
+        bound_tools = apply_job_complete_description(bound_tools, all_names)
         bound_tools = apply_guardrails_to_tools(bound_tools, model=llm_cfg.model)
         self._llm_with_tools = self._llm.bind_tools(bound_tools, **bind_kwargs)
         self._strategic_llm_with_tools = self._llm_with_tools
@@ -5166,6 +5289,7 @@ class UniversalAgent:
         # the exists()-probe precedence dance and the "rewrite if it vanished"
         # repair path — a virtual file cannot go missing.
         from agent.core.virtual_dirs import build_instruction_providers
+        from agent.core.bound_tools import binds_phase_tool
         from agent.core.deliverables import (
             format_cloud_connectors_block,
             format_deliverable_contract_block,
@@ -5203,7 +5327,8 @@ class UniversalAgent:
             # manifest as an explicit block — workers can't be held to a floor
             # they were never shown. Empty string when the job has no manifest.
             contract_block = format_deliverable_contract_block(
-                meta.get("required_deliverables")
+                meta.get("required_deliverables"),
+                phased=binds_phase_tool(loaded_tool_names),
             )
             if contract_block:
                 parts.append(contract_block)

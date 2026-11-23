@@ -1,0 +1,57 @@
+# =============================================================================
+# srw-cli — the srw command-line client, for pipelines
+# =============================================================================
+# One static Go binary on Alpine with the CA bundle. Alpine and not scratch,
+# as the driver images are: a GitHub `container:` job starts its image with
+# `tail -f /dev/null`, and a GitLab `image:` needs sh and grep. The default
+# user is root, which is what both expect of a job image.
+#
+#   docker build -f docker/Dockerfile.cli -t srw-cli .
+#   docker run --rm -e SRW_API_URL -e SRW_TOKEN srw-cli get jobs
+#
+# The Go toolchain and the base are pinned by digest (bump each with its tag).
+# The build stage runs on the build platform and cross-compiles for the
+# target platform BuildKit names; without BuildKit, for the build platform.
+# =============================================================================
+FROM --platform=$BUILDPLATFORM golang:1.26.11-alpine3.24@sha256:ecb67f987aa1a57794c91d19ade7ae0209f2f0f5496aaef9e6ae85ddf92d02ab AS build
+
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_RELEASE_VERSION=""
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+COPY cli/go.mod cli/go.sum ./
+RUN go mod download && go mod verify
+COPY cli/ ./
+RUN set -eu; \
+    goarch="${TARGETARCH:-$(go env GOARCH)}"; \
+    package=github.com/superhuman-remote-worker/srw/cli/internal/buildinfo; \
+    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="$goarch" go build -trimpath -buildvcs=false \
+        -ldflags "-s -w -X $package.Version=${SRW_RELEASE_VERSION:-dev} -X $package.Commit=${SRW_SOURCE_REVISION:-unknown}" \
+        -o /out/srw .; \
+    if [ "$goarch" = "$(go env GOHOSTARCH)" ]; then /out/srw version --client; fi
+
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
+
+ARG SRW_SOURCE_REVISION=""
+ARG SRW_SOURCE_URL="https://github.com/superhuman-remote-worker/srw"
+ARG SRW_RELEASE_VERSION=""
+ARG SRW_DOCUMENTATION_URL="https://docs.superhuman-remote-worker.com/cli/"
+
+LABEL org.opencontainers.image.title="srw-cli"
+LABEL org.opencontainers.image.description="srw, the command-line client of Superhuman Remote Worker"
+LABEL org.opencontainers.image.source="${SRW_SOURCE_URL}"
+LABEL org.opencontainers.image.revision="${SRW_SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${SRW_RELEASE_VERSION}"
+LABEL org.opencontainers.image.documentation="${SRW_DOCUMENTATION_URL}"
+LABEL org.opencontainers.image.licenses="FSL-1.1-ALv2"
+LABEL io.srw.component="cli"
+
+# Nothing runs in this stage, so the image builds for another architecture
+# without emulation. The base already carries the CA bundle
+# (ca-certificates-bundle, /etc/ssl/certs/ca-certificates.crt).
+COPY --from=build /out/srw /usr/local/bin/srw
+COPY LICENSE cli/THIRD_PARTY_NOTICES.md /usr/share/licenses/srw/
+
+ENTRYPOINT ["srw"]

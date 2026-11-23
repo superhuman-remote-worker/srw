@@ -622,7 +622,7 @@ async def _run_session(
         knowledge_store=knowledge_store,
         project_ids=[harness.PROJECT_ID],
         tool_context=SimpleNamespace(
-            knowledge_bindings=[],
+            knowledge_bindings=harness.attach_project_knowledge(knowledge_store),
             citation_engine=None,
             subagent_runtime=SimpleNamespace(
                 active_subagents_block=lambda: harness.ACTIVE_SUBAGENTS

@@ -7,6 +7,8 @@ import {Datasource, DatasourceIndexStatus} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {UserService} from '../../core/services/user.service';
+import {AdminUsersService} from '../../core/services/admin-users.service';
+import {McpServerQuestionsSetting} from '../../core/models/api.model';
 import {ViewportService} from '../../core/services/viewport.service';
 import {ActivatedRoute} from '@angular/router';
 import {DatasourceListComponent} from './datasource-list.component';
@@ -97,9 +99,14 @@ function createComponent(
     generateSshKey: vi.fn().mockReturnValue(of(null)),
   };
   const currentUser = signal({id: 'user-1', is_admin: false});
+  const adminSettings = {
+    mcpServerQuestions: signal<McpServerQuestionsSetting | null>(null),
+    loadMcpServerQuestions: vi.fn(),
+  };
   const injector = Injector.create({
     providers: [
       {provide: ApiService, useValue: api},
+      {provide: AdminUsersService, useValue: adminSettings},
       {
         provide: TranslocoService,
         useValue: {
@@ -139,7 +146,7 @@ function createComponent(
     injector,
     () => new DatasourceListComponent(),
   );
-  return {api, component, currentUser, ds};
+  return {api, component, currentUser, ds, adminSettings};
 }
 
 describe('DatasourceListComponent OKF Knowledge Base support', () => {
@@ -502,6 +509,234 @@ describe('DatasourceListComponent MCP support', () => {
     const update = api.updateDatasource.mock.calls[0][1];
     expect(update.connection_url).toBe('https://new.example.com/mcp');
     expect(update.credentials).toBeUndefined();
+  });
+});
+
+describe('DatasourceListComponent MCP Test before Save', () => {
+  // Test in an open form tested the saved connector: a token typed and not
+  // yet saved was never sent, and the server logged a request without one.
+  const saved = (over: Partial<Datasource> = {}): Datasource => ({
+    ...kbDatasource(),
+    id: 'mcp-1',
+    name: 'Own server',
+    type: 'mcp',
+    connection_url: 'https://mcp.example.com/mcp',
+    config: {},
+    ...over,
+  });
+
+  it('tests the token typed into the open form', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(saved());
+    component.formData.mcpToken = 'typed-token';
+    component.testFromForm();
+    expect(api.testDatasource).toHaveBeenCalledWith('mcp-1', {
+      connection_url: 'https://mcp.example.com/mcp',
+      credentials: {transport: 'http', auth: {type: 'bearer', token: 'typed-token'}},
+    });
+    expect(api.updateDatasource).not.toHaveBeenCalled();
+  });
+
+  it('tests typed headers, and a typed URL with the saved token', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(saved());
+    component.formData.mcpHeaders = [{key: 'X-Api-Key', value: 'typed-key'}];
+    component.testFromForm();
+    expect(api.testDatasource).toHaveBeenLastCalledWith('mcp-1', {
+      connection_url: 'https://mcp.example.com/mcp',
+      credentials: {transport: 'http', auth: {type: 'headers', headers: {'X-Api-Key': 'typed-key'}}},
+    });
+
+    const other = createComponent(false, null, BUILTIN_DRIVERS);
+    other.component.openEditForm(saved());
+    other.component.onConnectionUrlChange('https://new.example.com/mcp');
+    other.component.formData.connection_url = 'https://new.example.com/mcp';
+    other.component.testFromForm();
+    // No credentials: the token field is blank, so the saved token is tested.
+    expect(other.api.testDatasource).toHaveBeenCalledWith('mcp-1', {
+      connection_url: 'https://new.example.com/mcp',
+    });
+  });
+
+  it('leaves a redacted URL and a blank token to the saved connector', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    component.openEditForm(
+      saved({connection_url: null, connection_url_redacted: 'https://mcp.example.com/mcp?token=***'}),
+    );
+    component.testFromForm();
+    expect(api.testDatasource).toHaveBeenCalledWith('mcp-1', undefined);
+  });
+
+  it('says the test failed when no result comes back', () => {
+    const {api, component} = createComponent(false, null, BUILTIN_DRIVERS);
+    api.testDatasource.mockReturnValue(of(null));
+    component.openEditForm(saved());
+    component.testFromForm();
+    expect(component.formTestResult()).toEqual({
+      status: 'error',
+      message: 'datasources.messages.testFailed',
+    });
+  });
+});
+
+describe('DatasourceListComponent MCP server questions', () => {
+  const INSTALLED = [...BUILTIN_DRIVERS, ...MANAGED_DRIVERS];
+
+  const remote = (config: Datasource['config'] = {}): Datasource => ({
+    ...kbDatasource(),
+    id: 'mcp-1',
+    name: 'Civitai',
+    type: 'mcp',
+    connection_url: 'https://mcp.civitai.com/mcp',
+    config,
+  });
+
+  const managed = (config: Datasource['config']): Datasource => ({
+    ...kbDatasource(),
+    id: 'gitea-1',
+    name: 'Forge',
+    type: 'gitea_mcp' as Datasource['type'],
+    connection_url: null,
+    config,
+  });
+
+  function createRemote(choice?: 'inherit' | 'decline' | 'accept') {
+    const created = createComponent(false, null, INSTALLED);
+    const {component} = created;
+    component.openCreateForm();
+    component.formData.name = 'Civitai';
+    component.onTypeSelect('mcp');
+    component.formData.connection_url = 'https://mcp.civitai.com/mcp';
+    if (choice) component.formData.serverQuestions = choice;
+    return created;
+  }
+
+  it('offers the choice on remote and managed MCP connectors, and no other', () => {
+    const {component} = createComponent(false, null, INSTALLED);
+    component.openCreateForm();
+    component.onTypeSelect('mcp');
+    expect(component.isMcpForm()).toBe(true);
+    component.onTypeSelect('gitea_mcp' as Datasource['type']);
+    expect(component.isMcpForm()).toBe(true);
+    component.onTypeSelect('postgresql');
+    expect(component.isMcpForm()).toBe(false);
+    component.onTypeSelect('repository');
+    expect(component.isMcpForm()).toBe(false);
+  });
+
+  it('sends no config for a remote server that follows the default', () => {
+    const {api, component} = createRemote();
+    expect(component.formData.serverQuestions).toBe('inherit');
+    component.saveForm();
+    expect(api.createDatasource.mock.calls[0][0].config).toBeUndefined();
+  });
+
+  it.each(['decline', 'accept'] as const)('sends config.server_questions = %s when chosen', (choice) => {
+    const {api, component} = createRemote(choice);
+    component.saveForm();
+    expect(api.createDatasource.mock.calls[0][0].config).toEqual({server_questions: choice});
+  });
+
+  it("prefills the stored choice on edit and keeps it", () => {
+    const {api, component} = createComponent(false, null, INSTALLED);
+    component.openEditForm(remote({server_questions: 'accept'}));
+    expect(component.formData.serverQuestions).toBe('accept');
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].config).toEqual({server_questions: 'accept'});
+  });
+
+  it('clears a stored choice when the edit goes back to the default', () => {
+    const {api, component} = createComponent(false, null, INSTALLED);
+    component.openEditForm(remote({server_questions: 'decline'}));
+    component.formData.serverQuestions = 'inherit';
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].config).toEqual({});
+  });
+
+  it('leaves an edited remote server without a choice untouched', () => {
+    const {api, component} = createComponent(false, null, INSTALLED);
+    component.openEditForm(remote({}));
+    expect(component.formData.serverQuestions).toBe('inherit');
+    component.formData.description = 'Image generation';
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].config).toBeUndefined();
+  });
+
+  it("merges the choice into a managed server's own config, and leaves it out for the default", () => {
+    const {api, component} = createComponent(false, null, INSTALLED);
+    component.openCreateForm();
+    component.formData.name = 'Forge';
+    component.onTypeSelect('gitea_mcp' as Datasource['type']);
+    component.formData.serverQuestions = 'accept';
+    component.genericFormValue.set({
+      config: {url: 'https://gitea.example.com', access: 'ReadOnly'},
+      credentials: {token: 'gitea-token'},
+      problems: [],
+    });
+    component.doSave();
+    expect(api.createDatasource.mock.calls[0][0].config).toEqual({
+      url: 'https://gitea.example.com',
+      access: 'ReadOnly',
+      server_questions: 'accept',
+    });
+
+    const edit = createComponent(false, null, INSTALLED);
+    edit.component.openEditForm(
+      managed({url: 'https://gitea.example.com', access: 'ReadOnly', server_questions: 'accept'}),
+    );
+    expect(edit.component.formData.serverQuestions).toBe('accept');
+    edit.component.formData.serverQuestions = 'inherit';
+    edit.component.genericFormValue.set({
+      config: {url: 'https://gitea.example.com', access: 'ReadOnly'},
+      problems: [],
+    });
+    edit.component.saveForm();
+    expect(edit.api.updateDatasource.mock.calls[0][1].config).toEqual({
+      url: 'https://gitea.example.com',
+      access: 'ReadOnly',
+    });
+  });
+
+  it("names the installation default for an admin, and reads it only once", () => {
+    const {component, currentUser, adminSettings} = createComponent(false, null, INSTALLED);
+    currentUser.set({id: 'user-1', is_admin: true});
+    component.openEditForm(remote());
+    component.onTypeSelect('mcp');
+    expect(adminSettings.loadMcpServerQuestions).toHaveBeenCalledTimes(1);
+    expect(component.serverQuestionsInheritKey()).toBe('datasources.form.serverQuestionsInherit');
+    adminSettings.mcpServerQuestions.set({default: 'accept', updated_at: null, updated_by: null});
+    expect(component.serverQuestionsInheritKey()).toBe(
+      'datasources.form.serverQuestionsInheritAccept',
+    );
+    adminSettings.mcpServerQuestions.set({default: 'decline', updated_at: null, updated_by: null});
+    expect(component.serverQuestionsInheritKey()).toBe(
+      'datasources.form.serverQuestionsInheritDecline',
+    );
+  });
+
+  it('does not ask for the admin-only default for anyone else', () => {
+    const {component, adminSettings} = createComponent(false, null, INSTALLED);
+    component.openEditForm(remote());
+    expect(adminSettings.loadMcpServerQuestions).not.toHaveBeenCalled();
+    expect(component.serverQuestionsInheritKey()).toBe('datasources.form.serverQuestionsInherit');
+  });
+
+  it('labels the choice in both languages', () => {
+    const keys = [
+      'serverQuestionsLabel',
+      'serverQuestionsInherit',
+      'serverQuestionsInheritDecline',
+      'serverQuestionsInheritAccept',
+      'serverQuestionsDecline',
+      'serverQuestionsAccept',
+      'serverQuestionsHint',
+    ];
+    const enForm = en.datasources.form as Record<string, string>;
+    const deForm = de.datasources.form as Record<string, string>;
+    for (const key of keys) {
+      expect(enForm[key], key).toBeTruthy();
+      expect(deForm[key], key).toBeTruthy();
+    }
   });
 });
 
@@ -1046,7 +1281,8 @@ describe('DatasourceListComponent availability policy', () => {
 
     component.refresh();
 
-    expect(api.getDatasources).toHaveBeenCalledWith(undefined, undefined);
+    // Unfiltered: the page filters by type itself, and counts what it holds.
+    expect(api.getDatasources).toHaveBeenCalledWith();
     expect(api.getDatasourceCatalog).not.toHaveBeenCalled();
     expect(component.datasources()).toEqual([ds]);
   });
@@ -1173,6 +1409,9 @@ describe('DatasourceListComponent availability policy', () => {
     );
     expect(component.availabilityLabel({...ds, scope_mode: 'projects', project_count: 2}))
       .toBe('datasources.table.availabilityProjects');
+    // One project is "1 project", not "1 projects".
+    expect(component.availabilityLabel({...ds, scope_mode: 'projects', project_count: 1}))
+      .toBe('datasources.table.availabilityProject');
     expect(component.availabilityLabel({...ds, scope_mode: 'projects', project_count: 0}))
       .toBe('datasources.table.availabilityNone');
   });
@@ -1359,7 +1598,7 @@ describe('DatasourceListComponent platform-owned connectors', () => {
     expect(component.canEditRow(folder)).toBe(false);
     expect(component.canDeleteRow(folder)).toBe(false);
     expect(component.managedLabelKey(folder)).toBe('datasources.platform.managedByProject');
-    expect(en.datasources.platform.managedByProject).toBe('Managed by its project');
+    expect(en.datasources.platform.managedByProject).toBe('Kept by SRW for this project');
     // The form never opens for it: the server would refuse the save.
     component.openEditForm(folder);
     expect(component.showForm()).toBe(false);
@@ -1387,7 +1626,7 @@ describe('DatasourceListComponent platform-owned connectors', () => {
     const {component, currentUser} = createComponent();
     const outbox = cloudFolder({type: 'cloud_outbox', managed_key: 'cloud-outbox:user-1'});
     expect(component.managedLabelKey(outbox)).toBe('datasources.platform.managedForYou');
-    expect(en.datasources.platform.managedForYou).toBe('Managed by SRW for you');
+    expect(en.datasources.platform.managedForYou).toBe('Kept by SRW for you');
     currentUser.set({id: 'admin-1', is_admin: true});
     expect(component.managedLabelKey(outbox)).toBe('datasources.platform.managedForItsUser');
     // An administrator manages ordinary rows, never a platform-owned one.
@@ -1896,3 +2135,325 @@ describe('DatasourceListComponent managed MCP servers', () => {
     );
   });
 });
+
+describe('DatasourceListComponent catalog lists and filters', () => {
+  const PROJECT = '33333333-3333-3333-3333-333333333333';
+  const OWN = kbDatasource({id: 'own-pg', name: 'Sales database', type: 'postgresql'});
+  const OWN_KB = kbDatasource({id: 'own-kb', name: 'Handbook'});
+  const FOLDER = kbDatasource({
+    id: 'folder',
+    name: 'Atlas cloud folder (33333333)',
+    type: 'cloud_folder',
+    managed_key: `project-cloud:${PROJECT}`,
+    native_project_name: 'Atlas',
+  });
+  const PROJECT_KB = kbDatasource({
+    id: 'project-kb',
+    name: 'Atlas Knowledge (33333333)',
+    managed_key: `project-kb:${PROJECT}`,
+    native_project_name: 'Atlas',
+  });
+  const COPY = kbDatasource({
+    id: 'copy',
+    name: 'Atlas folder copy (33333333)',
+    type: 'cloud_folder_checkout',
+    managed_key: `project-cloud-checkout:${PROJECT}`,
+    native_project_name: 'Atlas',
+  });
+  const MY_CLOUD = kbDatasource({
+    id: 'my-cloud',
+    name: 'My cloud',
+    type: 'cloud_folder',
+    managed_key: 'user-cloud-root:user-1',
+  });
+
+  it('lists your own connectors and hides what SRW keeps, saying so with a token', () => {
+    const {api, component} = createComponent();
+    component.refresh();
+
+    expect(component.showKept()).toBe(false);
+    expect(api.getDatasourceCatalog).toHaveBeenCalledTimes(1);
+    expect(api.getDatasourceCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({managed: false}),
+    );
+    expect(component.filterTokens().map((token) => token.id)).toEqual(['kept']);
+  });
+
+  it('loads what SRW keeps as a second list when it is shown, and only then', () => {
+    const {api, component} = createComponent();
+    component.refresh();
+    api.getDatasourceCatalog.mockClear();
+
+    component.setShowKept(true);
+    expect(api.getDatasourceCatalog).toHaveBeenCalledTimes(1);
+    expect(api.getDatasourceCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({managed: true}),
+    );
+    // Already shown: nothing more to load.
+    component.setShowKept(true);
+    expect(api.getDatasourceCatalog).toHaveBeenCalledTimes(1);
+    // A refresh now reloads both lists.
+    component.refresh();
+    expect(api.getDatasourceCatalog.mock.calls.map((call) => call[0].managed)).toEqual([
+      true,
+      false,
+      true,
+    ]);
+    expect(component.filterTokens().map((token) => token.id)).toEqual([]);
+  });
+
+  it('removing the token shows what SRW keeps', () => {
+    const {api, component} = createComponent();
+    component.removeFilterToken('kept');
+    expect(component.showKept()).toBe(true);
+    expect(api.getDatasourceCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({managed: true}),
+    );
+  });
+
+  it('splits the legacy list into the two lists itself', () => {
+    // Policy off: one unpaged list of everything the user may see.
+    const {api, component} = createComponent(false);
+    api.getDatasources.mockReturnValue(of([FOLDER, OWN, PROJECT_KB, OWN_KB]));
+    component.refresh();
+
+    expect(component.filteredDatasources().map((ds) => ds.id)).toEqual(['own-pg', 'own-kb']);
+    expect(component.keptRows().map((ds) => ds.id)).toEqual(['folder', 'project-kb']);
+    // The legacy list filters what it holds: no request per type.
+    api.getDatasources.mockClear();
+    component.onTypeFilter('kb');
+    expect(api.getDatasources).not.toHaveBeenCalled();
+    expect(component.filteredDatasources().map((ds) => ds.id)).toEqual(['own-kb']);
+    expect(component.keptRows().map((ds) => ds.id)).toEqual(['project-kb']);
+  });
+
+  it('groups what SRW keeps by project, named after it, in a fixed order', () => {
+    const {component} = createComponent();
+    component.keptDatasources.set([PROJECT_KB, MY_CLOUD, FOLDER, COPY]);
+
+    const groups = component.keptGroups();
+    expect(groups.map((group) => [group.key, group.label || group.labelKey])).toEqual([
+      [`project:${PROJECT}`, 'Atlas'],
+      ['yours', 'datasources.kept.yours'],
+    ]);
+    expect(groups[0].projectId).toBe(PROJECT);
+    expect(groups[0].rows.map((ds) => ds.id)).toEqual(['folder', 'copy', 'project-kb']);
+  });
+
+  it('names a project the catalog sent no name for by its short id', () => {
+    const {component} = createComponent();
+    component.keptDatasources.set([{...FOLDER, native_project_name: null}]);
+    expect(component.keptGroups()[0].label).toBe('datasources.kept.unnamedProject');
+  });
+
+  it("puts another person's own cloud in a group of its own", () => {
+    const {component} = createComponent();
+    component.keptDatasources.set([{...MY_CLOUD, managed_key: 'user-cloud-root:someone-else'}]);
+    expect(component.keptGroups().map((group) => group.key)).toEqual(['others']);
+  });
+
+  it('builds the type strip from the counts: all first, then the types there are, in order', () => {
+    const {component} = createComponent();
+    component.ownTypeCounts.set({postgresql: 2, kb: 1, gpt_live_sip: 3});
+    component.keptTypeCounts.set({cloud_folder: 4, kb: 2});
+
+    expect(component.typeChips()).toEqual([
+      {value: 'all', count: 6},
+      {value: 'kb', count: 1},
+      {value: 'postgresql', count: 2},
+      {value: 'gpt_live_sip', count: 3},
+    ]);
+
+    // With what SRW keeps shown, its types count too.
+    component.showKept.set(true);
+    expect(component.typeChips()).toEqual([
+      {value: 'all', count: 12},
+      {value: 'kb', count: 3},
+      {value: 'postgresql', count: 2},
+      {value: 'gpt_live_sip', count: 3},
+      {value: 'cloud_folder', count: 4},
+    ]);
+  });
+
+  it('keeps the selected type in the strip at zero, so it can be cleared', () => {
+    const {component} = createComponent();
+    component.ownTypeCounts.set({postgresql: 2});
+    component.typeFilter.set('neo4j');
+    expect(component.typeChips().map((chip) => [chip.value, chip.count])).toEqual([
+      ['all', 2],
+      ['postgresql', 2],
+      ['neo4j', 0],
+    ]);
+  });
+
+  it('takes the counts from the first page of each list', () => {
+    const {api, component} = createComponent();
+    api.getDatasourceCatalog.mockReturnValue(
+      of({items: [], next_cursor: null, type_counts: {postgresql: 5}}),
+    );
+    component.refresh();
+    expect(component.ownTypeCounts()).toEqual({postgresql: 5});
+  });
+
+  it('a type is one request, and choosing it again is none', () => {
+    const {api, component} = createComponent();
+    component.onTypeFilter('postgresql');
+    expect(api.getDatasourceCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({type: 'postgresql', managed: false}),
+    );
+    const calls = api.getDatasourceCatalog.mock.calls.length;
+    component.onTypeFilter('postgresql');
+    expect(api.getDatasourceCatalog.mock.calls.length).toBe(calls);
+  });
+
+  it('gives every applied filter but the type a token, and each token removes its filter', () => {
+    const {api, component} = createComponent();
+    component.showKept.set(true);
+    component.catalogSearch.set('sales');
+    component.typeFilter.set('postgresql');
+    component.scopeFilter.set('projects');
+    component.automaticFilter.set('manual');
+    component.ownershipFilter.set('mine');
+    component.visibilityFilter.set('public');
+    component.catalogProjectId.set('project-a');
+
+    expect(component.filterTokens().map((token) => [token.id, token.labelKey])).toEqual([
+      ['search', 'datasources.catalog.token.search'],
+      ['project', 'datasources.catalog.token.project'],
+      ['availability', 'datasources.catalog.token.availability'],
+      ['automatic', 'datasources.catalog.token.manual'],
+      ['ownership', 'datasources.catalog.token.mine'],
+      ['visibility', 'datasources.catalog.token.public'],
+    ]);
+    expect(component.filterTokens()[0].labelParams).toEqual({term: 'sales'});
+
+    for (const id of ['search', 'project', 'availability', 'automatic', 'ownership', 'visibility']) {
+      component.removeFilterToken(id);
+    }
+    expect(component.filterTokens()).toEqual([]);
+    expect(component.typeFilter()).toBe('postgresql');
+    expect(api.getDatasourceCatalog).toHaveBeenLastCalledWith(
+      expect.objectContaining({managed: true, type: 'postgresql', limit: 50}),
+    );
+  });
+
+  it('Clear all goes back to the defaults, what SRW keeps hidden again, in one request', () => {
+    const {api, component} = createComponent();
+    component.showKept.set(true);
+    component.catalogSearch.set('sales');
+    component.typeFilter.set('postgresql');
+    component.ownershipFilter.set('mine');
+    api.getDatasourceCatalog.mockClear();
+
+    component.clearFilters();
+
+    expect(api.getDatasourceCatalog).toHaveBeenCalledTimes(1);
+    expect(api.getDatasourceCatalog).toHaveBeenLastCalledWith({limit: 50, managed: false});
+    expect(component.showKept()).toBe(false);
+    expect(component.filterTokens().map((token) => token.id)).toEqual(['kept']);
+  });
+
+  it('says why your list is empty: a filter, or nothing made yet', () => {
+    const {component} = createComponent();
+    expect(component.emptyKind()).toBe('none');
+    // Showing what SRW keeps narrows nothing.
+    component.showKept.set(true);
+    expect(component.emptyKind()).toBe('none');
+    component.typeFilter.set('neo4j');
+    expect(component.emptyKind()).toBe('filtered');
+    component.typeFilter.set('all');
+    component.visibilityFilter.set('public');
+    expect(component.emptyKind()).toBe('filtered');
+  });
+
+  it('names a row SRW keeps for what it is, and any other by its type', () => {
+    const {component} = createComponent();
+    expect(component.typeLabelKey(FOLDER)).toBe('datasources.platform.kind.projectCloud');
+    expect(component.typeLabelKey(PROJECT_KB)).toBe('datasources.platform.kind.projectKb');
+    expect(component.typeLabelKey(OWN)).toBe('datasources.filter.postgresql');
+  });
+
+  it('gives a row a menu only when something is behind it', () => {
+    const {component} = createComponent();
+    expect(component.hasRowMenu(OWN)).toBe(true);
+    expect(component.canDeleteRow(PROJECT_KB)).toBe(false);
+    expect(component.hasRowMenu(PROJECT_KB)).toBe(true);
+    expect(component.hasRowMenu(FOLDER)).toBe(false);
+  });
+
+  it('asks before deleting, and deletes only once the user confirms', () => {
+    const {api, component} = createComponent();
+    component.deleteDatasource(OWN);
+    expect(component.pendingDelete()).toBe(OWN);
+    expect(api.deleteDatasource).not.toHaveBeenCalled();
+
+    component.confirmDelete();
+    expect(api.deleteDatasource).toHaveBeenCalledWith('own-pg');
+    expect(component.pendingDelete()).toBeNull();
+  });
+
+  it('deletes nothing when the dialog is dismissed, and never a row SRW keeps', () => {
+    const {api, component} = createComponent();
+    component.deleteDatasource(OWN);
+    component.pendingDelete.set(null);
+    component.confirmDelete();
+    component.deleteDatasource(PROJECT_KB);
+    expect(component.pendingDelete()).toBeNull();
+    expect(api.deleteDatasource).not.toHaveBeenCalled();
+  });
+
+  it('has the strings of the lists, the filters and the delete dialog in English and German', () => {
+    for (const bundle of [en, de]) {
+      const strings = (bundle as unknown as {
+        datasources: {
+          kept: Record<string, string>;
+          catalog: Record<string, string> & {token: Record<string, string>};
+          empty: Record<string, {title: string; hint: string}>;
+          deleteDialog: Record<string, string>;
+        };
+      }).datasources;
+      for (const key of ['title', 'hint', 'yoursTitle', 'show', 'showHint', 'none', 'yours', 'others', 'unnamedProject']) {
+        expect(strings.kept[key], key).toBeTruthy();
+      }
+      for (const key of ['filters', 'clearFilters', 'typeGroup', 'appliedGroup', 'removeToken']) {
+        expect(strings.catalog[key], key).toBeTruthy();
+      }
+      for (const key of ['search', 'project', 'availability', 'automatic', 'manual', 'mine', 'shared', 'private', 'public', 'keptHidden']) {
+        expect(strings.catalog.token[key], key).toBeTruthy();
+      }
+      for (const kind of ['none', 'filtered']) {
+        expect(strings.empty[kind].title, kind).toBeTruthy();
+        expect(strings.empty[kind].hint, kind).toBeTruthy();
+      }
+      for (const key of ['title', 'message', 'namePrompt', 'confirm', 'cancel']) {
+        expect(strings.deleteDialog[key], key).toBeTruthy();
+      }
+    }
+  });
+});
+
+describe('DatasourceListComponent editing a description', () => {
+  it('clears a description emptied on edit, instead of keeping the old one', () => {
+    const {api, component} = createComponent(false);
+    const ds = kbDatasource({id: 'pg', name: 'Bookings', type: 'postgresql', description: 'Bearer abc'});
+    component.openEditForm(ds);
+    component.formData.description = '   ';
+    component.saveForm();
+    // An omitted field means "unchanged" to the server.
+    expect(api.updateDatasource.mock.calls[0][1].description).toBe('');
+  });
+
+  it('clears the CLI hint of an environment connector, and leaves other types\' alone', () => {
+    const {api, component} = createComponent(false);
+    component.openEditForm(kbDatasource({id: 'env', name: 'Billing API', type: 'generic', description: 'Invoices', cli_hint: 'curl $API'}));
+    component.formData.cli_hint = '';
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].cli_hint).toBe('');
+
+    api.updateDatasource.mockClear();
+    component.openEditForm(kbDatasource({id: 'pg', name: 'Bookings', type: 'postgresql'}));
+    component.saveForm();
+    expect(api.updateDatasource.mock.calls[0][1].cli_hint).toBeUndefined();
+  });
+});
+

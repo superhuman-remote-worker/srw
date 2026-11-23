@@ -3,6 +3,7 @@
     {
       "id": "33333333-3333-4333-8333-333333333333",
       "description": "Job-list contract fixture",
+      "title": null,
       "status": "completed",
       "completion_outcome_kind": null,
       "origin": "user",
@@ -40,12 +41,14 @@
       "audit_count": null,
       "cloud_review_mode": "open_folder",
       "exported_folder_url": null,
+      "phases": null,
       "workspace_lifecycle": null,
       "workspace_creation": null
     },
     {
       "id": "33333333-3333-4333-8333-333333333334",
       "description": "Matching child",
+      "title": null,
       "status": "completed",
       "completion_outcome_kind": null,
       "origin": "subjob",
@@ -83,6 +86,7 @@
       "audit_count": null,
       "cloud_review_mode": "open_folder",
       "exported_folder_url": null,
+      "phases": null,
       "workspace_lifecycle": null,
       "workspace_creation": null
     }

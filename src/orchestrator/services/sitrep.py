@@ -133,6 +133,8 @@ class ReportingHandles:
     audit_reader: Any = None
     usage_ledger: Any = None
     vector_db: Any = None
+    # The deployment flag, so the job lines can name a parked completion.
+    completion_commands_enabled: bool = False
 
 
 _HANDLES = ReportingHandles()
@@ -453,6 +455,8 @@ async def _jobs_section(
         # E3: the one shared liveness computation — the sitrep can never call
         # a job healthy while get_stuck_jobs calls it stuck (same threshold,
         # same audit/heartbeat authority order, updated_at never consulted).
+        from orchestrator.services.job_liveness import names_parked_completion
+
         liveness_by_id: dict[str, dict[str, Any]] = {}
         if active_ids:
             try:
@@ -463,6 +467,7 @@ async def _jobs_section(
                     audit_reader=audit_reader,
                     db=db,
                     now=now,
+                    completion_commands_enabled=(_HANDLES.completion_commands_enabled),
                 )
             except Exception:
                 logger.warning("sitrep: liveness computation failed", exc_info=True)
@@ -487,9 +492,9 @@ async def _jobs_section(
             last_write = _parse_iso((liveness or {}).get("last_activity_at"))
             if last_write is not None:
                 detail += f", last activity {_ago(last_write, now)}"
-            if liveness and liveness.get("state") in (
-                "suspected_stuck",
-                "unavailable",
+            if liveness and (
+                liveness.get("state") in ("suspected_stuck", "unavailable")
+                or names_parked_completion(liveness.get("reasons"))
             ):
                 reasons = liveness.get("reasons") or []
                 if reasons:

@@ -568,6 +568,25 @@ COLLIDING_COMMAND_TEMPLATE = (
     "--- terminal state ---\n{terminal_state}"
 )
 
+# What a backend's ``shell_send`` answers when it typed the input. Anything
+# else it returns (a busy tab, a blocked command) means nothing was typed, and
+# the tool must show that answer instead of the tab's unchanged output.
+SEND_CONFIRMATION_TEMPLATE = "Sent to '{tab}'"
+_SEND_CONFIRMATION_PATTERN = re.compile(r"Sent to '[^'\n]*'")
+
+
+def is_send_confirmation(result: object) -> bool:
+    """True when ``result`` is ``shell_send``'s answer for delivered input.
+
+    Any tab name matches: a subagent's backend prefixes its tab names, so the
+    tab in the answer differs from the one the tool asked for.
+    """
+    return (
+        isinstance(result, str)
+        and _SEND_CONFIRMATION_PATTERN.fullmatch(result) is not None
+    )
+
+
 # Returned when the command is genuinely blocked on an interactive prompt
 # (password, y/n, etc.). Unlike a no-change stall, this one really does need
 # input — the model should respond in keys mode.

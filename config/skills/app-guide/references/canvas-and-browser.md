@@ -133,18 +133,18 @@ different workspace bytes under the old presentation.
 
 ## Share the browser with the agent
 
-**Required workspace:** start with a **Container workspace**.
-Virtual and None cannot host the shared browser, and VM support must not be
-promised.
+**Required workspace:** a **Container workspace**, or a **VM** that runs on
+the same cluster as SRW. Virtual and None cannot host the shared browser; a
+VM reached over a private network (tailnet) reports it as not available.
 
-Shared browser is default-off and deployment-dependent. If it is enabled for a
-compatible full workspace, the currently proven path is a **Container
-workspace**; Virtual and None do not provide the required browser workspace,
-and VM support must not be promised. Use the web icon in the session header or
-**Open browser** in the Canvas empty state:
+Shared browser is on by default; an operator can turn it off. Use the web icon
+in the session header or **Open browser** in the Canvas empty state:
 
-1. Choose **Open browser**. A cold Container session may first show
-   **Starting workspace…**, then **Starting browser…**, then **Connecting…**.
+1. Choose **Open browser**. A cold Container session, or a VM session whose VM
+   is still starting or has gone to sleep, may first show **Starting
+   workspace…**, then **Starting browser…**, then **Connecting…**. A sleeping
+   VM wakes for the browser alone; the agent stays asleep until you send a
+   message.
 2. Choose **Take control** when you need to navigate, dismiss a banner,
    complete a login, or handle a page the agent cannot.
 3. Browse in the Canvas toolbar. While you are driving, the agent's mutating
@@ -152,6 +152,14 @@ and VM support must not be promised. Use the web icon in the session header or
    snapshots.
 4. Choose **Release control**, then tell the agent what to do next. Baton
    changes do not send the agent a separate takeover notification.
+
+To try a web app the agent built, ask it to run the app and show it to you.
+In a Container session it starts the app in its workspace, opens it in this
+browser, checks it and puts the browser on the Canvas. Choose **Take
+control** and use the app; ask in the chat for changes. The agent's turn takes
+the browser back while it works and returns it when the turn ends. An
+address on the workspace's `localhost` opens only in this browser, not in
+yours.
 
 This is one Chromium session. After handoff, the agent sees the same DOM,
 cookies, and authenticated state. Log out before releasing control if you do
@@ -163,9 +171,11 @@ dialogs. Native file pickers, print dialogs, certificate or WebAuthn prompts,
 browser-level authentication dialogs, and the built-in PDF viewer are known
 gaps. Downloading a file is often the practical PDF fallback.
 
-Shared browser is currently a persistent-session surface. It is not available
-on the Jobs view, and the proven deployment path is a Container workspace; do
-not promise VM support.
+Shared browser is a session surface. It is not available on the Jobs view.
+In a VM session, editable files on the Canvas save as in a Container
+session; if the server does not run VM remote operations they show view-only.
+An older VM image may show the page scaled to the pane without the size
+switch.
 
 ## If Open browser is missing or disabled
 

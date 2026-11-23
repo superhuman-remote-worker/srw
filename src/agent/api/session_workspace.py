@@ -754,10 +754,18 @@ async def poll_workspace_ready(
                 "workspace_ssh_host_key_fingerprint": ws.get(
                     "workspace_ssh_host_key_fingerprint"
                 ),
-                # VM physical attestation does not grant Canvas presentation.
-                "canvas_presentation_available": False,
-                "canvas_live_apps_available": False,
-                "canvas_shared_browser_available": False,
+                # The orchestrator grants a VM Canvas only for a
+                # controller-authenticated, same-cluster VM and re-proves the
+                # runtime on every Canvas operation; never inferred here.
+                "canvas_presentation_available": (
+                    ws.get("canvas_presentation_available") is True
+                ),
+                "canvas_live_apps_available": (
+                    ws.get("canvas_live_apps_available") is True
+                ),
+                "canvas_shared_browser_available": (
+                    ws.get("canvas_shared_browser_available") is True
+                ),
                 "remote": {
                     "host": ws["vm_ssh_host"],
                     "port": ws.get("vm_ssh_port", 22),

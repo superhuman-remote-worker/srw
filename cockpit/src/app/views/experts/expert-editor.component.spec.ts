@@ -4,6 +4,7 @@ import {
   buildPromptsPayload,
   buildSubagentsFragment,
   buildTagsPayload,
+  countLeaves,
   expertBaseConfigName,
   expertEditorMode,
   expertToolPreviewRequest,
@@ -12,14 +13,13 @@ import {
   slugify,
   splitTags,
   stripEmptySubagents,
+  wordCount,
 } from './expert-editor.component';
 import {assembleExpertConfig, liftLegacyTiers} from './expert-config';
 
 const FIELDS = {
   persona: 'P',
   instructions: 'I',
-  strategic: 'S',
-  tactical: 'T',
   summarization: 'Z',
 };
 
@@ -29,6 +29,20 @@ describe('slugify', () => {
     expect(slugify('123 go')).toMatch(/^[a-z][a-z0-9_-]*$/));
   it('strips non-ascii', () => expect(slugify('Über Helper')).toMatch(/^[a-z][a-z0-9_-]*$/));
   it('empty falls back to expert', () => expect(slugify('   ')).toBe('expert'));
+});
+
+describe('section summary helpers', () => {
+  it('counts the settings a fragment sets: its leaves, a list being one', () => {
+    expect(countLeaves({})).toBe(0);
+    expect(countLeaves({llm: {temperature: 0.3, top_p: 0.95}, tools: {shell: ['run_command', 'read']}})).toBe(3);
+    expect(countLeaves({workspace: {git: {enabled: false}}})).toBe(1);
+  });
+
+  it('counts words, ignoring surrounding and repeated whitespace', () => {
+    expect(wordCount('')).toBe(0);
+    expect(wordCount('   ')).toBe(0);
+    expect(wordCount('  one two\n\nthree  ')).toBe(3);
+  });
 });
 
 describe('parseConfigText', () => {
@@ -84,29 +98,26 @@ describe('expertToolPreviewRequest', () => {
 });
 
 describe('buildPromptsPayload', () => {
-  it('worker mode emits all five segments', () => {
-    expect(buildPromptsPayload(FIELDS, 'job')).toEqual({
+  it('emits the three expert prompt segments', () => {
+    expect(buildPromptsPayload(FIELDS)).toEqual({
       persona: 'P',
       instructions: 'I',
-      strategic: 'S',
-      tactical: 'T',
       summarization: 'Z',
     });
   });
 
-  it('session mode drops the worker-only phase prompts', () => {
-    const out = buildPromptsPayload(FIELDS, 'session');
-    expect(out).toEqual({persona: 'P', instructions: 'I', summarization: 'Z'});
-    expect(out['strategic']).toBeUndefined();
-    expect(out['tactical']).toBeUndefined();
+  it('omits empty/whitespace segments (empty ⇒ inherit / clear)', () => {
+    const out = buildPromptsPayload({persona: 'P', instructions: '   ', summarization: ''});
+    expect(out).toEqual({persona: 'P'});
   });
 
-  it('omits empty/whitespace segments (empty ⇒ inherit / clear)', () => {
-    const out = buildPromptsPayload(
-      {persona: 'P', instructions: '', strategic: '   ', tactical: 'T', summarization: ''},
-      'job',
-    );
-    expect(out).toEqual({persona: 'P', tactical: 'T'});
+  it('never writes the retired strategic/tactical phase prompts', () => {
+    // A loaded row may still carry them on the wire; the form has no field
+    // for them, so the save payload drops them.
+    const loaded = {...FIELDS, strategic: 'S', tactical: 'T'} as typeof FIELDS;
+    const out = buildPromptsPayload(loaded);
+    expect(out['strategic']).toBeUndefined();
+    expect(out['tactical']).toBeUndefined();
   });
 });
 

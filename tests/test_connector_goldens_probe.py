@@ -17,7 +17,7 @@ existing tests use (``tests/test_codeql_error_disclosure.py``,
   to, with the name in ``Host``); an SSH-key repository's host-key exchange:
   ``asyncssh.get_server_host_key``, at the resolved address;
 * KB: ``orchestrator.services.kb_datasources.kb_source_from_datasource``;
-* MCP: the SDK's transport clients and ``ClientSession``.
+* MCP: the SDK's transport clients and ``Client``.
 
 ``error_ref`` values are random and normalised to ``<error_ref>``.
 
@@ -378,21 +378,36 @@ def kb_source(
 def mcp_sdk(
     *, tools: tuple[str, ...] = (), error: BaseException | None = None
 ) -> Scenario:
-    """Fake the SDK transports and session; ``error`` is raised on connect."""
+    """Fake the SDK's transports and ``Client``; ``error`` is raised on connect.
+
+    The client's connect (the 2026-07-28 probe, or the ``initialize``
+    handshake it falls back to) is recorded as ``initialize``.
+    """
 
     def install(monkeypatch, calls):
         import mcp
         import mcp.client.sse
         import mcp.client.streamable_http
+        import mcp.shared._httpx_utils
 
         def opened(record):
             calls.append(record)
             if error is not None:
                 raise error
 
-        @asynccontextmanager
-        async def http_client_cm(headers=None, **_kwargs):
-            yield SimpleNamespace(headers=dict(headers or {}))
+        class HttpClient:
+            def __init__(self, headers=None):
+                self.headers = dict(headers or {})
+                self.event_hooks = {"request": [], "response": []}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        def create_mcp_http_client(headers=None, timeout=None, auth=None):
+            return HttpClient(headers)
 
         @asynccontextmanager
         async def streamable_http_client(url, http_client=None, **_kwargs):
@@ -403,59 +418,40 @@ def mcp_sdk(
                     "headers": http_client.headers,
                 }
             )
-            yield "read", "write", None
-
-        @asynccontextmanager
-        async def streamablehttp_client(url, headers=None, **_kwargs):
-            opened(
-                {
-                    "transport": "streamable_http",
-                    "url": url,
-                    "headers": dict(headers or {}),
-                }
-            )
-            yield "read", "write", None
+            yield "read", "write"
 
         @asynccontextmanager
         async def sse_client(url, headers=None, **_kwargs):
             opened({"transport": "sse", "url": url, "headers": dict(headers or {})})
             yield "read", "write"
 
-        class Session:
-            def __init__(self, read, write):
-                pass
+        class Client:
+            def __init__(self, connection, **_kwargs):
+                self._connection = connection
 
             async def __aenter__(self):
+                await self._connection.__aenter__()
+                calls.append("initialize")
                 return self
 
             async def __aexit__(self, *exc):
+                await self._connection.__aexit__(*exc)
                 return False
 
-            async def initialize(self):
-                calls.append("initialize")
-
-            async def list_tools(self):
+            async def list_tools(self, **_kwargs):
                 calls.append("list_tools")
                 return SimpleNamespace(
                     tools=[SimpleNamespace(name=name) for name in tools]
                 )
 
-        streamable = mcp.client.streamable_http
-        if hasattr(streamable, "streamable_http_client"):
-            import mcp.shared._httpx_utils
-
-            monkeypatch.setattr(
-                streamable, "streamable_http_client", streamable_http_client
-            )
-            monkeypatch.setattr(
-                mcp.shared._httpx_utils, "create_mcp_http_client", http_client_cm
-            )
-        else:
-            monkeypatch.setattr(
-                streamable, "streamablehttp_client", streamablehttp_client
-            )
+        monkeypatch.setattr(
+            mcp.client.streamable_http, "streamable_http_client", streamable_http_client
+        )
+        monkeypatch.setattr(
+            mcp.shared._httpx_utils, "create_mcp_http_client", create_mcp_http_client
+        )
         monkeypatch.setattr(mcp.client.sse, "sse_client", sse_client)
-        monkeypatch.setattr(mcp, "ClientSession", Session)
+        monkeypatch.setattr(mcp, "Client", Client)
 
     return install
 

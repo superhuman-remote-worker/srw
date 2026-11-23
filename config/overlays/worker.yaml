@@ -108,12 +108,14 @@ limits:
   # tightened the effective budget rather than loosened it. Set >0 only if you
   # deliberately want a per-phase guard.
   max_tool_calls_per_phase: 0
-  # Job ceiling — the real backstop, and the ONLY automatic stop a runaway job
-  # has (the progress nudge and act-ratio tripwire only inject reminders; loop
-  # detection only masks tools; the orchestrator has no job-duration limit).
-  # Exceeding it freezes with budget_exceeded, which parks for human review
-  # rather than auto-redispatching, so it cannot livelock. 0 disables it.
-  max_tool_calls_per_job: 5000
+  # Job ceiling: OFF by default, like every limit on a job's own work. A job
+  # runs until it finishes unless its expert or the job sets one here. With a
+  # value >0, exceeding it freezes with budget_exceeded, which waits for a
+  # review rather than auto-redispatching. The count lives in the worker
+  # process, so on the stateless lane it starts again with every lease.
+  max_tool_calls_per_job: 0
+  max_llm_calls_per_job: 0         # model calls per round of work (start or last feedback) before the job fails; 0 = off
+  max_plain_replies_in_a_row: 0    # replies without a tool call in a row, a todo pending, before the job fails; 0 = off
   # Act-ratio tripwire: after N consecutive tool actions that touch ONLY
   # process artifacts (patterns below), inject a one-line "stop planning"
   # nudge. Any action on a non-process target resets the counter. 0 disables.

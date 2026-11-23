@@ -428,10 +428,19 @@ jobs:
         # GHSA-vfj7-8cjw-p6xm: Braces stack exhaustion from deeply nested globs.
         # No patched release; Stylelint uses the fixed, repository-controlled
         # src/**/*.scss pattern. Accept only dev-only Braces 3.0.3 below.
+        #
+        # GHSA-fc5q-39xc-vjpf: picomatch ReDoS on crafted extglob patterns.
+        # Every release up to 4.0.7 is affected and none is patched. Used only
+        # by the build, lint and test tools with repository-controlled patterns.
+        # Accepted below only while no newer picomatch is published and no
+        # unreviewed package depends on it.
+        #
         # Exposure, guards and removal criteria: policy/npm_audit_exceptions.md.
         run: |
+          PICOMATCH_LATEST=$(npm view picomatch version 2>/dev/null || true)
+          export PICOMATCH_LATEST
           npm audit --json | python3 -c "
-          import json, sys
+          import json, os, sys
           from pathlib import Path
           IGNORE_ADVISORIES = {
               'GHSA-r5fr-rjxr-66jc', 'GHSA-f23m-r3pf-42rh',
@@ -443,45 +452,83 @@ jobs:
               print('npm audit did not return a vulnerability report', file=sys.stderr)
               sys.exit(2)
 
-          lock = json.loads(Path('package-lock.json').read_text())
-          braces = [pkg for path, pkg in lock['packages'].items()
+          packages = json.loads(Path('package-lock.json').read_text())['packages']
+          braces = [pkg for path, pkg in packages.items()
                     if path == 'node_modules/braces' or path.endswith('/node_modules/braces')]
           if braces and all(pkg.get('version') == '3.0.3' and pkg.get('dev') is True
                             for pkg in braces):
               IGNORE_ADVISORIES.add('GHSA-vfj7-8cjw-p6xm')
 
-          ignored_pkgs = set()
+          # picomatch: accepted only while the newest published release is still
+          # inside the affected range (up to 4.0.7) and nothing but the reviewed
+          # build tools depends on picomatch outside the dev-only packages.
+          PICOMATCH = 'GHSA-fc5q-39xc-vjpf'
+          REVIEWED_DEPENDENTS = {'@angular-devkit/core', 'tinyglobby', 'fdir'}
+          parts = os.environ.get('PICOMATCH_LATEST', '').strip().split('.')
+          latest = None
+          if len(parts) == 3 and all(part.isdigit() for part in parts):
+              latest = tuple(int(part) for part in parts)
+          dependents = set()
+          for path, pkg in packages.items():
+              needs = set()
+              for kind in ('dependencies', 'optionalDependencies', 'peerDependencies'):
+                  needs.update(pkg.get(kind) or {})
+              if 'picomatch' in needs and pkg.get('dev') is not True:
+                  dependents.add(path.split('node_modules/')[-1] or 'the Cockpit itself')
+          picomatch_off = []
+          if latest is None:
+              picomatch_off.append('the newest published picomatch version is unknown')
+          elif latest > (4, 0, 7):
+              picomatch_off.append('picomatch ' + '.'.join(parts) + ' is published; update to it and remove the exception')
+          if dependents - REVIEWED_DEPENDENTS:
+              picomatch_off.append('not reviewed, depends on picomatch outside the dev-only packages: '
+                                   + ', '.join(sorted(dependents - REVIEWED_DEPENDENTS)))
+          if not picomatch_off:
+              IGNORE_ADVISORIES.add(PICOMATCH)
+
+          # The root advisories behind every package: its own, and those of the
+          # packages it is vulnerable through.
+          roots = {name: set() for name in vulns}
           changed = True
           while changed:
               changed = False
               for name, vuln in vulns.items():
-                  if name in ignored_pkgs:
-                      continue
-                  dominated = bool(vuln.get('via'))
-                  for v in vuln.get('via', []):
-                      if isinstance(v, dict):
-                          ghsa = v.get('url', '').split('/')[-1]
-                          if ghsa not in IGNORE_ADVISORIES:
-                              dominated = False
-                              break
-                      elif isinstance(v, str) and v not in ignored_pkgs:
-                          dominated = False
-                          break
-                  if dominated:
-                      ignored_pkgs.add(name)
+                  behind = set()
+                  for via in vuln.get('via') or []:
+                      if isinstance(via, dict):
+                          behind.add((via.get('url', '').split('/')[-1], via.get('severity')))
+                      elif isinstance(via, str) and via in vulns:
+                          behind |= roots[via]
+                      else:
+                          behind.add((None, None))
+                  if not behind <= roots[name]:
+                      roots[name] |= behind
                       changed = True
 
+          # npm rates a package by the worst advisory of any of its chains. A package
+          # npm rates high or critical blocks unless every advisory behind it that is
+          # not accepted is rated lower. An advisory without a rating, and a package
+          # without root advisories, keep npm's rating of the package.
+          LOWER = ('info', 'low', 'moderate')
           found = 0
           for name, vuln in vulns.items():
-              if name in ignored_pkgs:
+              own = vuln.get('severity')
+              if own not in ('high', 'critical'):
                   continue
-              if vuln.get('severity') in ('high', 'critical'):
+              unaccepted = [severity or own for ghsa, severity in roots[name]
+                            if ghsa not in IGNORE_ADVISORIES]
+              if not roots[name]:
+                  unaccepted = [own]
+              if any(severity not in LOWER for severity in unaccepted):
                   found += 1
-                  print(f'{name}: {vuln[\"severity\"]}')
+                  print(name + ': ' + own)
           if found:
-              print(f'{found} unignored high/critical vulnerabilities')
+              print(str(found) + ' unignored high/critical vulnerabilities')
+              if picomatch_off and any(ghsa == PICOMATCH for behind in roots.values() for ghsa, _ in behind):
+                  print('The picomatch exception (' + PICOMATCH + ') is off: ' + '; '.join(picomatch_off)
+                        + '. See policy/npm_audit_exceptions.md.')
               sys.exit(1)
-          print('npm audit passed (ignored advisories: ' + ', '.join(IGNORE_ADVISORIES) + ')')
+          print('npm audit passed (ignored advisories: ' + ', '.join(sorted(IGNORE_ADVISORIES)) + ')')
           "
 
       # --- Third-party license policy gate (blocking) -----------------------
@@ -531,6 +578,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # tests/test_srw_cli_wire.py builds the srw binary from cli/.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.11'
+          cache-dependency-path: cli/go.sum
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -1209,8 +1261,14 @@ jobs:
       - name: Build sudo_gate.so (C plugin)
         working-directory: vm/sudo-plugin
         run: |
-          gcc -fPIC -shared -Wall -Wextra -Werror -O2 -I./include \
-            -o sudo_gate.so sudo_gate.c json_util.c
+          # -march=x86-64: the VM image's sudo loads this plugin on any x86-64
+          # CPU (packer's build VM has no AVX). The ubuntu-26.04 runner's gcc
+          # defaults to a newer level, and sudo died with SIGILL in stage2.
+          gcc -fPIC -shared -Wall -Wextra -Werror -O2 -march=x86-64 -mtune=generic \
+            -I./include -o sudo_gate.so sudo_gate.c json_util.c
+          if objdump -d sudo_gate.so | grep -qE '%[yz]mm|[[:space:]]v[a-z0-9]+[[:space:]]+%'; then
+            echo "::error::sudo_gate.so contains AVX instructions"; exit 1
+          fi
           file sudo_gate.so
           ls -lh sudo_gate.so
       - name: Upload sudo gate artifacts
@@ -1689,7 +1747,7 @@ jobs:
       # The same release as docker/Dockerfile.driver-shim's pinned base.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache: false
       - name: Vet and test the shim
         working-directory: drivers/shim
@@ -1860,7 +1918,7 @@ jobs:
       # The same release as docker/Dockerfile.driver-mcp-front's pinned base.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache: false
       - name: Vet and test the front
         working-directory: drivers/mcp-front
@@ -1956,7 +2014,7 @@ jobs:
       # The same release as docker/Dockerfile.driver-git-swap's pinned base.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache: false
       - name: Vet and test the git swap driver
         working-directory: drivers/git-swap
@@ -2030,7 +2088,7 @@ jobs:
       # The same release as docker/Dockerfile.driver-gpt-live-sip's pinned base.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache: false
       - name: Vet and test the phone-line driver
         working-directory: drivers/gpt-live-sip
@@ -2267,7 +2325,7 @@ jobs:
       # The same release as docker/Dockerfile.in-pod-mount's pinned base.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.8'
+          go-version: '1.26.11'
           cache: false
       - name: Vet and test the FUSE opener
         working-directory: drivers/fuse-opener
@@ -2351,12 +2409,172 @@ jobs:
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-fuse-opener:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   # ---------------------------------------------------------------------------
+  # srw, the command-line client (cli/). test-cli has no needs: it runs beside
+  # the other tests, also on a pull request. Its tests include the reference
+  # drift check (docs/cli-reference.md) and the route table against
+  # policy/endpoint_inventory.txt. The wire test against the real routes is a
+  # Python test and runs in test-python-shards.
+  # ---------------------------------------------------------------------------
+  test-cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.11'
+          cache-dependency-path: cli/go.sum
+      - name: Verify modules, formatting and vet
+        working-directory: cli
+        run: |
+          go mod verify
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change: $unformatted"
+            exit 1
+          fi
+          go vet ./...
+          GOOS=windows go vet ./...
+          GOOS=darwin go vet ./...
+      - name: Test with the race detector
+        working-directory: cli
+        run: go test -count=1 -race -timeout 300s ./...
+      - name: Audit dependencies for known vulnerabilities
+        working-directory: cli
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: Build every target and smoke-test what a release ships
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+            scripts/release/build_cli.sh 0.0.0 "${GITHUB_SHA}" dist/cli
+          (cd dist/cli && sha256sum -c checksums.txt)
+          mkdir -p smoke/releases/latest/download smoke/home
+          cp dist/cli/* smoke/releases/latest/download/
+          # The installer against the archives just built, in an empty home.
+          env -i HOME="$PWD/smoke/home" PATH=/usr/bin:/bin \
+            SRW_INSTALL_REPOSITORY="file://$PWD/smoke" sh scripts/install-cli.sh
+          srw="$PWD/smoke/home/.local/bin/srw"
+          "$srw" version --client | grep -F "0.0.0 (commit ${GITHUB_SHA})"
+          "$srw" --help > /dev/null
+          "$srw" completion bash > /dev/null
+          # Nothing configured: a clear refusal, not a request to localhost.
+          set +e
+          env -i HOME="$PWD/smoke/home" "$srw" get jobs
+          code=$?
+          set -e
+          test "$code" -eq 2
+
+  # The release archives with their checksums and build provenance, and the
+  # srw-cli image. release-chart needs this job, so a broken client stops the
+  # chart, the tag and the release like every other component. The archives
+  # travel to github-release as an artifact.
+  build-cli:
+    needs: [architecture, lint, dependency-audit, test-python, test-cockpit, test-cli, resolve-version]
+    if: >-
+      needs.architecture.result == 'success' &&
+      always() && !cancelled() &&
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      needs.test-cli.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      # Build provenance for the archives (actions/attest): the only job in
+      # this repository that asks for an OIDC token.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.11'
+          cache-dependency-path: cli/go.sum
+      - name: Build the archives
+        env:
+          # Empty on a validation run, which builds and publishes nothing.
+          RELEASE_VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+            scripts/release/build_cli.sh "${RELEASE_VERSION:-0.0.0}" "${GITHUB_SHA}" dist/cli
+          (cd dist/cli && sha256sum -c checksums.txt)
+          ls -l dist/cli
+      - name: Attest the archives' build provenance
+        if: needs.resolve-version.result == 'success'
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/cli/checksums.txt
+      - name: Keep the archives for the GitHub Release
+        uses: actions/upload-artifact@v4
+        with:
+          name: srw-cli
+          path: dist/cli/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        if: needs.resolve-version.result == 'success'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cli
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable=${{ needs.resolve-version.result == 'success' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ needs.resolve-version.result == 'success' }}
+      - name: Build${{ needs.resolve-version.result == 'success' && ' and push' || ' (validation, no push)' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.cli
+          # The build stage cross-compiles and the last stage runs nothing,
+          # so the second architecture needs no emulation.
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.resolve-version.result == 'success' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.source=${{ env.SRW_SOURCE_URL }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.resolve-version.outputs.version }}
+            org.opencontainers.image.documentation=${{ env.SRW_DOCUMENTATION_URL }}/cli/
+            org.opencontainers.image.licenses=FSL-1.1-ALv2
+            io.srw.component=cli
+          provenance: false
+          build-args: |
+            SRW_SOURCE_REVISION=${{ github.sha }}
+            SRW_RELEASE_VERSION=${{ needs.resolve-version.outputs.version }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cli:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cli:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+
+  # ---------------------------------------------------------------------------
   # Package and publish Helm chart at the resolved release version.
   # Git tag goes LAST so a failed chart push doesn't leave dangling tags.
   # ---------------------------------------------------------------------------
   release-chart:
     name: Package and publish Helm chart
-    needs: [architecture, resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-vm-preparer, build-driver-shim, build-driver-mcp-front, build-driver-git-swap, build-driver-gpt-live-sip, build-voice-gateway, build-asterisk, build-fuse-opener, build-agent-vm-base, chart-test, chart-schema-negative]
+    needs: [architecture, resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-vm-preparer, build-driver-shim, build-driver-mcp-front, build-driver-git-swap, build-driver-gpt-live-sip, build-voice-gateway, build-asterisk, build-fuse-opener, build-cli, build-agent-vm-base, chart-test, chart-schema-negative]
     if: >-
       always() && !cancelled() &&
       github.ref == 'refs/heads/main' &&
@@ -2377,6 +2595,7 @@ jobs:
       needs.build-voice-gateway.result == 'success' &&
       needs.build-asterisk.result == 'success' &&
       needs.build-fuse-opener.result == 'success' &&
+      needs.build-cli.result == 'success' &&
       needs.chart-test.result == 'success' &&
       needs.chart-schema-negative.result == 'success'
     runs-on: ubuntu-latest
@@ -2495,6 +2714,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-notes
+      # The srw client's archives, checksums and installer from build-cli
+      # (release-chart needs that job, so they exist).
+      - uses: actions/download-artifact@v4
+        with:
+          name: srw-cli
+          path: dist/cli
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2502,9 +2727,33 @@ jobs:
           TAG: ${{ needs.resolve-version.outputs.tag }}
           TITLE: ${{ needs.resolve-version.outputs.title }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::notice::GitHub Release $TAG already exists; leaving it untouched"
-            exit 0
-          fi
-          gh release create "$TAG" --verify-tag --latest \
-            --title "$TITLE" --notes-file release-notes.md
+          set -euo pipefail
+          assets=(dist/cli/srw_*.tar.gz dist/cli/srw_*.zip dist/cli/checksums.txt dist/cli/install.sh)
+          test "${#assets[@]}" -eq 8
+          # missing, or isDraft as true or false.
+          state=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
+          case "$state" in
+            missing)
+              # With files, gh drafts the release, uploads them and publishes
+              # it, so a published release always has every asset.
+              gh release create "$TAG" --verify-tag --latest \
+                --title "$TITLE" --notes-file release-notes.md "${assets[@]}"
+              ;;
+            true)
+              # A draft left by a run that failed while uploading: finish it.
+              gh release upload "$TAG" "${assets[@]}" --clobber
+              gh release edit "$TAG" --draft=false --latest
+              ;;
+            *)
+              # Published. Never changed; but a release without its assets
+              # breaks every install, so say so loudly.
+              have=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+              for asset in "${assets[@]}"; do
+                if ! grep -qxF "$(basename "$asset")" <<<"$have"; then
+                  echo "::error::GitHub Release $TAG exists without $(basename "$asset")"
+                  exit 1
+                fi
+              done
+              echo "::notice::GitHub Release $TAG already exists with every asset; leaving it untouched"
+              ;;
+          esac

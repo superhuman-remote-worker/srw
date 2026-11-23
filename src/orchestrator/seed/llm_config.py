@@ -258,6 +258,7 @@ _CAPABILITY_ENUM = (
     "fetch",
     "rerank",
     "live_voice",
+    "image_generation",
 )
 
 # Default-model pins the payload's ``defaults`` map may set — one
@@ -282,6 +283,7 @@ DEFAULT_PIN_CAPABILITY_BY_KIND: dict[str, str] = {
     "search_fallback": "search",
     "rerank": "rerank",
     "live_voice": "live_voice",
+    "image_generation": "image_generation",
 }
 
 

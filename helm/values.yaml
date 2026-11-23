@@ -1,5 +1,6 @@
 # Superhuman Remote Worker — Helm Chart Values
-# See knowledge-base/knowledge/helm_migration.md for architecture overview.
+# Guide: https://github.com/superhuman-remote-worker/srw/blob/main/helm/README.md
+# Reference: https://docs.superhuman-remote-worker.com/reference/helm-values/
 
 # -- Override chart name in resource names
 nameOverride: ""
@@ -598,13 +599,16 @@ orchestrator:
   # replacement code can mutate the same deterministic resources.
   workspaceLifecycleServiceAccountGeneration: "0197"
   # -- Enable exact, renewable v1 receipts for orchestrator-originated VM
-  # SSH/SFTP. Enabling switches the orchestrator to Recreate so no pre-v1
-  # replica overlaps activation. Keep false until migration 0199 is present;
-  # after activation never roll back to an image without v1 support. The dark
-  # value intentionally retains same-cluster TCP/22 for existing/read-only VM
-  # paths; mutation admission is fenced by the application + database gate.
+  # SSH/SFTP. On by default: uploads into a VM, Canvas saves of a VM file, IDE
+  # settings and cloud staging into a VM all need it, and with it off they are
+  # refused (VM files on the Canvas show view-only). Enabling switches the
+  # orchestrator to Recreate so no pre-v1 replica overlaps activation (the
+  # default rollout already is Recreate). After activation never roll back to
+  # an image without v1 support (migration 0199). Setting false keeps
+  # same-cluster TCP/22 for read-only VM paths; mutation admission is fenced by
+  # the application + database gate.
   vmRemoteOperationProtocol:
-    enabled: false
+    enabled: true
   vmProvisioning:
     # -- Admit new jobs through the durable creation protocol. Keep disabled
     # until every controller supports the complete creation and cleanup contract.
@@ -669,6 +673,19 @@ orchestrator:
       cpu: "500m"
   # -- Auto-assign jobs to idle agents
   autoAssignEnabled: "true"
+  # -- The job dispatcher's own safeguards against a stall.
+  dispatcher:
+    # -- Log an error when the dispatcher has made no scheduling pass for
+    # this many seconds (0: no alarm).
+    stallAlarmSeconds: 180
+    # -- End the orchestrator replica when the dispatcher has made no
+    # scheduling pass for this many seconds, so that Kubernetes restarts it
+    # or another replica takes the lead (0: never). Keep it well above
+    # stallAlarmSeconds; unattended batch runs use 600.
+    stallRestartSeconds: 0
+    # -- Cancel a workspace preparation that has not returned after this many
+    # seconds and free its slot for the next job (0: no limit).
+    preflightTimeoutSeconds: 1800
   # -- Enable durable completion-command admission/finalization. Ships dark;
   # open only after the Gate-3 parity and crash-recovery proof is complete.
   completionCommandsEnabled: false
@@ -992,10 +1009,6 @@ agent:
   # DB-backed experts are the source of truth for the application and personal
   # root-creation defaults. Set false only as an emergency compatibility switch.
   expertsDbEnabled: "true"
-  # -- Enable DB-backed Agent Skills (skills + skill_files tables). Default OFF
-  # (prod-safe); the dev/experimental values file turns it on. Mirrors
-  # expertsDbEnabled.
-  skillsDbEnabled: "false"
   # -- Emergency operator-only withdrawal of the managed in-product App Guide.
   # Default OFF. This is not a user preference or normal feature gate; enable
   # only to contain a broken guide/reader, then disable it after rollback or
@@ -1013,6 +1026,23 @@ agent:
   # D5b): its image runs as a managed MCP server (connectors.drivers), and
   # the former agent.mcpStdioEnabled fails the render when set to true.
   mcpDatasourcesEnabled: "false"
+  # -- Keep every tool step's full arguments and full result in the audit
+  # store (`agent_audit`), next to the 200/500-character previews. Off by
+  # default: a tool result is also part of the next model request, so the
+  # preview is enough to debug with. Turn it on for a record that must hold
+  # each tool call as it ran, including a job's last tool batch, which no
+  # later request carries, and results a compaction shortens afterwards.
+  # Tool input and output then take about twice the room in the audit DB.
+  auditFullToolIo: "false"
+  # -- `synchronous_commit` for the agents' audit writes: "off" (default) or
+  # "on". Off, the audit database acknowledges a row before it is on disk, so
+  # a database crash can lose the last ~600 ms of rows the agent was told were
+  # written. On, every audit write waits for the flush: a few milliseconds
+  # more per row and more fsyncs on the audit volume, for a record that must
+  # not lose an acknowledged row. A clean restart loses nothing either way;
+  # rows written while the database is away are spooled by the agent and
+  # written when it is back.
+  auditSynchronousCommit: "off"
   # -- Temporary compatibility gate for REST/session requests that omit
   # datasource_ids. Omission always attaches the project's own platform-owned
   # connectors (knowledge base, cloud folder); this gate adds the owner's and
@@ -1031,7 +1061,6 @@ agent:
   datasourceScopeAutoAttachV1Enabled: "true"
   # -- Enable protected cloud mode: RO-reader provisioning + capture overlay.
   # Default OFF (prod-safe); the dev/experimental values file turns it on.
-  # See knowledge-base/knowledge/design/cloud_access_unification.md §8 Phase 1.
   protectedCloudModeEnabled: "false"
   # -- Require every pinned lifecycle/credential write to carry exact runtime
   # generation and attach identity. Migration 0185 is a drained maintenance
@@ -1048,8 +1077,7 @@ agent:
   # -- Effective context ceiling (tokens) for models routed via the system codex
   # proxy, whose ChatGPT-OAuth backend caps context ~400K regardless of the
   # model's true API window. Compaction fires at 80% of this. Set 0 to disable
-  # (e.g. once OpenAI ships 1M-for-Codex). See
-  # knowledge-base/knowledge/issues/codex_proxy_context_window_cap.md.
+  # (e.g. once OpenAI ships 1M-for-Codex).
   codexContextWindowCap: 400000
   resources:
     requests:
@@ -1072,8 +1100,8 @@ agent:
     minAvailable: 0
   # -- Egress NetworkPolicy for agent pods (helm/templates/agent/network-policy.yaml).
   # Agent pods hold internal credentials and historically had NO policy at all;
-  # this is the companion control to the local-execution-fallback removals
-  # (no_workspace_agent_mode.md §9.1). In-cluster dependencies are allowed by
+  # this is the companion control to the local-execution-fallback removals.
+  # In-cluster dependencies are allowed by
   # podSelector; public internet is allowed on TCP 80/443/22 minus the `except`
   # CIDRs below.
   networkPolicy:
@@ -1083,7 +1111,6 @@ agent:
     # MUST add an `extraEgress` carve-out before enabling, or agents lose model
     # access. The policy has no rule for the bundled Gitea yet, whose API the
     # agent's repository tools (pull requests) call, so add one there too.
-    # See knowledge-base/knowledge/issues/agent_egress_networkpolicy_enablement.md.
     enabled: false
     # -- CIDRs subtracted from the 0.0.0.0/0 internet egress allow: every
     # private, shared (CGNAT), loopback and link-local/metadata range, so the
@@ -1142,8 +1169,8 @@ agent:
   # or deleting that transcript/thread, or an old-reader-compatible exclusion.
   # See the design note.
   persistentInputCancellationEnabled: false
-  # -- Stateless executor Deployment (knowledge-base/knowledge/features/stateless_agents.md §5.8;
-  # templates/agent/stateless-deployment.yaml). A static pool of generic agent
+  # -- Stateless executor Deployment
+  # (templates/agent/stateless-deployment.yaml). A static pool of generic agent
   # processes running `--mode stateless` that PULL work units from the
   # run_queue, replacing per-thread provisioning for queue-lane threads
   # (threads.execution_lane='stateless'). Coexists with the AgentProvisioner
@@ -1223,12 +1250,11 @@ agent:
       maxUnavailable: 0
       maxSurge: "25%"
     # -- Queue-driven autoscaling of the executor pool via KEDA
-    # (templates/agent/stateless-scaledobject.yaml;
-    # knowledge-base/knowledge/features/capacity_ux_and_queue_autoscaling.md).
+    # (templates/agent/stateless-scaledobject.yaml).
     # Replicas follow run_queue demand: busy + runnable + reserve, clamped to
     # [minReplicas, maxReplicas]. KEDA itself is a cluster-level prerequisite
-    # the chart does NOT install (HomeLab deployments_managed/keda/ on dev,
-    # scripts/local-dev-up.sh on k3d); enabling this without it fails the
+    # the chart does NOT install (https://keda.sh/docs/latest/deploy/;
+    # scripts/local-dev-up.sh installs it on k3d); enabling this without it fails the
     # upgrade at apply time on the unknown ScaledObject kind.
     autoscaling:
       # -- DEFAULT OFF (prod-safe). On: renders the ScaledObject +
@@ -1271,6 +1297,13 @@ agent:
       # -- Minimum wall-clock budget for one worker batch. Production keeps a
       # five-minute floor; local acceptance may explicitly lower it.
       batchMinWallSeconds: 300
+      # -- Base wait in seconds before a worker job is tried again after a
+      # batch that ended in a recoverable failure, such as a model provider
+      # that stopped answering. The wait grows with each failed try in a row
+      # (1x, 2x, 3x, 4x) and the fifth failure ends the job, so 5 tolerates
+      # about 50 seconds of outage and 60 about ten minutes. Unattended batch
+      # runs use 60 to 90. Range 1 to 900.
+      errorBackoffSeconds: 5
 
 # =============================================================================
 # Cockpit (Angular frontend)
@@ -1309,16 +1342,19 @@ cockpit:
   # `GET /api/models`, which is the authoritative source (system endpoints
   # seeded via `llm.seed.systemEndpoints` + user endpoints). Empty catalogs
   # render a role-aware empty-state banner pointing operators to
-  # Admin → Providers. See knowledge-base/knowledge/features/db_backed_llm_config.md.
+  # Admin → Providers. See https://docs.superhuman-remote-worker.com/models/.
 
 # =============================================================================
 # Dynamic Canvas
 # =============================================================================
 canvas:
-  # Shared browser (knowledge-base/knowledge/features/shared_browser.md): stream the workspace
-  # Chromium into the Canvas. Dark by default; the dev profile enables it.
+  # -- Shared browser: the workspace's Chromium, streamed into a Session's
+  # Canvas. The user and the agent take turns driving it, so the user can try
+  # a web app the agent built and runs in its workspace. Needs a Session with
+  # a machine (a Container); Virtual/None Sessions show the reason instead of
+  # the button. Jobs have no Canvas. Set false to hide it everywhere.
   sharedBrowser:
-    enabled: false
+    enabled: true
   livePreview:
     # -- Master capability gate for workspace-port live preview. The proxy,
     # isolated viewer origin, and browser acceptance gates must all fail closed
@@ -1336,8 +1372,7 @@ canvas:
     # ingress block renders a standard wildcard Ingress for it. A normalizing
     # HTTP proxy in front (Cloudflare tunnel/proxy, an ordinary ingress
     # controller) is a supported edge: adjacent-slash merging is an accepted,
-    # documented limitation of that mode, not a security regression (see
-    # knowledge-base/knowledge/issues/canvas_hosted_edge_use_cloudflare_tunnel.md). Production
+    # documented limitation of that mode, not a security regression. Production
     # operators must still supply the restricted database role/Secret and the
     # PSL-boundary attestation.
     viewer:
@@ -1536,7 +1571,7 @@ collabora:
 # Auth — cockpit cookie BFF + (future) PAT system
 # =============================================================================
 # Knobs for the orchestrator's cookie-backed session layer for the cockpit.
-# See knowledge-base/knowledge/features/auth_bff_and_api_tokens.md. The cookie domain defaults
+# The cookie domain defaults
 # to a leading-dot prefix of global.domain so the cookie rides on both the
 # cockpit and api subdomains; override below for non-shared parents.
 auth:
@@ -1647,8 +1682,9 @@ sshGateway:
   # above defaults to "" (the bare domain), while `hostnames.api` defaults to
   # `api.<domain>`. A value that guesses the `cockpit.` subdomain is wrong out
   # of the box and every client gets a bare 403 at the WebSocket upgrade with
-  # nothing in the gateway pod's logs to explain why (ssh-access.md
-  # §7 Troubleshooting; this is also the trap behind srw-ssh-proxy's own
+  # nothing in the gateway pod's logs to explain why (see Troubleshooting in
+  # https://github.com/superhuman-remote-worker/srw/blob/main/ssh-access.md;
+  # this is also the trap behind srw-ssh-proxy's own
   # `--origin` default guess).
   allowedOrigins: []
   # -- Source addresses whose `X-Forwarded-For` header the gateway may believe
@@ -1857,8 +1893,7 @@ ingress:
   # When to leave off: you use a tunnel/edge that bypasses Traefik
   # (Cloudflare Tunnel, Tailscale Funnel, Ngrok, etc.) — Traefik never
   # sees the request, so the middleware would be dead code. Add the
-  # equivalent path rule at your tunnel/edge instead. See
-  # knowledge-base/knowledge/multi_tenancy.md for the cloudflared example.
+  # equivalent path rule at your tunnel/edge instead.
   internalPathBlock:
     enabled: false
 
@@ -1888,6 +1923,8 @@ secrets:
 # orchestrator, every agent pod and every container workspace (whose
 # entrypoint adds it to the system store). Certificate verification is never
 # switched off; without this, such an endpoint fails its TLS handshake.
+# For one self-signed certificate that cannot be verified for its address, trust
+# it per endpoint in Admin → Models instead (see docs/models.md).
 trust:
   # -- PEM, one or more certificates (-----BEGIN CERTIFICATE----- …). The chart
   # puts it into the ConfigMap <fullname>-trust-ca.
@@ -1908,8 +1945,8 @@ externalSecrets:
 
 # =============================================================================
 # Headscale — external Tailscale coordination server (consumed, not deployed).
-# Headscale itself is deployed out of band (see HomeLab/deployments_managed/
-# headscale/) so its lifecycle is independent of the SRW release.
+# Headscale itself is deployed out of band, so its lifecycle is independent
+# of the SRW release.
 # =============================================================================
 headscale:
   # -- Full headscale server URL. When empty, falls back to
@@ -1944,14 +1981,11 @@ headscale:
 #
 # Cutover caveat: at the flip, any in-flight job still holding a sqlite-only
 # checkpoint has no PG checkpoint yet, so it cold-starts ONCE, then runs on PG.
-# Docs: knowledge-history/done/cross_pod_resume_cold_starts_checkpoint_not_replicated.md
 checkpointer:
   # -- Worker checkpointer backend: "postgres" (shared, cross-pod — default) or "sqlite" (pod-local, legacy)
   backend: "postgres"
 
-# LLM-outage / cooldown resilience. Docs:
-# knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md +
-# knowledge-base/knowledge/features/llm_cooldown_pause_and_resume.md.
+# LLM-outage / cooldown resilience.
 # This single ceiling is read by BOTH the orchestrator (give-up: fail a job
 # loudly after this much continuous outage) AND every agent pod (cutoff: a quota
 # cooldown whose provider-stated reset fits inside this budget PAUSES + resumes
@@ -2099,8 +2133,8 @@ databases:
   #
   #    REQUIRES that plugin, which this chart CANNOT install: it ships as a raw
   #    manifest that hardcodes the operator's namespace (cnpg-system), which a
-  #    release deployed elsewhere does not own. See the runbook:
-  #    knowledge-base/knowledge/operations/cnpg_backup_runbook.md
+  #    release deployed elsewhere does not own. Install it yourself:
+  #    https://github.com/superhuman-remote-worker/srw/blob/main/helm/README.md#the-barman-cloud-plugin--the-chart-cannot-install-this
   backup:
     # -- none | objectstore. Default none, deliberately. Pointing this at the
     #    BUNDLED Garage would be worse than nothing: single node, one PVC, same
@@ -2261,7 +2295,7 @@ databases:
     # Postgres advisory lock, which silently breaks behind a TRANSACTION-mode
     # connection pooler (PgBouncer/pgcat/RDS-Proxy in txn mode — the lock leaks
     # and can stall autovacuum). Point externalHost at a direct or session-mode
-    # Postgres endpoint. See knowledge-history/researches/orchestrator_leader_election.md.
+    # Postgres endpoint.
     externalHost: ""
     externalPort: 5432
     externalDb: "srw"
@@ -2994,8 +3028,8 @@ gitea:
   # and users exist* from this database — pointing a populated instance at an
   # empty Postgres yields a Gitea that believes it is a fresh install while
   # hundreds of repos sit orphaned on disk. A preflight init container refuses
-  # to start in exactly that situation; run the migration first:
-  # knowledge-base/knowledge/operations/gitea_sqlite_to_postgres.md
+  # to start in exactly that situation. Move the data first, as described in
+  # https://github.com/superhuman-remote-worker/srw/blob/main/helm/README.md#moving-the-bundled-gitea-from-sqlite-to-postgres
   database:
     type: postgres
   storageClass: ""
@@ -3504,6 +3538,14 @@ workspace:
     # its container, and privileged is one step from root on the node. Enable
     # only when you trust everyone who can author workspace templates.
     privileged: false
+  memoryGrowth:
+    # -- The largest memory limit a Job may get after its workspace ran out of
+    # memory. When the workspace container is killed for memory, the hold says
+    # so and the Job's next Resume runs with twice the killed limit, once per
+    # Job and never above this value. Only the limit grows; the request (what
+    # the node reserves) stays. Empty switches the growth off: the hold then
+    # tells the person to start a new job on a template with more memory.
+    max: "16Gi"
   builtinTemplates:
     # -- Ship the built-in workspace templates in the shared Catalog: virtual,
     # container-minimal, container-full and, when VMs are on, vm-full. The
@@ -3588,7 +3630,6 @@ workspace:
   # Mixed fleets are safe — the reaper reads each pod's actual volume mode — so
   # this is a rolling flip, not a cutover; flipping it back off leaves existing
   # PVCs to drain as their work finishes.
-  # See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
   pvcEnabled: false
   # -- Size of each workspace PVC (only used when pvcEnabled). Applies to every
   # claim: job workspace, session workspace, and session agent.
@@ -3611,8 +3652,7 @@ workspace:
   # never-PVC-backed session. Bounds live PVCs to currently-active +
   # recently-crashed sessions instead of every retained thread ever. Fail-
   # safe: an unverifiable snapshot always keeps the PVC. Default off = keep
-  # today's retain-on-idle behavior. See
-  # knowledge-base/knowledge/features/workspace_durability_tiering.md §D3.
+  # today's retain-on-idle behavior.
   reclaimOnIdle: false
   # -- Idle Pod release for Kubernetes job workspaces, in seconds. A job left in
   # pending_review, waiting_for_reply or paused with no agent and no live IDE
@@ -3631,8 +3671,7 @@ workspace:
   # platform's own data PVCs (Postgres, …). On prod `longhorn-ephemeral`
   # is already dedicated; on single-node/local-path make a dedicated
   # local-path-backed class (same provisioner, distinct name) and point
-  # `ephemeralStorageClass` at it. See the storage-substrate section of
-  # knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md.
+  # `ephemeralStorageClass` at it.
   #
   # ONE BUCKET FOR BOTH KINDS. The quota is keyed on the storage class, and jobs
   # and sessions share that class — there is no per-kind split. A backlog of
@@ -3664,15 +3703,14 @@ workspace:
   # that enforces NetworkPolicy: Calico, Cilium, OVN-Kubernetes, and Antrea
   # enforce natively; K3s ships Flannel paired with the embedded kube-router
   # network-policy controller, which enforces by default (Flannel alone
-  # does not). See knowledge-base/knowledge/features/workspace_network_policy_unification.md.
+  # does not).
   #
   # PR 3 (per-project tiering): one NetworkPolicy is rendered per entry
   # in `tiers` below. Each policy selects pods carrying the matching
   # `srw.io/network-tier: <name>` label (emitted by the orchestrator's
   # ContainerProvisioner, derived from `projects.network_tier`). The
   # default tier `internet-only` MUST exist — pre-PR-3 pods and pods
-  # whose project has no resolvable tier inherit it. See
-  # knowledge-base/knowledge/features/workspace_network_isolation.md §3.
+  # whose project has no resolvable tier inherit it.
   networkPolicy:
     enabled: true
     # If set, the orchestrator init seeder bumps this user's default
@@ -3840,7 +3878,6 @@ codexProxy:
   # instant `503 auth_unavailable`, which reads as a dead token and takes out
   # unrelated jobs on the same proxy. v7.2.110 adds IsRequestScoped() and is a
   # strict descendant of that fix. Dev has run it since 2026-07-30.
-  # knowledge-history/done/codex_stream_disconnect_shape_nudge.md
   #
   # v7.3.13 (2026-09-22) was the first build that lists `claude-opus-5-5`. It
   # drops `gpt-5.3-codex-spark`, `gpt-5.4` and `gpt-5.4-mini` from its Codex
@@ -3963,7 +4000,7 @@ voiceGateway:
   # connection). Empty: the chart generates both once and keeps them
   # (resource-policy keep). Name one to manage them in Vault/ESO.
   existingSecret: ""
-  # -- The phone lines (local_voice_gateway.md §4.4). Per line:
+  # -- The phone lines (https://docs.superhuman-remote-worker.com/voice-gateway/). Per line:
   #   name           lowercase letters, digits, dashes (at most 31)
   #   mode           register (an extension on the PBX) or peer (the PBX sends
   #                  calls to Asterisk's address; no registration)
@@ -4121,7 +4158,7 @@ asterisk:
 # OFF by default and must stay off on production overlays.
 test:
   # -- GreenMail — disposable IMAP+IMAPS+SMTP(+S) mail server for the `email`
-  # datasource integration tests (knowledge-base/knowledge/features/email_datasource.md §Testing).
+  # datasource integration tests.
   # Auth disabled (any credentials work), state is in-memory only. Enable on
   # local k3d / CI overlays; seed fixtures with scripts/seed_greenmail.py.
   greenmail:
@@ -4165,8 +4202,7 @@ llm:
   # are admin-curated catalog rows now (system_api_keys + llm_endpoints
   # tables, plus default-model pins via Admin → Providers → Defaults).
   # The orchestrator resolves them at runtime through the model registry.
-  # See knowledge-base/knowledge/features/db_backed_llm_config.md and
-  # knowledge-base/knowledge/features/models_yaml_removal.md for the migration rationale.
+  # See https://docs.superhuman-remote-worker.com/models/.
   #
   # Removed in chunk 7 of models_yaml_removal:
   #   visionModel, embeddingModel, embeddingBaseUrl, codexBaseUrl,
@@ -4180,7 +4216,6 @@ llm:
   # whether the CLIProxyAPI proxy forwards input_tokens_details.cached_tokens.
   # Default off (verbose + disk); flip in values-local.yaml for k3d testing,
   # then start a FRESH session so a new agent pod inherits the ConfigMap value.
-  # See knowledge-base/knowledge/issues/codex_cached_tokens_not_metered.md.
   debugCodexRawResponse: "0"
   codexRawDumpDir: "/app/logs/codex-raw"
 
@@ -4460,8 +4495,7 @@ llm:
 # vector store (VECTOR_POSTGRES_*) for storage and SRW's EMBEDDING_* service
 # for embeddings — no separate citation DB, role, or embedding config.
 # `llmUrl` / `llmModel` / `reasoningLevel` for the verifier are passed via job
-# `config_override` at dispatch (default set in Admin → Models). See
-# knowledge-history/done/citation_engine_integration.md.
+# `config_override` at dispatch (default set in Admin → Models).
 
 # =============================================================================
 # Email / Notifications
@@ -4523,7 +4557,7 @@ garage:
   #
   # Auto rather than a plain `false` default because every consumer degrades
   # SILENTLY without a store: canvas presentations stop surviving their
-  # workspace (knowledge-base/knowledge/features/canvas_durable_presentation.md), workspace
+  # workspace, workspace
   # snapshots never capture, and the virtual tier stays unwired. An operator who
   # configures nothing should get a store that works, not a deployment that
   # looks healthy and quietly forgets things.
@@ -4552,7 +4586,7 @@ garage:
     limits:   { memory: "1Gi",   cpu: "1000m" }
 
 # =============================================================================
-# Virtual workspace tier (no_workspace_agent_mode.md §4/§5)
+# Virtual workspace tier
 # =============================================================================
 # Object store backing `workspace.backend: virtual` agents — file tools over
 # explicit rclone ops, no workspace pod, no PVC. The orchestrator injects this
@@ -4601,7 +4635,6 @@ ide:
 
 # -----------------------------------------------------------------------------
 # Session router — Direct Session WebSockets
-# (knowledge-base/knowledge/features/direct_session_websockets.md)
 # -----------------------------------------------------------------------------
 sessionRouter:
   # Tier-1 ingress controller — tested in CI + dev cluster.
@@ -4662,9 +4695,7 @@ orchestratorId: ""
 #                              provisioned by a post-install Job.
 #
 #   url="nats://...:4222"      orchestrator points at an external NATS (e.g.
-#                              a shared homelab hub — see the HomeLab repo's
-#                              deployments_managed/nats/ for the canonical
-#                              shared-hub deployment pattern).
+#                              one hub shared by several clusters).
 #
 # Leaving both unset disables VM lifecycle entirely (orchestrator falls back
 # to K8s pod workspaces via the container provisioner).
@@ -4812,8 +4843,7 @@ vmController:
   # -- CDI DataVolume storage class + size for the VM root disk.
   vmStorageClass: local-path
   vmDiskSize: 20Gi
-  # -- Golden-image boot acceleration
-  # (knowledge-base/knowledge/features/vm_golden_image_boot_acceleration.md). Import the base image
+  # -- Golden-image boot acceleration. Import the base image
   # once into a shared golden PVC per digest; clone each VM root disk from it
   # (host-assisted local copy on local-path) instead of a per-VM registry
   # import. Off = byte-for-byte the current registry-per-VM behaviour.
@@ -4825,8 +4855,7 @@ vmController:
       enabled: true
       keep: 3            # keep the N newest image digests
       minAgeMinutes: 30  # don't GC a golden younger than this
-  # -- Persistent VM rootdisks, shared by same-cluster and external modes
-  # (knowledge-base/knowledge/features/vm_persistent_rootdisk.md).
+  # -- Persistent VM rootdisks, shared by same-cluster and external modes.
   # Create each VM's root disk as a standalone DataVolume instead of via
   # spec.dataVolumeTemplates, so it is not cascade-deleted with the VM. A
   # recreate reattaches it by name: files survive a crash or a suspend, and the
@@ -4897,5 +4926,5 @@ vmController:
 # =============================================================================
 logLevel: "INFO"
 # Log output format: "json" (structured, for the Alloy -> Loki pipeline) or
-# "text" (human-readable). See knowledge-base/knowledge/features/centralized_logging.md.
+# "text" (human-readable).
 logFormat: "json"

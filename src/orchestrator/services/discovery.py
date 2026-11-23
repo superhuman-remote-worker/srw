@@ -38,7 +38,10 @@ from typing import Any
 import httpx
 
 from orchestrator.services import family_matcher
-from orchestrator.services.llm_endpoint_probe import declares_live_voice
+from orchestrator.services.llm_endpoint_probe import (
+    declares_live_voice,
+    is_image_generation_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +78,10 @@ _MULTIMODAL_PATTERNS = (
     "claude-haiku",
     "claude-4",  # claude-4 family is multimodal
     "qwen2-vl",
+    # DeepSeek V4.1 Flash; V4 Pro and the older deepseek-v4-flash are text-only.
+    "deepseek-flash",
+    "deepseek-v4.1-flash",
+    "deepseek-v4-flash-vision-exp",
     "qwen2.5-vl",
     # Mistral 3 multimodal generalists (Large 3 / Medium 3.5 / Small 4) + Pixtral.
     # Codestral / Ministral stay text-only, so no entry for them.
@@ -97,6 +104,9 @@ def _capability_from_model_id(model_id: str) -> str:
     Heuristics, evaluated top-down (a listing entry that declares
     ``live_voice`` skips them, see :func:`_candidate_from_id`):
     - ``gpt-live``/``realtime`` substring → ``live_voice``
+    - an image-generation id (``gpt-image``, ``dall-e``, ``imagen``,
+      ``…-image``) → ``image_generation``, before the multimodal and vision
+      rules so ``gemini-3-pro-image`` is not filed as chat+vision
     - ``embedding`` substring → ``embedding``
     - ``whisper`` substring → ``whisper``
     - ``tts``/``speech`` substring → ``tts``
@@ -115,6 +125,10 @@ def _capability_from_model_id(model_id: str) -> str:
         # A live voice model is never a chat row (it is bound by a phone-line
         # connector, not as an LLM).
         return "live_voice"
+    if is_image_generation_id(model_id):
+        # A text-to-image model is never a chat or vision row; the agent's
+        # generate_image tool calls it.
+        return "image_generation"
     if "embedding" in lower:
         return "embedding"
     if "whisper" in lower:

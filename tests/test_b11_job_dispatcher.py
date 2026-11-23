@@ -1816,11 +1816,14 @@ class TestAutoAssignDispatcher:
                 postgres_db=store,
                 completion_control_boundary=object(),
                 settings=SimpleNamespace(
-                    auto_assign_enabled=True, stateless_worker_enabled=False
+                    auto_assign_enabled=True,
+                    stateless_worker_enabled=False,
+                    dispatch_preflight_timeout_seconds=600.0,
                 ),
             )
         )
 
+        assert deps.preflight_timeout_seconds == 600.0
         for bound_half, owner in (
             (deps.request_leader_dispatch, job_dispatcher.request_leader_dispatch),
             (

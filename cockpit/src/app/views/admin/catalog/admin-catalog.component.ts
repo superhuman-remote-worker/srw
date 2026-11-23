@@ -1,4 +1,5 @@
 import {ChangeDetectionStrategy, Component, computed, DestroyRef, effect, ElementRef, inject, OnInit, signal, viewChild} from '@angular/core';
+import {tlsView} from '../providers/admin-providers.tls-pin';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AdminModelsService, catalogErrorDetail} from '../../../core/services/admin-models.service';
@@ -109,15 +110,29 @@ function isSubscriptionDiscovery(
  */
 function subscriptionRoutingParams(m: SubscriptionDiscoveredModel): Record<string, unknown> {
   const needsReview = m.support === 'needs_review';
-  const routing: Record<string, unknown> = {
-    client_protocol: m.client_protocol || 'openai-chat',
-  };
+  const isImage = (m.capability_hints ?? []).includes('image_generation');
+  // An image row has no chat protocol: its wire shape is params.provider.
+  const routing: Record<string, unknown> = isImage
+    ? {}
+    : {client_protocol: m.client_protocol || 'openai-chat'};
   if (m.sources.length > 0) routing['subscription_sources'] = [...m.sources];
   if (needsReview) routing['needs_review'] = true;
   const params: Record<string, unknown> = {routing};
-  if (m.max_output_tokens) params['max_output_tokens'] = m.max_output_tokens;
+  if (isImage) {
+    params['provider'] = 'openai-images';
+    params['ops'] = ['generate', 'edit'];
+    params['billing'] = 'subscription';
+  } else if (m.max_output_tokens) {
+    params['max_output_tokens'] = m.max_output_tokens;
+  }
   return params;
 }
+
+/** Adapters the agent's generate_image tool implements (params_json.provider). */
+export const IMAGE_ADAPTER_OPTIONS: ReadonlyArray<string> = ['openai-images', 'gemini'];
+
+/** Capabilities a catalog row must carry alone (mirrors the orchestrator). */
+const EXCLUSIVE_CAPABILITIES: ReadonlyArray<CatalogCapability> = ['live_voice', 'image_generation'];
 
 /**
  * Build the `capabilities[]` pre-fill from the discovery hint array.
@@ -139,6 +154,7 @@ function hintsToCapabilities(
     'fetch',
     'rerank',
     'live_voice',
+    'image_generation',
   ];
   const isKnown = (v: string): v is CatalogCapability =>
     known.includes(v as CatalogCapability);
@@ -435,6 +451,27 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                             <span class="test-result-text">{{ result.ok ? 'OK' : (result.error || 'failed') }}</span>
                           </app-badge>
                         </span>
+                        @if (tlsView(result.tls); as tv) {
+                          @if (tv.show) {
+                            <span class="tls-note" data-testid="tls-note">
+                              @if (tv.reasonKey) {
+                                {{ tv.reasonKey | transloco }}
+                              } @else if (tv.showMessage) {
+                                {{ result.tls?.message }}
+                              } @else if (tv.pinMatches) {
+                                {{ 'admin.providers.endpoints.tls.pinMatches' | transloco }}
+                              }
+                              @if (tv.expiredPinDate) {
+                                {{ 'admin.providers.endpoints.tls.expiredStillTrusted' | transloco: {date: tv.expiredPinDate} }}
+                              }
+                              @if (tv.trust) {
+                                {{ 'admin.providers.endpoints.tls.catalogHint' | transloco }}
+                              } @else if (tv.refusal) {
+                                {{ tv.refusal }}
+                              }
+                            </span>
+                          }
+                        }
                       }
                     </span>
                   </div>
@@ -798,6 +835,21 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
               @if (researchConfigurationError(); as error) {
                 <p class="field-hint field-hint--warn">{{ error }}</p>
               }
+            } @else if (imageGenerationSelected()) {
+              <div class="form-row image-generation-config">
+                <app-form-field [label]="'admin.catalog.imageGeneration.adapter' | transloco">
+                  <app-select
+                    [value]="formImageAdapter()"
+                    [disabled]="creating()"
+                    (changed)="formImageAdapter.set($event ?? 'openai-images')"
+                  >
+                    @for (adapter of imageAdapterOptions; track adapter) {
+                      <option [value]="adapter">{{ adapter }}</option>
+                    }
+                  </app-select>
+                </app-form-field>
+              </div>
+              <p class="field-hint">{{ 'admin.catalog.imageGeneration.hint' | transloco }}</p>
             } @else if (liveVoiceSelected()) {
               <div class="form-row live-voice-config">
                 <app-form-field [label]="'admin.catalog.liveVoice.adapter' | transloco">
@@ -1155,6 +1207,10 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
     }
     .test-result app-badge {
       max-width: 100%;
+    }
+    .tls-note {
+      font-size: 11px;
+      color: var(--text-muted);
     }
     .test-result-text {
       min-width: 0;
@@ -1573,6 +1629,7 @@ export class AdminCatalogComponent implements OnInit {
   readonly pricingSaving = signal(false);
   readonly pricingError = signal<string | null>(null);
   // Exposed for the template (pure helpers, unit-tested in admin-models.pricing.spec.ts).
+  protected readonly tlsView = tlsView;
   protected readonly pricingModeOf = pricingModeOf;
   protected readonly pricingLabelOf = pricingLabelOf;
 
@@ -1600,7 +1657,14 @@ export class AdminCatalogComponent implements OnInit {
   );
 
   readonly liveVoiceSelected = computed(() => this.formCapabilities().includes('live_voice'));
-  readonly liveVoiceExclusive = computed(() => !this.liveVoiceSelected() || this.formCapabilities().length === 1);
+  readonly imageGenerationSelected = computed(() => this.formCapabilities().includes('image_generation'));
+  /** live_voice and image_generation are each a row's only capability. */
+  readonly liveVoiceExclusive = computed(() =>
+    !this.formCapabilities().some((c) => EXCLUSIVE_CAPABILITIES.includes(c)) ||
+    this.formCapabilities().length === 1,
+  );
+  readonly formImageAdapter = signal<string>('openai-images');
+  readonly imageAdapterOptions = IMAGE_ADAPTER_OPTIONS;
 
   readonly researchCapabilitiesSelected = computed(() =>
     this.formCapabilities().some((capability) =>
@@ -1848,7 +1912,8 @@ export class AdminCatalogComponent implements OnInit {
     return (
       !!this.formProviderKey() &&
       !!this.formModelId().trim() &&
-      (this.researchCapabilitiesSelected() || this.liveVoiceSelected() || !!this.formFamily().trim()) &&
+      (this.researchCapabilitiesSelected() || this.liveVoiceSelected() ||
+        this.imageGenerationSelected() || !!this.formFamily().trim()) &&
       !this.researchConfigurationError() &&
       this.liveVoiceExclusive() &&
       this.formCapabilities().length > 0
@@ -1871,8 +1936,8 @@ export class AdminCatalogComponent implements OnInit {
   toggleFormCapability(capability: CatalogCapability, checked: boolean): void {
     const current = new Set(this.formCapabilities());
     if (checked) {
-      if (capability === 'live_voice') current.clear();
-      else current.delete('live_voice');
+      if (EXCLUSIVE_CAPABILITIES.includes(capability)) current.clear();
+      else for (const exclusive of EXCLUSIVE_CAPABILITIES) current.delete(exclusive);
       current.add(capability);
     } else {
       current.delete(capability);
@@ -1956,7 +2021,11 @@ export class AdminCatalogComponent implements OnInit {
       return;
     }
     if (!this.liveVoiceExclusive()) {
-      this.formError.set(this.transloco.translate('admin.catalog.liveVoice.onlyCapability'));
+      this.formError.set(this.transloco.translate(
+        this.imageGenerationSelected()
+          ? 'admin.catalog.imageGeneration.onlyCapability'
+          : 'admin.catalog.liveVoice.onlyCapability',
+      ));
       return;
     }
     const researchError = this.researchConfigurationError();
@@ -1971,6 +2040,10 @@ export class AdminCatalogComponent implements OnInit {
     const params: Record<string, unknown> = {};
     if ((capabilities.includes('tts') || this.liveVoiceSelected()) && voice) params['voice'] = voice;
     if (this.liveVoiceSelected()) params['adapter'] = 'openai-live';
+    if (this.imageGenerationSelected()) {
+      params['provider'] = this.formImageAdapter();
+      params['ops'] = ['generate', 'edit'];
+    }
     if (pricingId) params['pricing_id'] = pricingId;
     if (this.researchCapabilitiesSelected()) {
       params['provider'] = this.formSearchProvider();
@@ -2002,8 +2075,9 @@ export class AdminCatalogComponent implements OnInit {
         // An empty label falls back to the model ID, cut to the API's 200-char limit.
         display_label: (this.formDisplayLabel().trim() || modelId).slice(0, 200),
         capabilities,
-        family: this.researchCapabilitiesSelected() || this.liveVoiceSelected() ? 'default' : this.formFamily().trim(),
-        context_window: this.researchCapabilitiesSelected() || this.liveVoiceSelected()
+        family: this.researchCapabilitiesSelected() || this.liveVoiceSelected() || this.imageGenerationSelected()
+          ? 'default' : this.formFamily().trim(),
+        context_window: this.researchCapabilitiesSelected() || this.liveVoiceSelected() || this.imageGenerationSelected()
           ? null
           : this.formContextWindow() ?? null,
         params_json: paramsJson,

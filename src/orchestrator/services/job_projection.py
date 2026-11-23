@@ -445,3 +445,31 @@ def with_cloud_review_mode(
     job.pop("cloud_checkout", None)
     job["exported_folder_url"] = resolve_folder_url(job.get("exported_folder_handle"))
     return job
+
+
+def _json_mapping(value: Any) -> Mapping[str, Any] | None:
+    """``value`` as a mapping, decoding JSONB text; ``None`` for anything else."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return value if isinstance(value, Mapping) else None
+
+
+def effective_phases(job: Mapping[str, Any]) -> bool | None:
+    """Whether a job plans in phases (``shared.job_phases``), ``None`` when unknown.
+
+    The frozen configuration (``resolved_config.agent.phases``) is what the
+    job runs with, so it is read first; then ``config_override.phases``, which
+    admission writes on every job of SRW's own worker. A row without either is
+    a job from before the setting or one on a custom harness: ``None``.
+    """
+    from shared.job_phases import PHASES_KEY, is_phases_value, plans_in_phases
+
+    resolved = _json_mapping(job.get("resolved_config"))
+    agent = _json_mapping(resolved.get("agent")) if resolved is not None else None
+    for source in (agent, _json_mapping(job.get("config_override"))):
+        if source is not None and is_phases_value(source.get(PHASES_KEY)):
+            return plans_in_phases(source)
+    return None

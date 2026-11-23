@@ -216,6 +216,39 @@ async def open_stores(resources: ApplicationResources) -> tuple[bool, Any]:
         logger.exception(
             "Project connector entries were not healed; it retries at the next start"
         )
+    from orchestrator.services.manifest_phase_prompt_retirement import (
+        retire_manifest_phase_prompts,
+    )
+
+    # Migration 0567 strips the retired strategic/tactical expert prompts from
+    # the experts rows; this strips current Expert and Project manifests the
+    # same way, as new revisions. Idempotent and never fatal.
+    try:
+        retired = await retire_manifest_phase_prompts(resources.postgres_db)
+        if any(retired.values()):
+            logger.info("Retired expert phase prompts: %s", retired)
+    except Exception:
+        logger.exception(
+            "Retired expert phase prompts were not removed from manifests; "
+            "it retries at the next start"
+        )
+    from orchestrator.services.expert_phases_backfill import (
+        backfill_existing_phases,
+    )
+
+    # Before the `phases` setting every job planned in phases. Once per
+    # installation, write `phases: true` on the stored Experts and automations
+    # that do not state it, so nothing an operator set up changes by itself.
+    # Never fatal: without its marker row the pass runs again at the next start.
+    try:
+        marked = await backfill_existing_phases(resources.postgres_db)
+        if marked is not None:
+            logger.info("Phases backfill: %s", marked)
+    except Exception:
+        logger.exception(
+            "Experts and automations from before the phases setting were not "
+            "marked; it retries at the next start"
+        )
     resources.postgres_db.manifests_ready = True
     logger.info(
         "Managed expert defaults ready: worker=%s session=%s",
@@ -667,6 +700,7 @@ async def bind_services(resources: ApplicationResources) -> None:
             audit_reader=resources.audit_reader,
             usage_ledger=resources.usage_ledger,
             vector_db=resources.vector_db,
+            completion_commands_enabled=resources.settings.completion_commands_enabled,
         )
     )
     # Unified feed: bind (category, action) handlers and source loaders.
@@ -737,7 +771,9 @@ async def stop_application(
     6. protected-cloud engages and cloud stages (``cloud_task_registry``),
        then "Connect your cloud" flows (``cloud_root_connect_flows``);
     7. background project repairs (``project_repair_state``);
-    8. provider mints still running (C5,
+    8. job naming calls (``job_naming_tasks``); a cancelled call wrote nothing
+       and the job keeps its task text as its name;
+    9. provider mints still running (C5,
        ``connector_minted_credentials.settle_background_mints``), waited for
        a bounded time so what a provider minted is recorded for its revoke.
 
@@ -789,6 +825,7 @@ async def stop_application(
             lambda: resources.cloud_root_connect_flows.drain(),
         ),
         ("background project repairs", lambda: resources.project_repair_state.drain()),
+        ("job naming calls", lambda: resources.job_naming_tasks.drain()),
         (
             "provider mints",
             lambda: connector_minted_credentials.settle_background_mints(
@@ -855,6 +892,7 @@ async def lifespan(app: FastAPI):
     # with no consumer is an active misconfiguration that won't self-heal —
     # the legacy code path silently fell through to api.openai.com with
     # `not-needed` (the bug captured in knowledge-base/knowledge/llm_routing_issues.md).
+    # Design: knowledge-base/knowledge/features/models_yaml_removal.md.
     if os.getenv("LLM_BASE_URL"):
         logger.error(
             "LLM_BASE_URL is set but no longer honoured. Self-hosted models "
@@ -862,7 +900,7 @@ async def lifespan(app: FastAPI):
             "+ Admin → Models (catalog row) or via "
             "helm.llm.seed.systemEndpoints[]. Unset LLM_BASE_URL and seed "
             "the endpoint in helm to migrate. See "
-            "knowledge-base/knowledge/features/models_yaml_removal.md."
+            "https://docs.superhuman-remote-worker.com/models/."
         )
         sys.exit(1)
 

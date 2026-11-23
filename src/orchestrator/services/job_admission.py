@@ -7,6 +7,8 @@ credentials, provisioning and lifecycle. HTTP errors and row redaction remain
 the compatibility contract for existing callers.
 """
 
+import asyncio
+import copy
 from dataclasses import dataclass, replace
 import logging
 from typing import Any, Awaitable, Callable
@@ -61,9 +63,162 @@ from orchestrator.services.live.admission import (
     prepare_live_session,
     refuse_session_contradictions,
 )
+from shared.job_phases import (
+    PHASES_KEY,
+    is_phases_value,
+    normalize_phases,
+    plans_in_phases,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+def admit_job_phases(command: JobCreate) -> None:
+    """Check the job's ``phases`` setting and fold the request field into ``config_override``.
+
+    The setting is an ordinary config key (``config_override.phases``), so the
+    resolver freezes it with the rest of the job's configuration. The typed
+    ``phases`` field is written there before the config stage reads the
+    override; a different value already in the override is refused (400), as
+    is a value that is neither true nor false. A null value there means "what
+    the configuration says" and is dropped. A live-session job always plans
+    in phases (it starts in a tactical phase, where ``job_complete`` is
+    refused), so an explicit ``false`` on one is refused (422).
+    """
+    override = command.config_override
+    requested: bool | None = None
+    if isinstance(override, dict) and PHASES_KEY in override:
+        if override[PHASES_KEY] in (None, ""):
+            # Null means "what the configuration says". Left in the override
+            # it would delete the expert's own value at the merge.
+            override = {k: v for k, v in override.items() if k != PHASES_KEY}
+        else:
+            try:
+                requested = normalize_phases(override[PHASES_KEY])
+            except ValueError as exc:
+                raise HTTPException(400, f"config_override.{exc}") from None
+            override = {**override, PHASES_KEY: requested}
+        command.config_override = override
+    if command.phases is not None:
+        if requested is not None and requested != command.phases:
+            raise HTTPException(
+                400,
+                f"phases is {command.phases!r} but config_override.phases is "
+                f"{requested!r}; state it once",
+            )
+        command.config_override = {
+            **(override if isinstance(override, dict) else {}),
+            PHASES_KEY: command.phases,
+        }
+        requested = command.phases
+    if requested is False and command.live_session:
+        raise HTTPException(
+            422,
+            "A live-session job always plans in phases: it starts in a "
+            "tactical phase and finishes in a strategic one. Leave phases "
+            "unset or set it to true.",
+        )
+
+
+async def stamp_job_phases(
+    *,
+    command: JobCreate,
+    config_name: str | None,
+    expert_row: dict[str, Any] | None,
+    config_override: dict[str, Any] | None,
+    harness_image: Any,
+    expert_id: str | None = None,
+    load_expert: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None,
+) -> dict[str, Any] | None:
+    """Return ``config_override`` with the job's effective ``phases`` on it.
+
+    The value is decided once, when the job is created: the job's own
+    override, else the project default merged under it, else the expert, else
+    the framework's default. A later edit of the expert does not change a job
+    that exists, and the job list can show the value without resolving the
+    expert. A live-session job always plans in phases. A job on a custom
+    harness image runs its own loop and gets no value. When the expert's
+    configuration does not resolve here the override is returned unchanged:
+    dispatch resolves it again and reports that error where it belongs.
+    """
+    if harness_image is not None:
+        return config_override
+    needs_expert = not command.live_session and not is_phases_value(
+        (config_override or {}).get(PHASES_KEY)
+    )
+    if needs_expert and expert_row is None and expert_id and load_expert is not None:
+        # A stored expert is named by id here; its row is read at dispatch.
+        try:
+            expert_row = await load_expert(str(expert_id))
+        except Exception as exc:
+            logger.warning(
+                "Admission: expert %s could not be read for the job's phases "
+                "setting (%s: %s); the job carries none",
+                expert_id,
+                type(exc).__name__,
+                exc,
+            )
+            return config_override
+        if expert_row is None:
+            logger.warning(
+                "Admission: expert %s was not found for the job's phases "
+                "setting; the job carries none",
+                expert_id,
+            )
+            return config_override
+    return await resolved_phases_override(
+        live_session=bool(command.live_session),
+        config_name=config_name,
+        expert_row=expert_row,
+        config_override=config_override,
+    )
+
+
+async def resolved_phases_override(
+    *,
+    live_session: bool,
+    config_name: str | None,
+    expert_row: dict[str, Any] | None,
+    config_override: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """``config_override`` with the effective ``phases`` of a job on SRW's own worker.
+
+    Shared by REST admission (:func:`stamp_job_phases`) and manifest admission
+    (``manifest_execution``), so a job states its value however it was created.
+    """
+    override = dict(config_override or {})
+    if live_session:
+        override[PHASES_KEY] = True
+        return override
+    if is_phases_value(override.get(PHASES_KEY)):
+        override[PHASES_KEY] = normalize_phases(override[PHASES_KEY])
+        return override
+
+    from orchestrator.services.config_resolver import resolve_config
+    from shared.runtime.core.loader import canonical_config_name
+
+    try:
+        blob = await asyncio.to_thread(
+            resolve_config,
+            base_config_name=canonical_config_name(config_name or "worker_base"),
+            expert_row=copy.deepcopy(expert_row) if expert_row else None,
+            request_override=copy.deepcopy(config_override)
+            if config_override
+            else None,
+            expert_type="worker",
+            db_refs={},
+        )
+    except Exception as exc:
+        logger.warning(
+            "Admission: the job's phases setting could not be resolved (%s: %s); "
+            "the job carries none",
+            type(exc).__name__,
+            exc,
+        )
+        return config_override
+    override[PHASES_KEY] = plans_in_phases(blob.get("agent"))
+    return override
 
 
 @dataclass(frozen=True)
@@ -81,6 +236,10 @@ class JobAdmissionDependencies:
     # A live-session job's session (live_session_jobs §4.2); None where the
     # composition offers no live connectors (a live job is then refused).
     live: Callable[[], LiveAdmissionDependencies] | None = None
+    # Reads a stored expert by id, for the job's effective `phases`
+    # (stamp_job_phases). A job that names a stored expert carries only the id
+    # through admission; without this the value falls back to the base's.
+    load_expert: Callable[[str], Awaitable[dict[str, Any] | None]] | None = None
 
 
 async def admit_job(
@@ -96,6 +255,8 @@ async def admit_job(
     command.config_override = dependencies.validate_tool_overrides(
         command.config_override
     )
+    # Before the config stage reads config_override (prepare_job_admission_config).
+    admit_job_phases(command)
     refuse_connector_selector_conflict(command)
     if refuse_session_contradictions(command) is not None and dependencies.live is None:
         raise HTTPException(422, "Live-session jobs are not available here")
@@ -143,6 +304,20 @@ async def admit_job(
                 ),
                 pending_harness_expert=None,
             )
+        # After the expert is final (a ticket's pin or a work default can
+        # replace it) and before anything reads the override for this job.
+        officer = replace(
+            officer,
+            config_override=await stamp_job_phases(
+                command=command,
+                config_name=config.config_name,
+                expert_row=config.expert_row,
+                config_override=officer.config_override,
+                harness_image=config.harness_image,
+                expert_id=config.expert_id,
+                load_expert=dependencies.load_expert,
+            ),
+        )
         workspace_selection = config.workspace_selection
         if workspace_selection and workspace_selection.get("project_revision"):
             from orchestrator.services.manifest_workspace_selection import (

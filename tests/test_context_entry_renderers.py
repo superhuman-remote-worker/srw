@@ -169,6 +169,19 @@ class TestGuidanceRenderer:
             "\n\n- Focus. (officer, t0)"
         )
 
+    def test_a_job_without_phases_is_not_told_about_a_plan(self):
+        # A job that is not offered next_phase_todos has no plan, no todo
+        # steps and nothing to re-plan.
+        rendered = format_supervisor_guidance(self.ENTRIES, phased=False)
+        assert rendered == (
+            "[SUPERVISOR GUIDANCE] Mid-run guidance from your supervisor. "
+            "Your task remains in force — fold this guidance into the work in "
+            "progress."
+            "\n\n- Focus. (officer, t0)"
+        )
+        for word in ("plan", "todos", "re-planning"):
+            assert word not in rendered
+
     def test_nothing_to_render_is_empty(self):
         assert format_supervisor_guidance([]) == ""
 

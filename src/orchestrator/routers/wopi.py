@@ -21,6 +21,7 @@ from orchestrator.services.canvas_files import (
     ThreadWorkspaceFileGateway,
     ValidatedCanvasFile,
     acquire_canvas_response_lease,
+    vm_canvas_write_authority,
 )
 from orchestrator.services.canvas_office import (
     CanvasOfficeError,
@@ -394,14 +395,17 @@ async def put_file(
             )
             return saved_file.source_version
 
-        mutation = await _get_canvas_service(db).edit_file(
-            record.thread_id,
-            expected_presentation_revision=record.presentation_revision,
-            expected_source_fingerprint=record.source_fingerprint,
-            expected_source_version=record.source_version,
-            expected_thread_user_id=str(access.thread.get("user_id") or ""),
-            writer=write_locked,
-        )
+        # A VM save holds the durable VM write lease (a no-op for a container)
+        # outside the Canvas and thread row locks edit_file takes.
+        async with vm_canvas_write_authority(access.thread, store=db):
+            mutation = await _get_canvas_service(db).edit_file(
+                record.thread_id,
+                expected_presentation_revision=record.presentation_revision,
+                expected_source_fingerprint=record.source_fingerprint,
+                expected_source_version=record.source_version,
+                expected_thread_user_id=str(access.thread.get("user_id") or ""),
+                writer=write_locked,
+            )
         assert mutation.record is not None
         assert saved_file is not None
         modified = saved_file.last_modified or mutation.record.updated_at

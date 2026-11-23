@@ -217,16 +217,26 @@ def test_every_type_has_a_driver_of_its_own():
 
 def test_only_ssh_key_connectors_deliver_workspace_ssh_identities():
     from orchestrator.services.connector_drivers.base import (
-        SupportsTestOverrides,
         SupportsWorkspaceSshIdentity,
     )
 
-    for capability in (SupportsTestOverrides, SupportsWorkspaceSshIdentity):
-        assert {
-            type_id
-            for type_id in _REGISTRY.type_ids()
-            if isinstance(_REGISTRY.for_type(type_id), capability)
-        } == {"repository", "ssh_key"}
+    assert {
+        type_id
+        for type_id in _REGISTRY.type_ids()
+        if isinstance(_REGISTRY.for_type(type_id), SupportsWorkspaceSshIdentity)
+    } == {"repository", "ssh_key"}
+
+
+def test_ssh_and_mcp_connectors_test_the_form_as_edited():
+    """Test reaches an SSH endpoint, or an MCP server and its token, as the
+    connector form edits them, before Save."""
+    from orchestrator.services.connector_drivers.base import SupportsTestOverrides
+
+    assert {
+        type_id
+        for type_id in _REGISTRY.type_ids()
+        if isinstance(_REGISTRY.for_type(type_id), SupportsTestOverrides)
+    } == {"repository", "ssh_key", "mcp"}
 
 
 def test_only_the_knowledge_base_has_index_capabilities():

@@ -14,7 +14,7 @@ metadata:
 
       (plan.md, archive/, memories, knowledge base). Writes to the project knowledge
 
-      base via kb_write/kb_update. See knowledge-base/knowledge/features/project_knowledge_base.md.'
+      base via kb_write/kb_update.'
     srw.io/icon: menu_book
     srw.io/color: '#a6e3a1'
     srw.io/expert-type: worker
@@ -36,11 +36,14 @@ spec:
 
         agent_id: curator
         display_name: Curator
+        # This expert plans in phases (shared/job_phases.py; false by default).
+        # The curator's instructions follow the phased procedure.
+        phases: true
         description: |
           Knowledge extraction specialist. Runs as a persistent subjob in parallel
           with working agents, extracting structured knowledge notes from job artifacts
           (plan.md, archive/, memories, knowledge base). Writes to the project knowledge
-          base via kb_write/kb_update. See knowledge-base/knowledge/features/project_knowledge_base.md.
+          base via kb_write/kb_update.
         icon: menu_book
         color: "#a6e3a1"
         tags:

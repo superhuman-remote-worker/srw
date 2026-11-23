@@ -12,11 +12,16 @@ Validates:
 - Archiving to the Postgres audit store via LLMArchiver
 - Sync wrapper bridging async to sync
 """
+# ruff: noqa: F811  (the imported fixture is requested by name as a test argument)
 
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from shared.tls_pinning import UNREADABLE_PIN, CertificateChangedError
+from tests.tls_pin_fixtures import caused_by, pin_of
+from tests.tls_pin_fixtures import tls_certs, tls_server  # noqa: F401
 
 from agent.services.audio_helper import (
     AudioHelper,
@@ -874,3 +879,86 @@ class TestChunkedTranscription:
         mock_rmtree.assert_called_once_with(str(chunk_dir), ignore_errors=True)
         # Chunk failure logged, concatenated result includes failure marker
         assert "chunk 1 transcription failed" in result
+
+
+# =============================================================================
+# Certificate pinning (A6)
+# =============================================================================
+
+
+_TRANSCRIPT = {("POST", "/v1/audio/transcriptions"): {"text": "hello there"}}
+
+
+class TestWhisperPin:
+    @pytest.fixture(autouse=True)
+    def _env(self, mock_env, monkeypatch):
+        monkeypatch.delenv("WHISPER_TLS_PINNED_CERT", raising=False)
+
+    @pytest.mark.asyncio
+    async def test_transcribes_through_the_pin(self, monkeypatch, tmp_audio, tls_certs):
+        with tls_server(tls_certs.leaf, tls_certs.leaf_key, _TRANSCRIPT) as server:
+            monkeypatch.setenv("WHISPER_BASE_URL", server.url)
+            monkeypatch.setenv("WHISPER_API_KEY", "k")
+            monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
+            helper = AudioHelper()
+            text = await helper.transcribe(tmp_audio)
+            await helper.client.close()
+        assert text == "hello there"
+
+    @pytest.mark.asyncio
+    async def test_swapped_certificate_sends_nothing(
+        self, monkeypatch, tmp_audio, tls_certs
+    ):
+        with tls_server(tls_certs.swap, tls_certs.swap_key, _TRANSCRIPT) as server:
+            monkeypatch.setenv("WHISPER_BASE_URL", server.url)
+            monkeypatch.setenv("WHISPER_API_KEY", "secret")
+            monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
+            helper = AudioHelper()
+            with pytest.raises(Exception) as exc:
+                with open(tmp_audio, "rb") as f:
+                    await helper.client.audio.transcriptions.create(
+                        file=f, model="whisper-1"
+                    )
+            text = await helper.transcribe(tmp_audio)
+            await helper.client.close()
+        assert caused_by(exc.value, CertificateChangedError)
+        assert server.requests == []
+        assert text.startswith("[Error") and "TLS certificate changed" in text
+        assert "An admin must re-trust it in Admin" in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [UNREADABLE_PIN, "not-base64!"])
+    async def test_a_broken_pin_makes_transcription_unavailable(
+        self, monkeypatch, tmp_audio, value
+    ):
+        monkeypatch.setenv("WHISPER_BASE_URL", "https://stt.example/v1")
+        monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", value)
+        with patch("agent.services.audio_helper.AsyncOpenAI") as cls:
+            helper = AudioHelper()
+            text = await helper.transcribe(tmp_audio)
+        cls.assert_not_called()
+        assert text.startswith("[Error") and "WHISPER_TLS_PINNED_CERT" in text
+
+    @pytest.mark.asyncio
+    async def test_a_pin_on_an_http_url_is_unavailable(
+        self, monkeypatch, tmp_audio, tls_certs
+    ):
+        monkeypatch.setenv("WHISPER_BASE_URL", "http://stt.example/v1")
+        monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
+        with patch("agent.services.audio_helper.AsyncOpenAI") as cls:
+            text = await AudioHelper().transcribe(tmp_audio)
+        cls.assert_not_called()
+        assert text.startswith("[Error") and "https" in text
+
+    def test_singleton_rebuilds_when_only_the_pin_changes(
+        self, monkeypatch, tls_certs, mock_openai_client
+    ):
+        import agent.services.audio_helper as mod
+
+        monkeypatch.setattr(mod, "_audio_helper", None)
+        monkeypatch.setenv("WHISPER_BASE_URL", "https://stt.example/v1")
+        monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", pin_of(tls_certs.leaf).wire)
+        first = mod.get_audio_helper()
+        assert mod.get_audio_helper() is first
+        monkeypatch.setenv("WHISPER_TLS_PINNED_CERT", pin_of(tls_certs.swap).wire)
+        assert mod.get_audio_helper() is not first

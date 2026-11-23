@@ -87,6 +87,19 @@ release.
    The [chart guide](../helm/README.md#upgrade) covers upgrade details and
    one-time cutovers.
 
+## The srw command-line client
+
+[`srw`](cli.md) is released with the platform, under the same version. Use
+the `srw` of your installation's MINOR line: `srw version` shows both
+versions and warns when they differ.
+
+Before 1.0 the client makes the same promise as the platform and no more. A
+command or flag that is removed or renamed counts as a change that needs
+operator action, so it makes the release a MINOR and appears in the release
+notes. Scripts may rely on the exit codes, on `-o json` and `-o name`, and on
+the shape of an error. Tables and other text output are for people and can
+change in any release.
+
 ## What 1.0 will mean
 
 Version 1.0 will come with a written stability promise, which does not exist

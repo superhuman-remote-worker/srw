@@ -347,6 +347,12 @@ def register_notification_actions(
             return True
         return str(row["status"]) != "pending"
 
+    @register_source_probe("completion_command")
+    async def _probe_completion_command(db: Any, command_id: str) -> bool:
+        # A parked completion report waits for an administrator; once it is
+        # unparked or force-resolved nobody is waiting on a person any more.
+        return await db.completion_command_state(command_id) != "parked"
+
     @register_source_probe("thread")
     async def _probe_thread(db: Any, thread_id: str) -> bool:
         # An officer question has no state machine to consult; only an
@@ -398,6 +404,10 @@ def register_notification_actions(
     @register_action("user_registered", "open")
     async def _open_admin_users(ctx: ActionContext) -> ActionResult:
         return _navigate("/admin/users")
+
+    @register_action("chat_executors_unavailable", "open")
+    async def _open_admin_capacity(ctx: ActionContext) -> ActionResult:
+        return _navigate("/admin/capacity")
 
     @register_action("ssh_key_added", "open")
     async def _open_ssh_keys(ctx: ActionContext) -> ActionResult:

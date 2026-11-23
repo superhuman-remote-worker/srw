@@ -365,3 +365,11 @@ class TestRegistries:
         finally:
             cat._ACTION_HANDLERS.clear()
             cat._ACTION_HANDLERS.update(saved)
+
+
+def test_chat_executors_unavailable_category():
+    spec = cat.category_spec("chat_executors_unavailable")
+    assert spec.severity == "high"
+    assert [(a.type, a.label_key) for a in spec.actions] == [
+        ("open", "notifications.actions.openAdminCapacity")
+    ]

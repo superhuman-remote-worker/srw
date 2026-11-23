@@ -45,11 +45,13 @@ invocation by a main factory — never captured at import (R1.B05 §P1).
 from __future__ import annotations
 
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from orchestrator.security.config_redaction import strip_in_flight_only_keys
 from orchestrator.services.model_availability import (
+    EndpointPinUnreadable,
     ModelUnavailable,
     UnavailableModel,
     endpoint_key_unreadable,
@@ -75,6 +77,12 @@ from shared.runtime.core.transport_resolution import (
     same_endpoint,
 )
 from shared.subscription_routing import subscription_request_headers
+from shared.tls_pinning import (
+    TLS_PINNED_CERT_SUFFIX,
+    UNREADABLE_PIN,
+    pin_applies,
+    read_stored_pin,
+)
 
 
 @dataclass(frozen=True)
@@ -128,6 +136,64 @@ def provider_of_model(model: str) -> str | None:
         return "google"
     if name.startswith(("gpt-", "o1", "o3", "o4", "text-embedding-")):
         return "openai"
+    return None
+
+
+def endpoint_tls_pin_wire(endpoint_row: Mapping[str, Any]) -> str | None:
+    """The endpoint row's pinned certificate as it travels next to the row's
+    base URL (``TlsPin.wire``: base64 DER on one line), or ``None``.
+
+    ``None`` when the row has no pin, and when its base URL is not
+    ``https://``: a pin applies only to TLS, and an admin may edit a pinned
+    endpoint's URL to ``http://`` (an edit keeps the pin, decision 4). A stored
+    pin that can't be read raises ``ValueError``: it is never treated as no
+    pin. "Can't be read" is :func:`shared.tls_pinning.read_stored_pin`'s, the
+    same reading the Test probe uses (``services/endpoint_tls.py``).
+    """
+    if not pin_applies(endpoint_row.get("base_url")):
+        return None
+    pin = read_stored_pin(
+        endpoint_row.get("tls_pin_cert"), endpoint_row.get("tls_pin_sha256")
+    )
+    return pin.wire if pin is not None else None
+
+
+def refused_endpoint_pin(endpoint_row: Mapping[str, Any] | None) -> str | None:
+    """The pin slot of a slot whose endpoint row is refused.
+
+    A refused row writes no base URL or key, but one may survive in a stored
+    config (redaction keeps base URLs), so the pin slot still carries the
+    row's pin (:func:`endpoint_tls_pin_wire`), or ``tls_pinning.UNREADABLE_PIN``
+    for a pin that can't be read, which the agent refuses. ``None`` when the
+    row has no pin that applies.
+    """
+    if not endpoint_row:
+        return None
+    try:
+        return endpoint_tls_pin_wire(endpoint_row)
+    except ValueError:
+        return UNREADABLE_PIN
+
+
+async def kept_url_pin(store: Any, url: str | None) -> str | None:
+    """The pin a base URL no endpoint row resolved in this dispatch keeps.
+
+    Such a URL (left in a stored block by an earlier resolution, or a
+    caller's) is still a pinned endpoint's when a system endpoint on its
+    origin stores a pin: it never goes out without that pin, or
+    ``tls_pinning.UNREADABLE_PIN`` for one that can't be read. ``None``
+    otherwise, and for a URL a pin can't apply to. Pins are stored on system
+    endpoints only.
+    """
+    if not pin_applies(url):
+        return None
+    for row in await store.list_system_llm_endpoints():
+        if not (row.get("tls_pin_sha256") or row.get("tls_pin_cert")):
+            continue
+        if same_endpoint(row.get("base_url"), url):
+            pin = refused_endpoint_pin(row)
+            if pin:
+                return pin
     return None
 
 
@@ -269,7 +335,16 @@ async def inject_model_credentials(
     stored key did not decrypt is refused with
     ``model_availability.EndpointKeyUnreadable`` (and an ERROR) rather than
     sent keyless; a row registered without a key (``api_key_stored`` false)
-    gets its ``base_url`` alone, as before.
+    gets its ``base_url`` alone, as before. The row's pinned TLS certificate
+    travels next to its ``base_url`` as ``tls_pinned_cert``
+    (:func:`endpoint_tls_pin_wire`); one that can't be read refuses the slot
+    with ``model_availability.EndpointPinUnreadable``. A refused row writes no
+    base URL or key, but its pin slot still carries the row's pin, or
+    ``tls_pinning.UNREADABLE_PIN`` (:func:`refused_endpoint_pin`), as the flat
+    env does: a base URL kept in a stored section never goes out without its
+    pin. Every other path that resolves the model writes
+    ``tls_pinned_cert: None``; a model the registry can't resolve is refused
+    before that and leaves the section untouched.
 
     For system-anchored catalog rows: injects the row's provider key from
     ``resolved_keys`` (the user > project > env resolution chain).
@@ -356,6 +431,10 @@ async def inject_model_credentials(
     section["client_protocol"] = (
         effective_client_protocol(meta) if meta is not None else None
     )
+    # The endpoint's pinned TLS certificate. Only the endpoint branch below
+    # writes one, next to the row's base_url; `None` clears a previous model's
+    # pin on a session hot swap, like `served_model` above. Never a caller's.
+    section["tls_pinned_cert"] = None
 
     if transport_complete and not (meta is not None and meta.endpoint_id):
         return None
@@ -380,10 +459,34 @@ async def inject_model_credentials(
                 unreadable.endpoint,
                 meta.endpoint_id,
             )
+            # A base URL kept in a stored section keeps the row's pin.
+            section["tls_pinned_cert"] = refused_endpoint_pin(endpoint_row)
             return unreadable
         if endpoint_row:
+            try:
+                pin_wire = endpoint_tls_pin_wire(endpoint_row)
+            except ValueError as exc:
+                # Sent without its pin, the base URL would be verified against
+                # the CA list instead: a pin that can't be read is never
+                # treated as no pin. Refuse, naming the endpoint; a base URL
+                # kept in a stored section gets the marker the agent refuses.
+                section["tls_pinned_cert"] = UNREADABLE_PIN
+                dependencies.logger.error(
+                    "Dispatch: %s model %r refused: endpoint %r (%s) has a "
+                    "pinned TLS certificate that can't be read (%s); trust its "
+                    "certificate again or remove the pin in Admin → Models.",
+                    capability,
+                    model_id,
+                    endpoint_row.get("label"),
+                    meta.endpoint_id,
+                    exc,
+                )
+                return EndpointPinUnreadable(
+                    endpoint_row.get("label") or meta.endpoint_id
+                )
             if endpoint_row.get("base_url"):
                 section["base_url"] = endpoint_row["base_url"]
+                section["tls_pinned_cert"] = pin_wire
             if endpoint_row.get("api_key"):
                 section["api_key"] = endpoint_row["api_key"]
         return None
@@ -440,8 +543,20 @@ async def inject_env_key_credentials(
     ``resolved_keys[provider]`` (setdefault) together with the provider's own
     OpenAI-compatible base URL (``transport_resolution.provider_base_url``).
     The key is withheld when an endpoint name for the prefix is already set to
-    another host, or when the provider has no such API.
+    another host, or when the provider has no such API; such a kept URL that
+    is a pinned endpoint's keeps that endpoint's pin (:func:`kept_url_pin`).
+
+    ``{PREFIX}_TLS_PINNED_CERT`` is popped on entry and written only by the
+    endpoint branch, next to the row's base URL (:func:`endpoint_tls_pin_wire`):
+    a caller's BYO pair and a provider-key row never carry a pin. A row whose
+    pin can't be read gets no base URL or key, like one whose key did not
+    decrypt, and its pin is ``tls_pinning.UNREADABLE_PIN``. A row whose key
+    did not decrypt still writes its pin (or that marker). Either way a base
+    URL that survived in a stored override never goes out without its pin;
+    ``TlsPin.from_env`` refuses the marker.
     """
+    pin_name = f"{prefix}_{TLS_PINNED_CERT_SUFFIX}"
+    env_keys.pop(pin_name, None)
     env_keys.setdefault(f"{prefix}_MODEL", model_id)
 
     # A complete caller-supplied pair (an endpoint name AND its key, e.g. a
@@ -493,6 +608,17 @@ async def inject_env_key_credentials(
                 # know — the citation client refuses a custom host with no key
                 # of its own — so every flat-env slot reaches the endpoint.
                 api_key = NO_KEY_SENTINEL
+            # A pinned endpoint's base URL never travels without its pin. A
+            # refusal below writes no base URL or key from the row, but one may
+            # survive from a stored override (redaction keeps base URLs), so
+            # the pin slot still carries the row's pin, or, for a pin that
+            # can't be read, the marker the agent refuses. Popping the URL
+            # instead would send the client to its default host.
+            try:
+                pin_wire = endpoint_tls_pin_wire(endpoint_row)
+                pin_error = None
+            except ValueError as exc:
+                pin_wire, pin_error = UNREADABLE_PIN, exc
             if base_url and not api_key:
                 # The endpoint is configured but its stored key didn't decrypt
                 # (get_user_llm_endpoint -> _decrypt_stored already logged the
@@ -500,6 +626,8 @@ async def inject_env_key_credentials(
                 # half-credential (base_url without api_key) that silently
                 # degrades the agent to a keyless 'local' provider — the failure
                 # mode in knowledge-history/done/embedding_key_missing_silently_disables_memory_and_kb.md.
+                if pin_wire:
+                    env_keys[pin_name] = pin_wire
                 dependencies.logger.error(
                     "Dispatch: %s endpoint %s resolved a base_url but no usable "
                     "api_key (decrypt failed or empty) — not injecting "
@@ -509,15 +637,33 @@ async def inject_env_key_credentials(
                     prefix,
                 )
                 return
+            if pin_error is not None:
+                # A pin that can't be read is never treated as no pin: like a
+                # key that did not decrypt, the slot gets no transport from
+                # the row, and its pin slot carries the marker.
+                env_keys[pin_name] = UNREADABLE_PIN
+                dependencies.logger.error(
+                    "Dispatch: %s endpoint %s has a pinned TLS certificate that "
+                    "can't be read (%s) — not injecting %s_BASE_URL/_API_KEY; "
+                    "trust its certificate again or remove the pin in Admin → "
+                    "Models.",
+                    prefix,
+                    meta.endpoint_id,
+                    pin_error,
+                    prefix,
+                )
+                return
             # The endpoint row is authoritative for its own transport, exactly
             # like the model-section branch: overwrite, never setdefault, so a
             # pre-set endpoint name (under any alias a reader consults) cannot
-            # survive next to this row's key.
+            # survive next to this row's key. Its pin travels with it.
             if base_url:
                 names = env_endpoint_names(prefix)
                 for alias in names[1:]:
                     env_keys.pop(alias, None)
                 env_keys[names[0]] = base_url
+                if pin_wire:
+                    env_keys[pin_name] = pin_wire
             if api_key:
                 env_keys[f"{prefix}_API_KEY"] = api_key
         return
@@ -549,6 +695,11 @@ async def inject_env_key_credentials(
                 ", ".join(foreign),
                 provider,
             )
+            # The URL the agent will call stays; when it is a pinned
+            # endpoint's (an earlier resolution's), it keeps that pin.
+            kept = next(env_keys[name] for name in names if env_keys.get(name))
+            if kept_pin := await kept_url_pin(dependencies.store, kept):
+                env_keys[pin_name] = kept_pin
         elif canonical is None:
             dependencies.logger.error(
                 "Dispatch: %s model %r routes on the %s provider key, but that "
@@ -617,6 +768,22 @@ async def inject_search_credentials(
             )
             continue
 
+        if creds.tls_pin is not None:
+            # The search and fetch adapters build their own clients and do not
+            # verify a pinned certificate; sending them with normal CA trust
+            # would let a server that now presents a publicly valid
+            # certificate pass for the pinned one. Fail closed.
+            research.pop(capability, None)
+            dependencies.logger.error(
+                "Dispatch: %s model %r is on an endpoint with a pinned TLS "
+                "certificate; search/fetch adapters don't support pinned "
+                "certificates yet, so %s is disabled for it",
+                capability,
+                creds.model,
+                capability,
+            )
+            continue
+
         resolved[capability] = creds
         research[capability] = {
             "provider": creds.provider,
@@ -661,6 +828,14 @@ async def inject_search_credentials(
         or "search" not in fallback_ops
     ):
         research.pop("search_fallback", None)
+    elif fallback.tls_pin is not None:
+        research.pop("search_fallback", None)
+        dependencies.logger.error(
+            "Dispatch: search fallback model %r is on an endpoint with a pinned "
+            "TLS certificate; search/fetch adapters don't support pinned "
+            "certificates yet, so the fallback is disabled",
+            fallback.model,
+        )
     else:
         research["search_fallback"] = {
             "provider": fallback.provider,
@@ -676,6 +851,130 @@ async def inject_search_credentials(
 
     if not research:
         config_override.pop("research", None)
+    return config_override
+
+
+#: Image adapters the agent's generate_image tool implements.
+IMAGE_ADAPTERS = ("openai-images", "gemini")
+#: Default image operations when a catalog row names none.
+DEFAULT_IMAGE_OPS = ("generate", "edit")
+#: Provider ids of system-anchored rows mapped to their image adapter.
+_IMAGE_ADAPTER_BY_PROVIDER = {
+    "openai": "openai-images",
+    "openai-images": "openai-images",
+    "google": "gemini",
+    "gemini": "gemini",
+}
+
+
+def image_adapter_for(provider: str | None) -> str | None:
+    """The generate_image adapter a catalog provider id maps to, or None."""
+    if not provider:
+        return None
+    return _IMAGE_ADAPTER_BY_PROVIDER.get(provider.strip().lower())
+
+
+async def _image_generation_settings(
+    dependencies: DispatchCredentialDependencies,
+) -> dict[str, int]:
+    """The installation's image settings; defaults when unreadable."""
+    from shared.image_generation import SYSTEM_SETTING_KEY, normalize_settings
+
+    try:
+        row = await dependencies.store.get_system_setting(SYSTEM_SETTING_KEY)
+    except Exception:
+        row = None
+    return normalize_settings(row.get("value") if isinstance(row, dict) else None)
+
+
+async def inject_image_credentials(
+    config_override: dict[str, Any],
+    *,
+    user_settings: dict[str, Any],
+    user_id: str | None,
+    resolved_keys: dict[str, str],
+    dependencies: DispatchCredentialDependencies,
+) -> dict[str, Any]:
+    """Inject the pinned ``image_generation`` row as the top-level ``image`` section.
+
+    The agent's ``generate_image`` tool is built only when this section exists
+    (the ``research.*`` pattern). The capability is pin-only: without an admin
+    or user pin nothing resolves and the section is removed, so the tool never
+    appears by accident (image_generation decision D1, 2026-11-17). The key
+    stays in the per-dispatch override and is stripped before persistence by
+    ``redact_config_override`` (name-based: ``api_key``).
+    """
+
+    # Function-local on purpose: tests patch the resolver on its owner module.
+    from orchestrator.services.capability_credentials import (
+        resolve_capability_credentials,
+    )
+    from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
+
+    creds = await resolve_capability_credentials(
+        capability="image_generation",
+        user_settings=user_settings,
+        user_id=user_id,
+        resolved_keys=resolved_keys,
+        postgres_db=dependencies.store,
+    )
+    if creds is None:
+        config_override.pop("image", None)
+        return config_override
+    adapter = image_adapter_for(creds.provider)
+    if adapter is None:
+        config_override.pop("image", None)
+        dependencies.logger.warning(
+            "Dispatch: image model %r names no supported image adapter "
+            "(params_json.provider=%r; expected one of %s); generate_image is "
+            "disabled",
+            creds.model,
+            creds.provider,
+            ", ".join(IMAGE_ADAPTERS),
+        )
+        return config_override
+    ops_value = creds.params.get("ops")
+    ops = (
+        [str(op) for op in ops_value if isinstance(op, str)]
+        if isinstance(ops_value, list) and ops_value
+        else list(DEFAULT_IMAGE_OPS)
+    )
+    subscription = (
+        creds.transport_kind == SUBSCRIPTION_PROXY_TRANSPORT
+        or str(creds.params.get("billing") or "").lower() == "subscription"
+    )
+    section: dict[str, Any] = {
+        "provider": adapter,
+        "base_url": creds.base_url,
+        "api_key": creds.api_key,
+        "model": creds.wire_model,
+        "catalog_model": creds.model,
+        "ops": ops,
+        "billing": "subscription" if subscription else "api",
+        # The endpoint row's pinned certificate, in flight only (stripped by
+        # redaction like the key); written after the entry strip, so a planted
+        # value never survives. ``None`` unpinned or for a non-https URL.
+        "tls_pinned_cert": (
+            creds.tls_pin.wire
+            if creds.tls_pin is not None and pin_applies(creds.base_url)
+            else None
+        ),
+    }
+    defaults = creds.params.get("image_defaults")
+    if isinstance(defaults, dict):
+        section["defaults"] = dict(defaults)
+    # The installation's cap on paid images per job or Session (D1). The
+    # proxy lane is not counted; its quota is checked per call (D3).
+    section["max_paid_images"] = (await _image_generation_settings(dependencies))[
+        "max_paid_images"
+    ]
+    config_override["image"] = section
+    dependencies.logger.info(
+        "Dispatch: injected image provider %s (%s, %s)",
+        adapter,
+        creds.model,
+        section["billing"],
+    )
     return config_override
 
 
@@ -723,6 +1022,8 @@ async def inject_system_kb_embedding_profile(
         fallback = EmbeddingService()
         if not fallback.api_key:
             return None
+        # No KB_EMBEDDING_TLS_PINNED_CERT: this profile has no endpoint row,
+        # so no pin (the wipe on entry removed any earlier one).
         env_keys.update(
             {
                 "KB_EMBEDDING_PROVIDER": fallback.provider,
@@ -807,6 +1108,10 @@ async def inject_thread_dispatch_credentials(
     model choices.
     """
     user_settings = user_settings or {}
+    # Every pin in the dispatched config comes from an endpoint row: drop any
+    # the override brought before an injector runs (the image injector last
+    # among them), so a slot no injector touches cannot carry one.
+    strip_in_flight_only_keys(config_override)
 
     # Drop None-valued keys in the model sections before injecting. A prior
     # hot-swap persists explicit ``provider/base_url/api_key = None`` sentinels
@@ -1022,6 +1327,13 @@ async def inject_thread_dispatch_credentials(
         resolved_keys=resolved_keys,
         dependencies=dependencies,
     )
+    await inject_image_credentials(
+        config_override,
+        user_settings=user_settings,
+        user_id=user_id,
+        resolved_keys=resolved_keys,
+        dependencies=dependencies,
+    )
 
     if unavailable:
         if strict:
@@ -1036,7 +1348,9 @@ async def inject_thread_dispatch_credentials(
 __all__ = [
     "DispatchCredentialDependencies",
     "dispatch_llm_provider_fallback",
+    "endpoint_tls_pin_wire",
     "inject_env_key_credentials",
+    "inject_image_credentials",
     "inject_model_credentials",
     "inject_search_credentials",
     "inject_system_kb_embedding_profile",

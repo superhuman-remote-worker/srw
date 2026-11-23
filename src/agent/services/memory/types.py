@@ -371,6 +371,9 @@ class MemoryRuntime:
     #: The expert's agent id; the manager's own audit rows carry it (the
     #: asynchronous retrieval reports a degraded pipeline itself, D13).
     agent_type: Optional[str] = None
+    #: The knowledge scope of the ``kb_notes`` retriever: the projects whose
+    #: own knowledge base is attached to this runtime
+    #: (``attached_project_knowledge_ids``), not every project of the work.
     project_id: Optional[str] = None
     project_ids: List[str] = field(default_factory=list)
     #: Per-store-call timeout in seconds. None = unbounded (the legacy

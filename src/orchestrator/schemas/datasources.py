@@ -150,14 +150,19 @@ class DatasourceTestRequest(BaseModel):
 
     The connector form tests before it saves. For an SSH-key repository or an
     ``ssh_key`` connector, the endpoint being typed (``connection_url`` and
-    ``config``) is what Test reaches; it is validated like an update and never
-    stored. Other connector types ignore it and test the saved row.
+    ``config``) is what Test reaches. For an MCP server, the URL and the
+    ``credentials`` being typed (its transport and auth, a token included)
+    are. Either is validated like an update and never stored. Other connector
+    types ignore it and test the saved row.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     connection_url: str | None = Field(None, max_length=2048)
     config: dict[str, Any] | None = None
+    #: An MCP server's credentials as the form edits them; left out, the
+    #: saved ones are tested.
+    credentials: dict[str, Any] | None = None
 
 
 class SSHKeyGenerateRequest(BaseModel):

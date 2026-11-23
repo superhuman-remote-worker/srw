@@ -206,6 +206,28 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
                 "tool_name": "run_command",
                 "tool_args": "not-json",
             },
+            # An MCP server's question waits in the same table (0568) and
+            # rides its own list, never as a tool approval.
+            {
+                "id": "question-1",
+                "tool_call_id": "tool-10",
+                "tool_name": "mcp__civitai__generate",
+                "tool_args": "{}",
+                "kind": "question",
+                "request": json.dumps(
+                    {
+                        "server": "Civitai",
+                        "server_slug": "civitai",
+                        "datasource_id": "ds-1",
+                        "tool": "mcp__civitai__generate",
+                        "mode": "form",
+                        "message": "Spend 12 Buzz?",
+                        "schema": {"type": "object", "properties": {}},
+                        "url": None,
+                        "confirmation": {},
+                    }
+                ),
+            },
         ],
         message_count=12,
         live_turn_count=7,
@@ -265,6 +287,21 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
                 "tool": "run_command",
                 "args": {},
             },
+        ],
+        "pending_questions": [
+            {
+                "id": "tool-10",
+                "approval_id": "question-1",
+                "server": "Civitai",
+                "server_slug": "civitai",
+                "tool": "mcp__civitai__generate",
+                "mode": "form",
+                "message": "Spend 12 Buzz?",
+                "schema": {"type": "object", "properties": {}},
+                "url": None,
+                "confirmation": {},
+                "field_order": None,
+            }
         ],
         "tasks": [],
         # Explicit null, not an omitted key: presence is authoritative on the

@@ -19,7 +19,11 @@ These are default instructions for design tasks. Follow them unless the user pro
 - Identify reusable components — your design should leverage these, not reinvent them
 - If the app is running, use `browser_navigate` then `browser_screenshot` to see the actual rendered UI
 
+{% if has_tool("next_phase_todos") -%}
 Record findings in `reference/pattern_audit.md`:
+{% else -%}
+Keep these findings at hand for the mockups (write them to `reference/pattern_audit.md` only if the task asks for an audit):
+{% endif -%}
 - Design tokens in use (CSS custom properties)
 - Common layout patterns (panel-based, split-view, tab-based)
 - Component conventions (how buttons look, how lists are structured, how errors are shown)
@@ -36,16 +40,21 @@ Record findings in `reference/pattern_audit.md`:
 - Plan the responsive behavior: what changes between mobile (< 768px) and desktop
 - Plan the interaction model: clicks, hovers, keyboard shortcuts, transitions
 
+{% if has_tool("next_phase_todos") -%}
 Write the plan to `plan.md`:
 - Feature overview (one paragraph)
 - Screen/component inventory (what to mock up)
 - Reuse map (existing component → where it's used in the new feature)
 - Mockup priority order (which screens to design first)
 
+{% endif -%}
 ## 4. Create Mockups
 
+{% if has_tool("next_phase_todos") -%}
 Work through the mockup list from plan.md, one per todo.
-
+{% else -%}
+Work through the screens and components you listed, one mockup at a time.
+{% endif %}
 ### Mockup Requirements
 
 Every mockup file must:
@@ -125,7 +134,11 @@ One paragraph describing the feature and its purpose.
 ## 6. Final Review
 
 - Verify every mockup uses design system tokens (no hardcoded colors)
+{% if has_tool("next_phase_todos") -%}
 - Verify every screen from the plan has a mockup
+{% else -%}
+- Verify every screen you listed has a mockup
+{% endif -%}
 - Verify the design spec covers all components and interactions
 - Verify responsive behavior is documented
 - Cross-check against the original feature requirements — does the design address everything?

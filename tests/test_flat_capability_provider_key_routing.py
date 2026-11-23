@@ -100,6 +100,9 @@ class _Store:
     async def resolve_default_for_capability(self, capability):
         return self.defaults.get(capability)
 
+    async def list_system_llm_endpoints(self):
+        return []  # no pinned endpoint: a kept URL carries no pin
+
 
 def _resolver():
     async def resolve(model_id, user_id=None, capability="chat"):
@@ -367,7 +370,7 @@ class TestAgentClients:
 
         env_keys = await delivered_env()
         cfg = SimpleNamespace(model=None, base_url=None, api_key=None)
-        model, base_url, api_key = resolve_reranker_transport(cfg, env=env_keys)
+        model, base_url, api_key, _ = resolve_reranker_transport(cfg, env=env_keys)
 
         posted = {}
 

@@ -703,3 +703,178 @@ tasks:
       - Kostenlose Stornierung ist bis 5. Maerz 2027, 18:00 Uhr moeglich.
       - Rueckfragen: Telefon 06221 555 210 oder Antwort auf diese E-Mail.
     required_deliverables: [output/email.md]
+
+  # -------------------------------------------------------------------------
+  # W* — office deliverables (2026-11-11): the requests most users bring. Run
+  # on general-worker, with and without the office skills (an arm that sets
+  # `skills: []` or reverts config/skills/{pdf-report,charts,data-analysis,
+  # spreadsheet,document,slides}). Hidden checks: bench/grade_office.py on the
+  # downloaded output/ folders; looks: its page renders, judged blind in pairs.
+  # -------------------------------------------------------------------------
+  - id: W1-restaurant-pdf-report
+    family: office
+    config_name: general-worker
+    description: |
+      Get me an overview of the Uferstube restaurant from September 2025 to
+      August 2026 for covers, revenue and spend per cover for lunch and
+      dinner. Highlight the months that stand out. I need it as a PDF I can
+      forward to the owner, saved as `output/uferstube_overview.pdf`.
+
+      Monthly figures from the POS (lunch = weekdays 11:30-15:00):
+
+      ```
+      month,lunch_covers,lunch_revenue_eur,dinner_covers,dinner_revenue_eur
+      2025-09,902,16416,1780,85440
+      2025-10,925,16928,1845,89483
+      2025-11,871,15765,1702,82547
+      2025-12,812,15265,2310,129360
+      2026-01,798,14364,1420,68160
+      2026-02,640,11584,1050,50820
+      2026-03,915,16653,1760,86240
+      2026-04,884,16089,1795,89750
+      2026-05,902,16416,1811,92361
+      2026-06,616,11026,1794,94185
+      2026-07,594,10573,1840,98440
+      2026-08,607,10926,1872,101088
+      ```
+    required_deliverables: [output/uferstube_overview.pdf]
+
+  - id: W2-chart-png
+    family: office
+    config_name: general-worker
+    description: |
+      Make me a chart of our support tickets per week that I can paste into a
+      chat message. It should make clear whether the new FAQ page (live from
+      week 14) changed anything. Save it as `output/tickets.png`.
+
+      ```
+      week,tickets
+      8,212
+      9,198
+      10,224
+      11,207
+      12,219
+      13,211
+      14,183
+      15,161
+      16,149
+      17,152
+      18,140
+      19,144
+      ```
+    required_deliverables: [output/tickets.png]
+
+  - id: W3-event-budget-xlsx
+    family: office
+    config_name: general-worker
+    description: |
+      Build an Excel workbook for our summer party budget,
+      `output/summer_party_budget.xlsx`, that I can play with. Inputs: 120
+      guests, catering 38 EUR per guest, drinks 14 EUR per guest, venue hire
+      2,400 EUR flat, band 1,800 EUR flat, decoration 6 EUR per guest, and a
+      10% contingency on everything. I want to see the total and the cost per
+      guest, and when I change the number of guests or a price, everything
+      must update.
+    required_deliverables: [output/summer_party_budget.xlsx]
+
+  - id: W4-results-deck-pdf
+    family: office
+    config_name: general-worker
+    description: |
+      Turn these quarterly results into a short presentation for our team
+      meeting (6 to 8 slides, as a PDF): `output/q3_results.pdf`. The team
+      wants to know how we did and what we focus on next quarter.
+
+      - Revenue Q3: 1.42 M EUR (Q2: 1.31 M, Q3 last year: 1.18 M)
+      - New customers: 38 (Q2: 41)
+      - Churned customers: 6 (Q2: 11)
+      - Net promoter score: 46 (Q2: 39)
+      - Average deal size: 37,400 EUR (Q2: 31,950)
+      - Sales cycle: 52 days (Q2: 47)
+      - Focus Q4: shorten the sales cycle, launch the partner programme,
+        hire two account executives
+    required_deliverables: [output/q3_results.pdf]
+
+  - id: W5-why-did-it-drop
+    family: office
+    config_name: general-worker
+    description: |
+      Our online shop's conversion rate dropped. Find out when it started,
+      how big the drop is, and which part of the funnel it comes from. Write
+      your answer for my manager to `output/findings.md` (short, numbers
+      first).
+
+      ```
+      date,sessions,product_views,add_to_cart,checkout_started,orders
+      2026-09-01,4210,2950,612,401,188
+      2026-09-08,4380,3060,640,415,196
+      2026-09-15,4150,2905,601,398,187
+      2026-09-22,4460,3122,650,422,199
+      2026-09-29,4320,3020,630,409,193
+      2026-10-06,4410,3090,644,418,121
+      2026-10-13,4290,3000,627,407,117
+      2026-10-20,4500,3150,655,425,124
+      2026-10-27,4360,3050,636,412,119
+      ```
+    required_deliverables: [output/findings.md]
+
+  - id: W6-supplier-letter-docx
+    family: office
+    config_name: general-worker
+    description: |
+      Schreib einen Geschäftsbrief als Word-Datei, `output/brief_lieferant.docx`,
+      an die Weinhandlung Kessler GmbH, z. Hd. Herrn Jonas Kessler,
+      Marktstraße 4, 67433 Neustadt an der Weinstraße. Absender: Hotel
+      Lindenhof, Bergstraße 12, 69117 Heidelberg. Inhalt: Die Lieferung vom
+      3. November 2026 (Rechnung 2026-1187) enthielt 24 statt 36 Flaschen
+      Riesling Spätlese 2024; wir bitten um Nachlieferung der 12 Flaschen bis
+      20. November 2026 oder eine Gutschrift über 214,80 Euro. Ansprechpartnerin
+      ist Frau Anja Brandt, Telefon 06221 555 230.
+    required_deliverables: [output/brief_lieferant.docx]
+
+  - id: W7-onboarding-pptx
+    family: office
+    config_name: general-worker
+    description: |
+      I need an editable PowerPoint (`output/onboarding.pptx`, 5 to 7 slides)
+      to welcome new kitchen staff in their first week: who is who (head chef
+      Marta Lenz, sous chef Ali Demir, pastry Jana Wolf), the shift times
+      (early 6:30-15:00, late 14:30-23:00), hygiene rules (hand washing,
+      allergen labels, cold chain at max 7 degrees), and where to find help
+      (shift lead first, then Marta). Keep it friendly and easy to read.
+    required_deliverables: [output/onboarding.pptx]
+
+  # W8/W9 (2026-11-18): work with generated images (image_generation.md WP7).
+  # Needs a pinned image_generation model (or an image key in a connector);
+  # arms: with and without the `image` skill. Hidden checks open every image.
+  - id: W8-deck-with-pictures-pdf
+    family: office
+    config_name: general-worker
+    description: |
+      Make a short presentation for our team about the new autumn menu at
+      the Uferstube (5 to 7 slides, as a PDF): `output/autumn_menu.pdf`. Give
+      at least three slides a fitting food photo you generate, all in one
+      consistent warm, rustic style, with the dish names on the slides and
+      not inside the pictures. Keep the pictures as files in `output/` too.
+
+      - Pumpkin soup with roasted seeds and chili oil, 7.50 EUR
+      - Wild mushroom risotto with parmesan, 16.90 EUR
+      - Braised beef cheek with celeriac puree, 22.50 EUR
+      - Plum crumble with vanilla ice cream, 6.90 EUR
+      - Available from 1 October, lunch and dinner
+    required_deliverables: [output/autumn_menu.pdf]
+
+  - id: W9-character-dataset-zip
+    family: office
+    config_name: general-worker
+    description: |
+      I want to train a LoRA of my comic character Mira, a 30-year-old
+      lighthouse keeper: short silver hair, a scar across her left eyebrow,
+      green eyes, a yellow raincoat over a navy knit sweater. Build me the
+      training set: first a reference sheet, then 15 to 20 varied images of
+      her (close-ups to full body, different angles, expressions and
+      places), each with a caption file that starts with the trigger word
+      `mrvl`. Pack the images and captions flat into `output/mira_dataset.zip`
+      and give me a numbered contact sheet of the set as
+      `output/contact_sheet.png` so I can review it.
+    required_deliverables: [output/mira_dataset.zip, output/contact_sheet.png]

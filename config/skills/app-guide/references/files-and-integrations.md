@@ -69,7 +69,7 @@ at **Read-only**); a file written anywhere else in the workspace does not.
   project's Overview opens it. What agents may do in it is the folder's
   **Default access** (**Read-only**, **Protected**, or **Read-write**, as far
   as the cloud offers each), set on the project's **Connectors** tab under
-  **Cloud folders**; a session can choose another level when it is created.
+  **Kept by SRW**; a session can choose another level when it is created.
 - A **personal project** has no folder of its own. Its cloud is its owner's
   **My cloud** (connected once on the **Connectors** page), which only the
   owner's own sessions mount; adding a member to a personal project shares no

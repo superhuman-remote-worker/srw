@@ -113,6 +113,13 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
         "tools.memory",
         "memory.pipeline.extensions",
         "memory.retrieval",
+        # The two optional job limits, stated off (0 = the dataclass default).
+        "limits.max_llm_calls_per_job",
+        "limits.max_plain_replies_in_a_row",
+        # Image generation WP4 (2026-11-17, owner decision D1): the shared
+        # root grants generate_image in a new category, tools.image_generation
+        # (both roles; differs from the dataclass default []).
+        "tools.image_generation",
     ),
     # U3 WP1: the persistent loop reads limits.llm_inproc_retries (it was a
     # hard-coded 3); the overlay pins the historical 3 against the dataclass
@@ -125,6 +132,7 @@ _POST_SPLIT_OVERLAY_ADDITIONS: dict[str, tuple[str, ...]] = {
         "tools.memory",
         "memory.pipeline.extensions",
         "memory.retrieval",
+        "tools.image_generation",
     ),
 }
 #: Keys later work packages DELETED from an overlay after the baseline was
@@ -178,7 +186,13 @@ _POST_SPLIT_OVERLAY_CHANGES: dict[str, tuple[str, ...]] = {
     # Append-only context injection WP6 (D37): the worker's writer list lost
     # memory_assembler. WP6 (D36): the retriever recall_two_tier became
     # recall_hybrid (both roles).
-    "worker": ("memory.pipeline.writers", "memory.pipeline.retrievers"),
+    # Owner decision 2026-11-21: the per-job tool-call ceiling is off by
+    # default (5000 -> 0), like every limit on a job's own work.
+    "worker": (
+        "memory.pipeline.writers",
+        "memory.pipeline.retrievers",
+        "limits.max_tool_calls_per_job",
+    ),
     "session": (
         "browser.security.blocked_domains",
         "memory.pipeline.retrievers",
@@ -199,13 +213,17 @@ _POST_SPLIT_TOOL_ADDITIONS: dict[str, dict[str, tuple[str, ...]]] = {
     # the shared root's knowledge category alongside kb_search.
     # Citation engine overhaul (D7): withdraw_citation joined the shared root's
     # citation category next to edit_citation (flag, never delete).
+    # Image generation WP5 (2026-11-17): compose_images joined the shared
+    # root's workspace category (contact and character sheets on every tier).
     "worker": {
         "knowledge": ("kb_delete", "kb_grep"),
         "citation": ("withdraw_citation",),
+        "workspace": ("compose_images",),
     },
     "session": {
         "knowledge": ("kb_delete", "kb_grep"),
         "citation": ("withdraw_citation",),
+        "workspace": ("compose_images",),
     },
 }
 #: Bindings later work added to an overlay's ``instruction_files`` (role ->

@@ -50,6 +50,7 @@ import re
 import asyncio
 import time
 from copy import deepcopy
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 from uuid import UUID, uuid4
 
@@ -68,6 +69,9 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
 from agent.core.archiver import get_archiver, inflight_tool_calls
+from agent.core.bound_tools import binds_phase_tool, binds_todo_tool
+from agent.core.brief_pointer import brief_pointer_after_compaction
+from shared.runtime.llm.reasoning_chat import record_wire_attempts
 from agent.core.context import (
     ContextManager,
     ContextConfig,
@@ -129,10 +133,7 @@ from shared.runtime.core.llm_retry import (  # noqa: F401
     initial_error_freeze_fields,
 )
 from shared.runtime.core.loader import (
-    PHASE_SKILLS,
     AgentConfig,
-    append_expert_workflow_addendum,
-    db_phase_addendum,
     get_phase_system_prompt,
     load_auxiliary_prompt,
     resolve_model_settings,
@@ -613,6 +614,97 @@ def _check_no_tool_call_streak(
     return 1, False, new_hash
 
 
+def _positive_limit(limits: Any, name: str) -> int:
+    """``limits.<name>`` when it is a positive integer, else 0 (off)."""
+    value = getattr(limits, name, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return 0
+    return value
+
+
+def llm_call_limit_stop(
+    state: UniversalAgentState, config: AgentConfig
+) -> Optional[Dict[str, Any]]:
+    """The execute node's stop when the job has used its model calls, else None.
+
+    ``limits.max_llm_calls_per_job`` (0 = off) bounds the passes of the
+    execute node since the job started or since the last resume with
+    feedback: ``iteration - llm_call_baseline``. ``iteration`` is
+    checkpointed and raised by every return of the execute node (answered,
+    rejected and failed calls alike), so the count survives batch rotations
+    and rebuilt graphs. ``llm_call_baseline`` is absent from old checkpoints
+    (read as 0).
+
+    The stop is the shape of the node's other breakers: a non-recoverable
+    ``error`` plus ``should_stop``, which the orchestrator settles as
+    ``failed``. ``iteration`` stays as it is (no call was made); the baseline
+    moves to it and the plain-reply streak is cleared, so a resume by a
+    person starts a fresh budget instead of stopping again at once.
+    """
+    limit = _positive_limit(getattr(config, "limits", None), "max_llm_calls_per_job")
+    if not limit:
+        return None
+    iteration = int(state.get("iteration") or 0)
+    used = max(0, iteration - int(state.get("llm_call_baseline") or 0))
+    if used < limit:
+        return None
+    return {
+        "error": {
+            "type": "llm_call_limit",
+            "message": (
+                f"Stopped before another model call: the job has made {used} "
+                f"model calls and its limit (limits.max_llm_calls_per_job) is "
+                f"{limit}."
+            ),
+            "recoverable": False,
+            "limit": limit,
+            "count": used,
+        },
+        "should_stop": True,
+        "llm_call_baseline": iteration,
+        "plain_reply_streak": 0,
+    }
+
+
+def plain_reply_limit_error(streak: int, limit: int) -> Dict[str, Any]:
+    """The ``error`` of the stop after ``streak`` plain replies in a row."""
+    return {
+        "type": "plain_reply_limit",
+        "message": (
+            f"Stopped: {streak} replies in a row without a tool call while a "
+            f"to-do was pending; the limit (limits.max_plain_replies_in_a_row) "
+            f"is {limit}."
+        ),
+        "recoverable": False,
+        "limit": limit,
+        "count": streak,
+    }
+
+
+def _todo_reminder_text(
+    remaining: List[Any], model: Optional[str], todo_tool_bound: bool
+) -> str:
+    """The reminder appended after a reply without a tool call.
+
+    A job with ``todo_complete`` is told to close the current to-do with it; a
+    job without it is told to end with ``job_complete`` or to keep working.
+    The pending list follows in both.
+    """
+    todo_lines = "\n".join(
+        f"  - {t.id}: {t.content[:80]}{'...' if len(t.content) > 80 else ''}"
+        for t in remaining
+    )
+    pending = f"Pending todos ({len(remaining)}):\n{todo_lines}"
+    if not todo_tool_bound:
+        return format_nudge("todo_action_job_complete", model=model) + "\n\n" + pending
+    return (
+        format_nudge("todo_action", model=model, todo_id=remaining[0].id) + "\n\n"
+        "If you already finished the work for this todo, that's perfectly fine — "
+        "invoke `todo_complete` now to record it. You don't need to redo anything.\n\n"
+        + pending
+    )
+
+
 # =============================================================================
 # INITIALIZATION NODES
 # =============================================================================
@@ -723,13 +815,13 @@ def create_init_strategic_todos_node(
         # A lever whose "off" position reintroduces a high-severity defect is
         # not a rollback. Failing closed here covers every cause instead of one,
         # and cannot corrupt a shared workspace to do it.
+        # Design: knowledge-base/knowledge/features/virtual_directories.md.
         if not task_brief.strip() and not instructions.strip():
             raise RuntimeError(
                 f"[{job_id}] Refusing to start: no task description available. "
                 "Both task_brief.md and instructions.md resolved empty — the "
                 "virtual instruction providers did not serve content. Starting "
-                "anyway would run the job against an empty brief. See "
-                "knowledge-base/knowledge/features/virtual_directories.md."
+                "anyway would run the job against an empty brief."
             )
 
         # Load the first phase's predefined todos from config template
@@ -785,6 +877,13 @@ def create_init_strategic_todos_node(
                 "the strategic phase follows its end.\n\n"
                 "Your task brief is saved to `task_brief.md` in your workspace "
                 "for reference."
+            )
+        elif not binds_phase_tool(tool_names):
+            # A job without next_phase_todos does its task in this one phase
+            # and ends it with job_complete: no planning, no phases.
+            content_parts.append(
+                "Do the task in the brief now. When it is done, call `job_complete`.\n\n"
+                "Your task brief is saved to `task_brief.md` in your workspace for reference."
             )
         else:
             content_parts.append(
@@ -928,9 +1027,19 @@ def create_execute_node(
         tool results, phase-start messages). When a summary evicted its
         latest rendering, the compacted history carries it once, seated
         right after the summary, until the next compaction.
+
+        The same holds for the brief: when the kickoff message was evicted,
+        the job is told once that the brief is unchanged in ``task_brief.md``
+        and has to be read again (``agent.core.brief_pointer``).
         """
+        restated: List[BaseMessage] = []
         text = todo_manager.list_restatement(retained)
-        return [HumanMessage(content=text)] if text else []
+        if text:
+            restated.append(HumanMessage(content=text))
+        pointer = brief_pointer_after_compaction(retained, tool_names)
+        if pointer:
+            restated.append(HumanMessage(content=pointer))
+        return restated
 
     async def execute(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute current todo using ReAct pattern."""
@@ -941,6 +1050,16 @@ def create_execute_node(
         phase_number = state.get("phase_number", 0)
         phase_name = "strategic" if is_strategic else "tactical"
         turn_count = state.get("turn_count", 0)
+
+        # Optional cap on model calls (limits.max_llm_calls_per_job, 0 = off),
+        # checked before compaction and before the request is built, so a job
+        # at its cap spends nothing more. Counted on checkpointed state, so it
+        # holds across batch rotations and rebuilt graphs.
+        llm_call_stop = llm_call_limit_stop(state, config)
+        if llm_call_stop is not None:
+            logger.error(f"[{job_id}] {llm_call_stop['error']['message']}")
+            return llm_call_stop
+
         # Update tool context for phase-aware behavior (e.g., multimodal override)
         if tool_context is not None:
             tool_context.set_current_phase(
@@ -1038,19 +1157,13 @@ def create_execute_node(
                         # A bound skill delivers its instructions, not its
                         # catalog frontmatter.
                         instr_content = skill_body(instr_content)
-                        if entry.skill == PHASE_SKILLS.get(phase_name):
-                            # A DB expert's own strategic/tactical prompt rides
-                            # INSIDE the phase block (one protected identity per
-                            # path), fenced as <expert_workflow> exactly as the
-                            # legacy swap fenced it into the system prompt.
-                            addendum = db_phase_addendum(config, phase_name)
-                            if addendum:
-                                instr_content = append_expert_workflow_addendum(
-                                    instr_content, addendum
-                                )
                     delivered_phase_blocks.append(
                         create_phase_instruction_message(
-                            instr_path, instr_content, phase_name, phase_key
+                            instr_path,
+                            instr_content,
+                            phase_name,
+                            phase_key,
+                            whole_job=not binds_phase_tool(tool_names),
                         )
                     )
                     pending_phase_injections.add(injection_key)
@@ -1459,40 +1572,6 @@ def create_execute_node(
                 logger.warning(
                     f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}"
                 )
-        elif memory_service is None and knowledge_store and tool_context.project_id:
-            try:
-                import uuid as _uuid
-
-                project_uuid = (
-                    _uuid.UUID(tool_context.project_id)
-                    if isinstance(tool_context.project_id, str)
-                    else tool_context.project_id
-                )
-
-                # Build retrieval context from current todo + phase info
-                pending_todos = todo_manager.list_pending()
-                kb_context_parts = []
-                if pending_todos:
-                    kb_context_parts.append(pending_todos[0].content)
-                kb_context_parts.append(
-                    f"phase {phase_number} {'strategic' if is_strategic else 'tactical'}"
-                )
-                kb_context_text = " ".join(kb_context_parts)
-
-                kb_notes = await knowledge_store.hybrid_search(
-                    project_id=project_uuid,
-                    query=kb_context_text,
-                    match_count=5,
-                )
-                if kb_notes:
-                    _knowledge_records = list(kb_notes)
-                    logger.debug(
-                        f"[{job_id}] Knowledge injection: {len(kb_notes)} notes retrieved"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}"
-                )
 
         # Citation verification feedback (Phase 2b / D4): surface still-failed
         # citations so the agent can correct them. DB-driven — re-computed from
@@ -1599,6 +1678,7 @@ def create_execute_node(
             failed_citations=_failed_citations,
             guidance=_guidance_entries,
             delivered_guidance_ids=_delivered_guidance_ids,
+            phased=binds_phase_tool(tool_names),
             subagents=_subagents_state,
         )
         _max_memories = max_memories_per_entry(config)
@@ -1781,12 +1861,36 @@ def create_execute_node(
         while True:
             try:
                 start_time = time.time()
+                call_started_at = datetime.now(timezone.utc)
+                # The requests this try puts on the wire. The caller's own
+                # list, so a try that times out or raises still has them.
+                wire_attempts: List[Dict[str, Any]] = []
                 try:
-                    response = await asyncio.wait_for(
-                        llm_with_tools.ainvoke(prepared_messages),
-                        timeout=llm_timeout,
-                    )
+                    with record_wire_attempts() as wire_attempts:
+                        response = await asyncio.wait_for(
+                            llm_with_tools.ainvoke(prepared_messages),
+                            timeout=llm_timeout,
+                        )
                 except Exception as invoke_error:
+                    # Every try that raised leaves its own llm_requests row
+                    # (status "error"): the request, when it went out, and
+                    # how it ended. Only the answered try has a reply row.
+                    if auditor:
+                        auditor.archive_error(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            messages=prepared_messages,
+                            model=phase_model,
+                            error=str(invoke_error),
+                            error_type=type(invoke_error).__name__,
+                            latency_ms=int((time.time() - start_time) * 1000),
+                            iteration=iteration,
+                            tool_schemas=tool_schemas,
+                            model_kwargs=model_kwargs,
+                            started_at=call_started_at,
+                            attempt=attempt + 1,
+                            wire_attempts=wire_attempts,
+                        )
                     # A 413 "request too big" is deterministic: hand it to
                     # the emergency compaction below, not the retry ladder.
                     overflow = _as_context_overflow(invoke_error)
@@ -1859,6 +1963,31 @@ def create_execute_node(
                 # reaches the checkpoint raw and poisons every subsequent
                 # request (knowledge-base/knowledge/features/outbound_message_hygiene.md).
                 response = repair_tool_call_arguments(response)
+
+                def _archive_reply(rejected: Optional[str] = None) -> Optional[str]:
+                    """Store this call in llm_requests; ``rejected`` names the
+                    guard that threw the reply away. Every reply the provider
+                    produced gets a row, used or not."""
+                    if not auditor:
+                        return None
+                    return auditor.archive(
+                        job_id=job_id,
+                        agent_type=config.agent_id,
+                        messages=prepared_messages,
+                        history_messages=prepared_history,
+                        response=response,
+                        model=phase_model,
+                        latency_ms=latency_ms,
+                        iteration=iteration,
+                        metadata=state.get("metadata"),
+                        phase=phase_str,
+                        phase_number=phase_number,
+                        tool_schemas=tool_schemas,
+                        model_kwargs=model_kwargs,
+                        started_at=call_started_at,
+                        attempt=attempt + 1,
+                        rejected=rejected,
+                    )
 
                 tool_calls_count = (
                     len(response.tool_calls)
@@ -1951,6 +2080,7 @@ def create_execute_node(
                         f"(finish_reason=length, max_output_tokens={_cap}): reasoning "
                         f"consumed the entire output budget before answering."
                     )
+                    _archive_reply(rejected="output_truncated")
                     return {
                         "error": {
                             "message": (
@@ -2018,6 +2148,7 @@ def create_execute_node(
                         f"[{job_id}] Empty response streak exceeded "
                         f"(streak {empty_streak}): failing job"
                     )
+                    _archive_reply(rejected="empty_response")
                     return {
                         "error": {
                             "message": (
@@ -2096,6 +2227,7 @@ def create_execute_node(
                         f"(streak {no_tc_streak}, model={phase_model}): "
                         f"failing job"
                     )
+                    _archive_reply(rejected="parser_failure")
                     return {
                         "error": {
                             "message": (
@@ -2137,6 +2269,8 @@ def create_execute_node(
                     )
 
                     if validation.is_degenerate:
+                        # Both exits below drop the reply.
+                        _archive_reply(rejected="response_degeneration")
                         _degeneration_streak[0] += 1
                         streak = _degeneration_streak[0]
                         pattern_names = [p.name for p in validation.matched_patterns]
@@ -2268,21 +2402,7 @@ def create_execute_node(
                 # Archive full LLM request/response to llm_requests collection
                 request_id = None
                 if auditor:
-                    request_id = auditor.archive(
-                        job_id=job_id,
-                        agent_type=config.agent_id,
-                        messages=prepared_messages,
-                        history_messages=prepared_history,
-                        response=response,
-                        model=phase_model,
-                        latency_ms=latency_ms,
-                        iteration=iteration,
-                        metadata=state.get("metadata"),
-                        phase=phase_str,
-                        phase_number=phase_number,
-                        tool_schemas=tool_schemas,
-                        model_kwargs=model_kwargs,
-                    )
+                    request_id = _archive_reply()
 
                     # Build tool calls preview
                     tool_calls_preview = []
@@ -2323,29 +2443,36 @@ def create_execute_node(
                 # Post-response todo reminder: if the model responded without tool calls
                 # and there are pending todos, append a reminder to state so it persists
                 # in conversation history. The model will see it on the next execute loop.
+                # The replies of that kind in a row are counted in state
+                # (plain_reply_streak, any wording); at the optional limit
+                # (limits.max_plain_replies_in_a_row, 0 = off) the job stops
+                # instead of getting another reminder.
                 injected_reminder = None
+                plain_reply_stop: Optional[Dict[str, Any]] = None
+                streak_update: Dict[str, Any] = {}
                 if not (hasattr(response, "tool_calls") and response.tool_calls):
                     remaining = todo_manager.list_pending()
                     if remaining:
-                        first = remaining[0]
-                        todo_lines = "\n".join(
-                            f"  - {t.id}: {t.content[:80]}{'...' if len(t.content) > 80 else ''}"
-                            for t in remaining
+                        plain_streak = int(state.get("plain_reply_streak") or 0) + 1
+                        streak_update["plain_reply_streak"] = plain_streak
+                        plain_limit = _positive_limit(
+                            config.limits, "max_plain_replies_in_a_row"
                         )
-                        injected_reminder = HumanMessage(
-                            content=(
-                                format_nudge(
-                                    "todo_action",
-                                    model=config.llm.model,
-                                    todo_id=first.id,
-                                )
-                                + "\n\n"
-                                "If you already finished the work for this todo, that's perfectly fine — "
-                                "invoke `todo_complete` now to record it. You don't need to redo anything.\n\n"
-                                f"Pending todos ({len(remaining)}):\n"
-                                f"{todo_lines}"
+                        if plain_limit and plain_streak >= plain_limit:
+                            plain_reply_stop = plain_reply_limit_error(
+                                plain_streak, plain_limit
                             )
-                        )
+                            logger.error(f"[{job_id}] {plain_reply_stop['message']}")
+                        else:
+                            injected_reminder = HumanMessage(
+                                content=_todo_reminder_text(
+                                    remaining,
+                                    config.llm.model,
+                                    binds_todo_tool(tool_names),
+                                )
+                            )
+                elif state.get("plain_reply_streak"):
+                    streak_update["plain_reply_streak"] = 0
 
                 # Memory Light: extract memories via AuxiliaryLLM (async, non-blocking)
                 new_turn_count = state.get("turn_count", 0) + 1
@@ -2418,6 +2545,20 @@ def create_execute_node(
                 result_update["delivered_guidance_ids"] = sorted(
                     _delivered_guidance_ids | _absorbed_guidance_ids
                 )
+                result_update.update(streak_update)
+                if plain_reply_stop is not None:
+                    # The reply is kept; the job stops in place of another
+                    # reminder. Like the cap's stop, it moves the model-call
+                    # baseline and clears the streak, so a resume by a person
+                    # starts fresh.
+                    result_update.update(
+                        {
+                            "error": plain_reply_stop,
+                            "should_stop": True,
+                            "llm_call_baseline": iteration + 1,
+                            "plain_reply_streak": 0,
+                        }
+                    )
 
                 # Return compacted messages + response if compaction occurred
                 # (the phase block is inside `messages`: kept in the window or
@@ -3775,12 +3916,18 @@ def _write_reply_files(
         workspace.git_manager.commit(f"Received {len(replies)} queued reply(ies)")
 
 
-def _format_drained_replies(replies: List[Dict[str, Any]]) -> str:
+def _format_drained_replies(
+    replies: List[Dict[str, Any]], *, phased: bool = True
+) -> str:
     """Render human/operator queued replies as one visible message-block.
 
     Injected as a persistent HumanMessage at a natural break/expiry or the
     tactical→strategic backstop because the audit files alone would be a dead
     letter box: nothing tells the worker to read them.
+
+    ``phased=False`` is a job that does not plan phases (it is not offered
+    ``next_phase_todos``): its closing line does not point at a plan or a
+    strategic review, which that job never reaches.
     """
     lines = [
         "[QUEUED MESSAGES] Messages received while you were working "
@@ -3794,10 +3941,13 @@ def _format_drained_replies(replies: List[Dict[str, Any]]) -> str:
         lines.append(f"--- ({meta}) ---")
         lines.append(str(reply.get("message", "")).strip())
         lines.append("")
-    lines.append(
-        "Weigh these against the current plan during the strategic review; "
-        "they do not force a re-plan by themselves."
-    )
+    if phased:
+        lines.append(
+            "Weigh these against the current plan during the strategic review; "
+            "they do not force a re-plan by themselves."
+        )
+    else:
+        lines.append("Take these into account in the work in progress.")
     return "\n".join(lines)
 
 
@@ -3837,6 +3987,8 @@ def _format_subagent_replies(replies: List[Dict[str, Any]]) -> str:
 
 def _drained_reply_messages(
     replies: List[Dict[str, Any]],
+    *,
+    phased: bool = True,
 ) -> List[HumanMessage]:
     """Build source-correct persistent carriers without reordering entries.
 
@@ -3860,7 +4012,9 @@ def _drained_reply_messages(
                 )
             )
         else:
-            messages.append(HumanMessage(content=_format_drained_replies(group)))
+            messages.append(
+                HumanMessage(content=_format_drained_replies(group, phased=phased))
+            )
         group = []
 
     for reply in replies:
@@ -4016,6 +4170,9 @@ def _deliver_queued_replies(
     tool_context: "ToolContext",
     config: AgentConfig,
     result: Dict[str, Any],
+    *,
+    todo_tool_bound: bool = True,
+    phased: bool = True,
 ) -> None:
     """Drain queued replies into the conversation at their source cadence.
 
@@ -4033,6 +4190,13 @@ def _deliver_queued_replies(
     is the better break: same intent ("finish the current unit of work, then
     read your mail"), roughly an order of magnitude more often, and independent
     of phase structure.
+
+    A job without ``todo_complete`` (``todo_tool_bound=False``) has no such
+    break: it works through one task, and the only to-do it has is closed by
+    ``job_complete``, its last call. Waiting for a completed todo would append
+    the mail after the model's final turn, where nobody reads it, so that job
+    gets human mail on the next tool pass. ``phased=False`` (no
+    ``next_phase_todos``) picks the closing line that names no plan.
 
     Entries are persistent rather than transient. Human mail uses an ordinary
     ``HumanMessage``. Child reports use the provider-portable HumanMessage
@@ -4057,7 +4221,9 @@ def _deliver_queued_replies(
     at_break = tool_context.consume_reply_drain()
     max_wait = float(getattr(config.limits, "queued_reply_max_wait_seconds", 300) or 0)
     human_replies = [reply for reply in pending if not _is_subagent_reply(reply)]
-    deliver_human = at_break or _replies_overdue(human_replies, max_wait)
+    deliver_human = (
+        at_break or not todo_tool_bound or _replies_overdue(human_replies, max_wait)
+    )
     replies = [reply for reply in pending if _is_subagent_reply(reply) or deliver_human]
     if not replies:
         return
@@ -4072,7 +4238,7 @@ def _deliver_queued_replies(
             logger.warning(f"[{job_id}] Failed to archive queued replies: {e}")
 
     result["messages"] = list(result.get("messages") or []) + (
-        _drained_reply_messages(replies)
+        _drained_reply_messages(replies, phased=phased)
     )
 
     delivered.update(_reply_key(r) for r in replies)
@@ -4092,10 +4258,13 @@ def _deliver_queued_replies(
     if immediate:
         cadence.append(f"{immediate} child event(s) immediately")
     if human:
-        cadence.append(
-            f"{human} human reply(ies) at "
-            f"{'a completed todo' if at_break else 'the wall-clock floor'}"
-        )
+        if at_break:
+            where = "a completed todo"
+        elif not todo_tool_bound:
+            where = "the next tool step (the job has no todo steps)"
+        else:
+            where = "the wall-clock floor"
+        cadence.append(f"{human} human reply(ies) at {where}")
     logger.info(
         f"[{job_id}] Delivered {len(replies)} queued reply(ies): {', '.join(cadence)}"
     )
@@ -4922,12 +5091,23 @@ def create_restore_from_feedback_node(
         # Step 3: Create HumanMessage with formatted feedback. The banner
         # states the ACTUAL cause (see resume_reason above), never a blanket
         # "previously frozen for human review".
+        if binds_phase_tool(tool_names):
+            next_step = (
+                "Process the feedback using the strategic todos below, then create "
+                "corrective tactical todos to address each feedback item."
+            )
+        else:
+            # Without next_phase_todos the job cannot stage tactical todos:
+            # it finishes the task in this phase and ends with job_complete.
+            next_step = (
+                "Take the message above into account, then finish the task and "
+                "call `job_complete`."
+            )
         feedback_text = (
             f"[FEEDBACK_RESUME] {resume_reason}\n\n"
             f"## Feedback\n\n{feedback}\n\n"
             f"The feedback has been saved to feedback.md for reference. "
-            f"Process the feedback using the strategic todos below, then create "
-            f"corrective tactical todos to address each feedback item."
+            f"{next_step}"
         )
 
         # Step 4a: Archive any in-flight todos from the checkpoint before the
@@ -5039,6 +5219,11 @@ def create_restore_from_feedback_node(
             "todos": todo_state["todos"],
             "staged_todos": todo_state["staged_todos"],
             "todo_next_id": todo_state["next_id"],
+            # A resume with feedback is a new round of work: the optional
+            # model-call cap counts from here, and the plain-reply streak
+            # starts over.
+            "llm_call_baseline": state.get("iteration", 0) or 0,
+            "plain_reply_streak": 0,
         }
         updates.update(_clear_completion_report_updates(state))
         return updates
@@ -5196,10 +5381,9 @@ def create_audited_tool_node(
     _PROGRESS_THRESHOLD = config.limits.progress_stall_threshold  # default 30
     # Per-phase ceiling, now OFF by default (0). See LimitsConfig.
     _PHASE_CAP = config.limits.max_tool_calls_per_phase
-    # Job ceiling — the actual backstop. Counted across phases, never reset at a
-    # boundary, because bounding a *phase* stopped bounding a *job* the moment
-    # phases got large.
-    _JOB_CAP = getattr(config.limits, "max_tool_calls_per_job", 5000)
+    # Job ceiling, OFF by default (0) like the per-phase one. When an expert
+    # sets it, it is counted across phases and never reset at a boundary.
+    _JOB_CAP = getattr(config.limits, "max_tool_calls_per_job", 0)
 
     # Act-ratio tripwire: N consecutive executed tool actions touching ONLY
     # process artifacts (todos/plan/archive) get a one-line "stop planning"
@@ -5259,6 +5443,21 @@ def create_audited_tool_node(
         )
 
     TOOL_NOT_FOUND_PATTERN = "is not a valid tool"
+
+    # A job without todo_complete cannot mark a todo as blocked: its two
+    # recovery suffixes point at job_complete instead.
+    _todo_tool_bound = binds_todo_tool([getattr(t, "name", "") for t in tools])
+    _phase_tool_bound = binds_phase_tool([getattr(t, "name", "") for t in tools])
+    _loop_warning_key = (
+        "loop_warning_suffix"
+        if _todo_tool_bound
+        else "loop_warning_suffix_job_complete"
+    )
+    _tool_not_found_key = (
+        "tool_not_found_suffix"
+        if _todo_tool_bound
+        else "tool_not_found_suffix_job_complete"
+    )
 
     def _get_tool_category(tool_name: str) -> Optional[str]:
         from agent.tools.registry import TOOL_REGISTRY
@@ -5528,8 +5727,8 @@ def create_audited_tool_node(
             _category_failures.clear()
             _TOOL_TIMEOUT_RETRIES[0] = 0
 
-        # Budget check. The job ceiling is the real backstop; the per-phase one
-        # is an opt-in extra (0 = off) and no longer fires by default.
+        # Budget check. Both ceilings are opt-in (0 = off) and neither fires
+        # by default.
         _phase_tool_call_count[0] += len(tool_calls_info)
         _job_tool_call_count[0] += len(tool_calls_info)
         _over_job_cap = _JOB_CAP > 0 and _job_tool_call_count[0] > _JOB_CAP
@@ -5742,7 +5941,7 @@ def create_audited_tool_node(
                     msg.content = (
                         (msg.content or "")
                         + "\n\n"
-                        + format_nudge("loop_warning_suffix", model=config.llm.model)
+                        + format_nudge(_loop_warning_key, model=config.llm.model)
                     )
 
         # Workspace-unavailable errors now propagate by TYPE: the ToolNode error
@@ -5795,7 +5994,7 @@ def create_audited_tool_node(
                     and TOOL_NOT_FOUND_PATTERN in msg.content
                 ):
                     msg.content += "\n\n" + format_nudge(
-                        "tool_not_found_suffix", model=config.llm.model
+                        _tool_not_found_key, model=config.llm.model
                     )
 
         # Track category failures for logging (a phase rejection is not a
@@ -5870,7 +6069,7 @@ def create_audited_tool_node(
                     break
 
         # Progress nudge: periodic reminders to write findings down.
-        # Never freezes the job — the job budget is the only stop.
+        # Never freezes the job; only a ceiling an expert set does that.
         if _calls_since_progress[0] >= _PROGRESS_THRESHOLD:
             calls = _calls_since_progress[0]
             nudge_count = (calls - _PROGRESS_THRESHOLD) // _PROGRESS_THRESHOLD + 1
@@ -6017,7 +6216,14 @@ def create_audited_tool_node(
         # turn in execute() and is unaffected.
         if tool_context is not None:
             try:
-                _deliver_queued_replies(job_id, tool_context, config, result)
+                _deliver_queued_replies(
+                    job_id,
+                    tool_context,
+                    config,
+                    result,
+                    todo_tool_bound=_todo_tool_bound,
+                    phased=_phase_tool_bound,
+                )
             except Exception as e:
                 logger.warning(f"[{job_id}] Queued-reply delivery failed: {e}")
 
@@ -6243,6 +6449,9 @@ def build_phase_alternation_graph(
         from agent.services.memory import MemoryManager as MemorySeamManager
         from agent.services.memory import MemoryRuntime
 
+        from agent.core.knowledge_injection import attached_project_knowledge_ids
+
+        _attached_kb_projects = attached_project_knowledge_ids(tool_context)
         memory_service = MemorySeamManager.from_config(
             config.memory,
             MemoryRuntime(
@@ -6260,8 +6469,10 @@ def build_phase_alternation_graph(
                 extraction_prompt=memory_extraction_prompt,
                 job_id=tool_context.job_id if tool_context else None,
                 agent_type=config.agent_id,
-                project_id=tool_context.project_id if tool_context else None,
-                project_ids=list(tool_context.project_ids) if tool_context else [],
+                # The knowledge scope (kb_notes): the projects whose own
+                # knowledge base is attached, not every project of the job.
+                project_id=next(iter(_attached_kb_projects), None),
+                project_ids=_attached_kb_projects,
                 retrieval_timeout=None,  # worker path runs unbounded (legacy)
             ),
         )

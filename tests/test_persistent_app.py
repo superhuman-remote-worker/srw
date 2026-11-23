@@ -1795,6 +1795,51 @@ class TestPersistentLoopMemoryOutboxWiring:
             release.set()
             await loop_task
 
+    @pytest.mark.asyncio
+    async def test_session_transport_closes_unrun_calls(self, monkeypatch):
+        """The Session transport has its turns write a ``not_run`` result for
+        each call they leave un-run, read from the gate's recorded status."""
+        from agent.api import persistent_app as pa
+
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        captured = {}
+        release = asyncio.Event()
+
+        def fake_run(**kwargs):
+            captured.update(kwargs)
+
+            async def wait_for_release():
+                await release.wait()
+
+            return wait_for_release()
+
+        async def no_completion_cleanup(_task):
+            return None
+
+        session = MagicMock()
+        session.thread_id = "tid"
+        session.tool_decisions = {"x": "expired"}
+        with (
+            patch.object(pa, "_session", session),
+            patch.object(pa._session_identity, "_thread_id", "tid"),
+            patch.object(pa, "_loop_task", None),
+            patch.object(pa, "_session_ready", return_value=True),
+            patch.object(pa, "run_persistent_loop", new=fake_run),
+            patch.object(
+                pa._session_termination,
+                "loop_completion_handler",
+                no_completion_cleanup,
+            ),
+        ):
+            assert pa._ensure_persistent_loop_started("test") is True
+            loop_task = pa._loop_task
+            callbacks = captured["callbacks"]
+            assert callbacks.close_unrun_calls is True
+            assert callbacks.permission_no_answer_status("x") == "expired"
+            assert callbacks.permission_no_answer_status("unknown") is None
+            release.set()
+            await loop_task
+
 
 # ---------------------------------------------------------------------------
 # 3.4a _persist_one_message() + _loop_persist_message() — incremental (Phase 2)
@@ -2798,10 +2843,32 @@ class TestPollWorkspaceReady:
         assert result["workspace_provisioner"] == "k8s"
         assert result["remote"]["host"] == "10.0.0.5"
         assert result["remote"]["port"] == 2222
+        # The orchestrator's VM Canvas grant passes through unchanged.
+        assert result["canvas_presentation_available"] is True
+        assert result["canvas_live_apps_available"] is True
+        assert result["canvas_shared_browser_available"] is True
+        assert result["workspace_ssh_host_key_fingerprint"] is None
+
+    @pytest.mark.asyncio
+    async def test_vm_without_canvas_grant_keeps_canvas_off(self):
+        """A VM payload without an explicit grant never advertises Canvas."""
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = {
+            "vm_status": "ready",
+            "vm_ssh_host": "10.0.0.5",
+            "vm_ssh_port": 22,
+            "canvas_presentation_available": "true",
+        }
+
+        result = await poll_workspace_ready(
+            client, "tid", timeout=5, session_runtime_generation=None
+        )
+
+        assert result is not None
+        assert result["backend"] == "vm"
         assert result["canvas_presentation_available"] is False
         assert result["canvas_live_apps_available"] is False
         assert result["canvas_shared_browser_available"] is False
-        assert result["workspace_ssh_host_key_fingerprint"] is None
 
     @pytest.mark.asyncio
     async def test_returns_container_config_when_ready(self):
@@ -7730,6 +7797,99 @@ class TestCreatePersistentApp:
         assert payload["app_guide"] == {"state": "ready"}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stopped", "code", "status", "executor"),
+        [(True, 503, "unhealthy", "stopped"), (False, 200, "healthy", "running")],
+    )
+    async def test_stateless_health_reflects_the_executor(
+        self, monkeypatch, stopped, code, status, executor
+    ):
+        import agent.api.persistent_app as pa
+        import agent.api.turn_executor as te
+        from shared.runtime.core.skill_resolution import APP_GUIDE_BREAK_GLASS_ENV
+
+        monkeypatch.delenv(APP_GUIDE_BREAK_GLASS_ENV, raising=False)
+        monkeypatch.setattr(pa, "_stateless_mode", lambda: True)
+        monkeypatch.setattr(te, "executor_stopped_unexpectedly", lambda: stopped)
+        app = create_persistent_app("config", "tid")
+        route = next(route for route in app.routes if route.path == "/health")
+
+        response = await route.endpoint()
+        payload = json.loads(response.body)
+
+        assert response.status_code == code
+        assert payload["status"] == status
+        assert payload["executor"] == executor
+
+    @pytest.mark.asyncio
+    async def test_stateless_shutdown_marks_the_stop_before_any_drain_step(
+        self, monkeypatch
+    ):
+        """A claim loop that ends while the attach fence and receipt are still
+        settling is part of the SIGTERM drain: it must never hard-exit."""
+        import agent.api.persistent_app as pa
+        import agent.api.turn_executor as te
+
+        for name in (
+            "_agent",
+            "_session",
+            "_orchestrator_client",
+            "_heartbeat_task",
+            "_started_at",
+        ):
+            monkeypatch.setattr(pa, name, getattr(pa, name))
+        monkeypatch.setattr(pa, "_session", None)
+        monkeypatch.setattr(pa._session_identity, "_thread_id", None)
+        agent = MagicMock()
+        agent.initialize = AsyncMock()
+        agent.shutdown = AsyncMock()
+        client = MagicMock()
+        client.connect = AsyncMock()
+        client.close = AsyncMock()
+        monkeypatch.setattr(pa, "_stateless_mode", lambda: True)
+        monkeypatch.setattr(pa.UniversalAgent, "from_config", lambda _path: agent)
+        monkeypatch.setattr(
+            pa, "create_orchestrator_client_from_env", lambda _id: client
+        )
+        monkeypatch.setattr(te, "_lifespan_stopping", False)
+        monkeypatch.setattr(te, "start_stateless_executor", AsyncMock())
+        seen = []
+
+        def fence(source):
+            seen.append(("fence", te._lifespan_stopping))
+            return True
+
+        async def stop_attach(**_kwargs):
+            seen.append(("attach", te._lifespan_stopping))
+            return True
+
+        async def receipt(**_kwargs):
+            seen.append(("receipt", te._lifespan_stopping))
+            return True
+
+        async def stop_executor(timeout=None):
+            seen.append(("executor", te._lifespan_stopping))
+
+        monkeypatch.setattr(
+            pa._session_termination, "activate_termination_admission_fence", fence
+        )
+        monkeypatch.setattr(pa._session_attach, "stop_startup_attach", stop_attach)
+        monkeypatch.setattr(pa._session_attach, "release_shutdown_receipt", receipt)
+        monkeypatch.setattr(te, "stop_stateless_executor", stop_executor)
+
+        manager = pa.lifespan(MagicMock())
+        await manager.__aenter__()
+        assert te._lifespan_stopping is False
+        await manager.__aexit__(None, None, None)
+
+        assert seen == [
+            ("fence", True),
+            ("attach", True),
+            ("receipt", True),
+            ("executor", True),
+        ]
+
+    @pytest.mark.asyncio
     async def test_break_glass_health_is_bounded_degraded_and_still_live(
         self, monkeypatch
     ):
@@ -7967,16 +8127,24 @@ class TestHandleConfigUpdateEnrichmentGate:
 
     def test_gate_checks_embedding_env_keys(self):
         from inspect import getsource
-        from agent.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import (
+            _LIVE_EMBEDDING_ENV_KEYS,
+            _handle_config_update,
+        )
+
+        from agent.api.session_attach import MEMORY_EMBEDDING_ENV_KEYS
 
         src = getsource(_handle_config_update)
+        assert "embedding_env_keys = _LIVE_EMBEDDING_ENV_KEYS" in src
+        # A live update changes exactly the keys an attach applies.
+        assert set(_LIVE_EMBEDDING_ENV_KEYS) == set(MEMORY_EMBEDDING_ENV_KEYS)
         for key in (
             "EMBEDDING_PROVIDER",
             "EMBEDDING_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
         ):
-            assert key in src, (
+            assert key in _LIVE_EMBEDDING_ENV_KEYS, (
                 f"Embedding env key {key} must be in the gate's "
                 "credential-bearing-keys tuple."
             )
@@ -7985,13 +8153,19 @@ class TestHandleConfigUpdateEnrichmentGate:
         """A served model string belongs to the model it came with: the swap
         clears the old one of every slot the block touches before applying."""
         from inspect import getsource
-        from agent.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import (
+            _LIVE_EMBEDDING_ENV_KEYS,
+            _apply_live_embedding_env,
+            _handle_config_update,
+        )
 
         src = getsource(_handle_config_update)
-        assert "EMBEDDING_SERVED_MODEL" in src
-        assert "RERANK_SERVED_MODEL" in src
-        assert src.index("clear_served_model_env(") < src.index(
-            "os.environ[k] = str(new_env_block[k])"
+        assert "EMBEDDING_SERVED_MODEL" in _LIVE_EMBEDDING_ENV_KEYS
+        assert "RERANK_SERVED_MODEL" in _LIVE_EMBEDDING_ENV_KEYS
+        assert "_apply_live_embedding_env(new_env_block, embedding_env_keys)" in src
+        helper = getsource(_apply_live_embedding_env)
+        assert helper.index("clear_served_model_env(") < helper.index(
+            "os.environ.update(applied)"
         )
 
     def test_gate_checks_tool_updates_before_local_reload(self):
@@ -8148,16 +8322,20 @@ class TestHandleConfigUpdateEnrichmentGate:
         src = getsource(_handle_config_update)
         assert "_session.auxiliary_llm = AuxiliaryLLM(" in src
 
-    def test_resets_embedding_singleton(self):
+    def test_resets_embedding_singleton(self, monkeypatch):
         """Embedding hot-swap must clear ``embedding_service._embedding_service``
         so the next get_embedding_service() call rebuilds with the new
         env. Without this the process-wide singleton sticks at the
         boot-time base_url and 401s on api.openai.com."""
-        from inspect import getsource
-        from agent.api.persistent_app import _handle_config_update
+        from agent.api.persistent_app import _apply_live_embedding_env
+        from shared.runtime.services import embedding_service
 
-        src = getsource(_handle_config_update)
-        assert "_embedding_module._embedding_service = None" in src
+        monkeypatch.setattr(embedding_service, "_embedding_service", object())
+        # setenv, not delenv: the helper sets EMBEDDING_MODEL and monkeypatch
+        # must restore it afterwards.
+        monkeypatch.setenv("EMBEDDING_MODEL", "e1")
+        assert _apply_live_embedding_env({"EMBEDDING_MODEL": "e2"})
+        assert embedding_service._embedding_service is None
 
 
 class TestSessionArchiveModelName:
@@ -8504,10 +8682,12 @@ class TestAttachSessionRebinds:
             "EMBEDDING_SERVED_MODEL",
             "EMBEDDING_BASE_URL",
             "EMBEDDING_API_KEY",
+            "EMBEDDING_TLS_PINNED_CERT",
             "RERANK_MODEL",
             "RERANK_SERVED_MODEL",
             "RERANK_BASE_URL",
             "RERANK_API_KEY",
+            "RERANK_TLS_PINNED_CERT",
         }
         # Pop-first: the scrub precedes any re-application of new env values.
         assert helper_src.index("os.environ.pop") < helper_src.index(

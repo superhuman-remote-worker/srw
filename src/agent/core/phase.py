@@ -1511,6 +1511,10 @@ def finalize_job(
             # E4: declared evidence entries ride the completion contract to
             # the orchestrator, which resolves and pins them server-side.
             completion_data["evidence"] = final_data["evidence"]
+        if "deliverable_warnings" in final_data:
+            # Listed deliverables job_complete accepted with a problem (a job
+            # without todo_complete is not refused over them).
+            completion_data["deliverable_warnings"] = final_data["deliverable_warnings"]
 
         output_path = "output/job_completion.json"
         workspace.write_file(
@@ -1601,6 +1605,8 @@ def finalize_job(
         # E4: declared evidence entries ride the freeze to the orchestrator,
         # which resolves and pins them server-side at completion.
         freeze_data["evidence"] = final_data["evidence"]
+    if "deliverable_warnings" in final_data:
+        freeze_data["deliverable_warnings"] = final_data["deliverable_warnings"]
 
     # Write to output/job_frozen.json
     output_path = "output/job_frozen.json"

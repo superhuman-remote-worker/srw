@@ -51,7 +51,8 @@ The sidebar:
 - **Experts** — the agent roster; deployments can allow custom ones.
 - **Skills** — reusable how-to procedures agents can load; same story.
 - **Automations** — jobs on a schedule (cron).
-- **Settings** — your keys, models, voice, notifications, and integrations.
+- **Settings** — your keys, models, voice, notifications, and integrations,
+  plus how the app and session chats look (theme, chat display).
 
 The **Inbox** is where everything that needs *you* collects: job reviews,
 questions from agents, and permission requests — with approve/deny/reply

@@ -323,6 +323,13 @@ function activeSessionGet(url: string) {
 // Tests
 // ---------------------------------------------------------------------------
 
+// A stored workspace-upgrade decision (or rewind marker) is per tab and
+// outlives its service on purpose: that is what a reload restores. Between
+// tests it must not leak into the next one's thread.
+beforeEach(() => {
+  sessionStorage.clear();
+});
+
 describe('cloudCountFromSummary', () => {
   // Protected cloud mode (Slice C, Task 14): the badge count is the sum of
   // the staged added/modified/deleted counts.
@@ -9671,6 +9678,21 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
     expect(sysLines(service)).toContain('chat.workspaceUpgrade.ready');
     expect(sysLines(service).some((l) => l.includes('readySudo'))).toBe(false);
   });
+
+  it('workspace_upgrade.complete asks the Canvas again whether the browser can open', async () => {
+    const { service, es, canvas } = await setup();
+    const refresh = vi.spyOn(canvas, 'refreshBrowserCapability');
+    fireSseMessage(
+      es,
+      {
+        method: 'workspace_upgrade.complete',
+        params: { target_tier: 'sandbox' },
+      },
+      '1:1',
+    );
+    expect(sysLines(service)).toContain('chat.workspaceUpgrade.ready');
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('PersistentChatService — control frame delivery across a reconnect', () => {
@@ -9985,7 +10007,8 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
       },
       '1:2',
     );
-    await Promise.resolve();
+    // The automatic continuation reads the thread's turn count first.
+    await vi.waitFor(() => expect(inputCalls(ctx)).toHaveLength(1));
     // Transloco is mocked identity, so the raw key is the content.
     expect(inputCalls(ctx)[0]?.[1]).toEqual({
       content: 'chat.workspaceOffer.continueMessage',
@@ -10022,11 +10045,11 @@ describe('PersistentChatService — inline workspace upgrade offer', () => {
         '1:2',
       );
     complete();
-    await Promise.resolve();
+    await vi.waitFor(() => expect(inputCalls(ctx)).toHaveLength(1));
     // The server short-circuits an already-satisfied tier straight to
     // .complete, so a second frame is reachable, not hypothetical.
     complete();
-    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(inputCalls(ctx)).toHaveLength(1);
   });
 
@@ -10510,6 +10533,34 @@ describe('PersistentChatService — usage.updated telemetry', () => {
     const u = service.usage()!;
     expect(u.turn).toBe(2);
     expect(u.reasoningEstimated).toBe(true);
+  });
+
+  describe('historyToTurns — sent files come back as chips after a reload', () => {
+    it('strips the attachment hint and rebuilds the attachments', () => {
+      const [turn] = historyToTurns([
+        {
+          id: 'u1',
+          role: 'human',
+          content: 'Make this brighter\n\n[Attached files in uploads/: photo.jpg, brief.pdf]',
+          tool_calls: null,
+          turn_number: 1,
+          created_at: '2026-11-17T22:00:00Z',
+        },
+      ] as never) as UserTurn[];
+      expect(turn.content).toBe('Make this brighter');
+      expect(turn.attachments).toEqual([
+        { id: 'u1:attachment:0', name: 'photo.jpg', size: 0, mimeType: 'image/jpeg', path: 'uploads/photo.jpg' },
+        { id: 'u1:attachment:1', name: 'brief.pdf', size: 0, mimeType: 'application/pdf', path: 'uploads/brief.pdf' },
+      ]);
+    });
+
+    it('leaves a message without attachments as it was', () => {
+      const [turn] = historyToTurns([
+        { id: 'u2', role: 'human', content: 'hi', tool_calls: null, turn_number: 1, created_at: '2026-11-17T22:00:00Z' },
+      ] as never) as UserTurn[];
+      expect(turn.content).toBe('hi');
+      expect(turn.attachments).toBeUndefined();
+    });
   });
 
   describe('historyToTurns — a returned tool error stays an error after replay', () => {
@@ -12496,6 +12547,309 @@ describe('PersistentChatService — control transport is declared, never inferre
     expect(ctx.service.continueAfterUpgrade()).toBe(true);
   });
 
+  // B1 of the 11-21 canvas run: "Upgrade & continue" clicked mid-turn was
+  // kept only in the page, a dropped connection erased it, and "The
+  // workspace upgrade will start after the current response" stayed on
+  // screen over an upgrade that never happened.
+  const intentKey = 'srw.workspace-upgrade.intent.socketless';
+  const controlCalls = (ctx: any) =>
+    ctx.mockHttp.post.mock.calls.filter(([url]: [string]) => String(url).endsWith('/controls'));
+  const inputPosts = (ctx: any) =>
+    ctx.mockHttp.post.mock.calls.filter(([url]: [string]) => String(url).endsWith('/input'));
+  const storedIntent = () => JSON.parse(sessionStorage.getItem(intentKey) ?? 'null');
+  async function reconnect(ctx: any) {
+    await ctx.service.connect('socketless');
+    fireSseOpen(ctx.sseInstances.at(-1));
+    TestBed.tick();
+  }
+  function snapshotSays(ctx: any, turnInFlight: boolean, threadMeta: Record<string, unknown> = {}) {
+    const base = socketlessGet(upgradeable, threadMeta);
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      url.endsWith('/state')
+        ? base(url).pipe(map((snapshot: any) => ({ ...snapshot, turn_in_flight: turnInFlight })))
+        : base(url),
+    );
+  }
+
+  it('a deferred upgrade survives a dropped connection and goes out once the turn is over', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    ctx.service.pendingTurnCount.set(1);
+    TestBed.tick();
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+    expect(controlCalls(ctx)).toHaveLength(0);
+    expect(storedIntent()).toMatchObject({ phase: 'pending', tier: 'sandbox', thenContinue: true });
+
+    // The connection drops (teardown) and comes back; the turn ended meanwhile.
+    await reconnect(ctx);
+
+    expect(controlCalls(ctx)).toHaveLength(1);
+    expect(controlCalls(ctx)[0][1]).toMatchObject({
+      method: 'upgrade-to-workspace',
+      target_tier: 'sandbox',
+      client_request_id: storedIntent().clientRequestId,
+    });
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+    expect(ctx.service.workspaceUpgradeInProgress()).toEqual({ tier: 'sandbox' });
+    // Admitted: only the continuation is left to remember.
+    expect(storedIntent()).toMatchObject({ phase: 'admitted', thenContinue: true });
+  });
+
+  it('a turn still running after the reconnect holds the upgrade until that turn ends', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.pendingTurnCount.set(1);
+    TestBed.tick();
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+
+    snapshotSays(ctx, true);
+    await reconnect(ctx);
+    // The snapshot alone says the turn runs; nothing may go out yet.
+    expect(controlCalls(ctx)).toHaveLength(0);
+
+    const es = ctx.sseInstances.at(-1)!;
+    fireSseMessage(es, { method: 'turn.started', params: { turn_id: 3 } }, '1:20');
+    TestBed.tick();
+    expect(controlCalls(ctx)).toHaveLength(0);
+    fireSseMessage(es, { method: 'turn.completed', params: { turn_id: 3 } }, '1:21');
+    TestBed.tick();
+
+    expect(controlCalls(ctx)).toHaveLength(1);
+    // One promise on screen, however many edges re-checked it.
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.control.upgradeDeferred'),
+    ).toHaveLength(1);
+  });
+
+  it('a reload sends the stored decision with its stored request id', async () => {
+    const before = await socketlessSession(upgradeable);
+    before.service.pendingTurnCount.set(1);
+    TestBed.tick();
+    before.service.upgradeWorkspace('sandbox', { thenContinue: true });
+    const stored = storedIntent();
+    expect(controlCalls(before)).toHaveLength(0);
+
+    // A reload: a new page (service) on the same tab's sessionStorage.
+    const ctx = await socketlessSession(upgradeable);
+    TestBed.tick();
+
+    expect(controlCalls(ctx)).toHaveLength(1);
+    expect(controlCalls(ctx)[0][1].client_request_id).toBe(stored.clientRequestId);
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+  });
+
+  it('a request lost to a teardown goes out again under the same request id', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    const lost = new Subject<unknown>();
+    ctx.mockHttp.post.mockReturnValueOnce(lost.asObservable()).mockReturnValue(of({ state: 'pending' }));
+
+    ctx.service.upgradeWorkspace('sandbox');
+    expect(controlCalls(ctx)).toHaveLength(1);
+
+    await reconnect(ctx);
+
+    const calls = controlCalls(ctx);
+    expect(calls).toHaveLength(2);
+    // The inbox admits a request id once: a second admission is a duplicate,
+    // never a second upgrade.
+    expect(calls[1][1].client_request_id).toBe(calls[0][1].client_request_id);
+    // Admitted without a continuation: nothing is left to remember.
+    expect(sessionStorage.getItem(intentKey)).toBeNull();
+    TestBed.tick();
+    expect(controlCalls(ctx)).toHaveLength(2);
+  });
+
+  it('a 425 while a turn is visibly running puts the upgrade back to wait, same request id', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    const answer = new Subject<unknown>();
+    ctx.mockHttp.post.mockReturnValueOnce(answer.asObservable()).mockReturnValue(of({ state: 'pending' }));
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+    const first = controlCalls(ctx)[0][1];
+
+    // Input another tab queued started a turn before the admission ran.
+    ctx.service.pendingTurnCount.set(1);
+    answer.error({ status: 425, error: { detail: 'Session is completing a turn; retry upgrade' } });
+    TestBed.tick();
+
+    expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
+    expect(ctx.service.error()).toBeNull();
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+    expect(controlCalls(ctx)).toHaveLength(1);
+
+    ctx.service.pendingTurnCount.set(0);
+    TestBed.tick();
+    expect(controlCalls(ctx)).toHaveLength(2);
+    expect(controlCalls(ctx)[1][1].client_request_id).toBe(first.client_request_id);
+  });
+
+  it('a refused upgrade forgets the stored decision', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(
+      throwError(() => ({ status: 409, error: { detail: 'already upgraded' } })),
+    );
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+    expect(sessionStorage.getItem(intentKey)).toBeNull();
+    expect(ctx.service.continueAfterUpgrade()).toBe(false);
+
+    await reconnect(ctx);
+    expect(controlCalls(ctx)).toHaveLength(1);
+  });
+
+  it('a stored decision for an earlier runtime is dropped, not sent', async () => {
+    sessionStorage.setItem(
+      intentKey,
+      JSON.stringify({
+        threadId: 'socketless',
+        tier: 'sandbox',
+        thenContinue: true,
+        clientRequestId: '11111111-1111-4111-8111-111111111111',
+        runtimeGeneration: '00000000-0000-4000-8000-000000000000',
+        phase: 'pending',
+      }),
+    );
+    const ctx = await socketlessSession(upgradeable);
+    TestBed.tick();
+
+    expect(controlCalls(ctx)).toHaveLength(0);
+    expect(sessionStorage.getItem(intentKey)).toBeNull();
+  });
+
+  it('an admitted upgrade keeps its continuation across a reconnect; the completion ends the decision', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    ctx.service.upgradeWorkspace('sandbox', { thenContinue: true });
+    expect(storedIntent()).toMatchObject({ phase: 'admitted' });
+
+    await reconnect(ctx);
+    expect(ctx.service.continueAfterUpgrade()).toBe(true);
+    // Admitted means sent: the reconnect does not send it again.
+    expect(controlCalls(ctx)).toHaveLength(1);
+
+    fireSseMessage(
+      ctx.sseInstances.at(-1)!,
+      { method: 'workspace_upgrade.complete', params: { target_tier: 'sandbox', seeded_files: 1 } },
+      '1:30',
+    );
+    expect(sessionStorage.getItem(intentKey)).toBeNull();
+    await vi.waitFor(() => expect(inputPosts(ctx)).toHaveLength(1));
+    expect(inputPosts(ctx)[0][1].content).toBe('chat.workspaceOffer.continueMessage');
+  });
+
+  // B2 of the same run: the continuation the Cockpit sends after the upgrade
+  // hit a dropped connection and sat as "Not sent — Retry / Discard".
+  async function continuationStalled(ctx: any) {
+    // Settle the connect's own effects first: only a later edge may retry.
+    TestBed.tick();
+    ctx.service.continueAfterUpgrade.set(true);
+    ctx.mockHttp.post.mockImplementation((url: string) =>
+      String(url).endsWith('/input') ? throwError(() => ({ status: 0 })) : of({ state: 'pending' }),
+    );
+    fireSseMessage(
+      ctx.sseInstances.at(-1)!,
+      { method: 'workspace_upgrade.complete', params: { target_tier: 'sandbox' } },
+      '1:30',
+    );
+    await vi.waitFor(() => expect(ctx.service.outboxStalled()).toBe(true));
+    expect(inputPosts(ctx)).toHaveLength(1);
+  }
+  const continuationBubbles = (ctx: any) =>
+    ctx.service
+      .turns()
+      .filter((t: Turn) => isUserTurn(t) && t.content === 'chat.workspaceOffer.continueMessage');
+  async function connectionBack(ctx: any) {
+    ctx.service.connectionState.set('connecting');
+    TestBed.tick();
+    ctx.service.connectionState.set('connected');
+    TestBed.tick();
+  }
+
+  it('the automatic continuation sends itself again when the connection is back', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    await continuationStalled(ctx);
+    expect(ctx.service.outbox()[0].automatic).toEqual({ turnsBefore: 2, unconfirmed: true });
+
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 3 }));
+    await connectionBack(ctx);
+
+    await vi.waitFor(() => expect(inputPosts(ctx)).toHaveLength(2));
+    expect(inputPosts(ctx)[1][1].content).toBe('chat.workspaceOffer.continueMessage');
+    await vi.waitFor(() => expect(ctx.service.outbox()).toEqual([]));
+    expect(ctx.service.outboxStalled()).toBe(false);
+    expect(continuationBubbles(ctx)).toHaveLength(1);
+  });
+
+  it('a continuation that landed under a lost answer is never sent again', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    await continuationStalled(ctx);
+
+    // The server took it before the answer was lost: total_turns moved on.
+    ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, { total_turns: 3 }));
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 4 }));
+    await connectionBack(ctx);
+
+    await vi.waitFor(() => expect(ctx.service.outbox()).toEqual([]));
+    expect(inputPosts(ctx)).toHaveLength(1);
+    expect(ctx.service.outboxStalled()).toBe(false);
+    expect(continuationBubbles(ctx)).toHaveLength(1);
+  });
+
+  it('a manual Retry of the continuation checks the turn count too', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    await continuationStalled(ctx);
+    ctx.mockHttp.get.mockImplementation(socketlessGet(upgradeable, { total_turns: 3 }));
+
+    ctx.service.retryQueuedSends();
+
+    await vi.waitFor(() => expect(ctx.service.outbox()).toEqual([]));
+    expect(inputPosts(ctx)).toHaveLength(1);
+  });
+
+  it('the automatic continuation also retries on its own clock', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      await continuationStalled(ctx);
+      ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 3 }));
+
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(inputPosts(ctx)).toHaveLength(2);
+      expect(ctx.service.outbox()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('typing while the continuation waits drops it: the user resumed the agent', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    await continuationStalled(ctx);
+
+    await ctx.service.sendMessage('do the other thing first');
+
+    expect(ctx.service.outbox().map((item: any) => item.displayContent)).toEqual([
+      'do the other thing first',
+    ]);
+    expect(continuationBubbles(ctx)).toHaveLength(0);
+  });
+
+  it('the continuation takes nothing from the composer', async () => {
+    const ctx = await socketlessSession(upgradeable);
+    ctx.service.continueAfterUpgrade.set(true);
+    ctx.service.pendingAttachments.set([
+      { id: 'a1', name: 'notes.txt', size: 3, mimeType: 'text/plain', file: new File(['abc'], 'notes.txt') } as any,
+    ]);
+    ctx.mockHttp.post.mockReturnValue(of({ accepted: true, turn_id: 3 }));
+    fireSseMessage(
+      ctx.sseInstances.at(-1)!,
+      { method: 'workspace_upgrade.complete', params: { target_tier: 'sandbox' } },
+      '1:30',
+    );
+    await vi.waitFor(() => expect(inputPosts(ctx)).toHaveLength(1));
+    expect(inputPosts(ctx)[0][1].content).toBe('chat.workspaceOffer.continueMessage');
+    expect(ctx.service.pendingAttachments()).toHaveLength(1);
+  });
+
   it('a refused upgrade leaves no provisioning line behind', async () => {
     // 10-19: each refused try left a "provisioning…" line in the chat.
     const ctx = await socketlessSession(upgradeable);
@@ -13623,6 +13977,30 @@ describe('PersistentChatService — queue state (parked / poll / retry)', () => 
     expect(ctx.service.isParked()).toBe(false);
   });
 
+  it('re-reads the queue when a turn.parked frame arrives so the Continue/Stop card can show', async () => {
+    const ctx = await readyOn('thread-tp');
+    const turnEndPark = {
+      ...parkedBlock,
+      park_reason: 'loop_died_after_tool_effect',
+      retryable: false,
+    };
+    const getQueue = vi.fn().mockReturnValue(of(turnEndPark));
+    (ctx.mockApi as any).getThreadQueue = getQueue;
+
+    // A park journals no target turn id, and here no turn is active either:
+    // the frame alone names nothing to close, yet the queue block changed.
+    fireSseMessage(
+      ctx.sseInstances[0],
+      { method: 'turn.parked', params: { reason: 'loop_died_after_tool_effect' } },
+      '2:1',
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(getQueue).toHaveBeenCalledWith('thread-tp');
+    expect(ctx.service.isParked()).toBe(true);
+    expect(ctx.service.queueState()?.park_reason).toBe('loop_died_after_tool_effect');
+  });
+
   it('a refused retry re-reads the block, so a unit settled elsewhere unparks', async () => {
     const ctx = await readyOn('thread-rr', { queue: parkedBlock });
     await new Promise((r) => setTimeout(r, 0));
@@ -13682,6 +14060,7 @@ describe('PersistentChatComponent — pending VM IDE ownership', () => {
       idePollingTimer: null, pendingVmIdeOpen: null, vmIdeOpenDestroyed: false, startupTickInterval: null,
       compactionTimer: null, capabilitiesSub: null, recordingStateSub: null,
       isRecording: signal(false),
+      voiceRecording: {isStarting: () => false, cancelRecording: vi.fn()},
     });
   });
 

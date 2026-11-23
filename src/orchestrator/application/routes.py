@@ -107,6 +107,7 @@ from orchestrator.routers import (
     thread_transport as thread_transport_routes,
     unit_claim as unit_claim_routes,
     usage_reporting as usage_reporting_routes,
+    version as version_routes,
     user_administration as user_administration_routes,
     verification as verification_routes,
     vm_creation_retry_authority as vm_creation_retry_authority_routes,
@@ -179,6 +180,9 @@ def bind_router_dependencies(app: FastAPI, resources: ApplicationResources) -> N
     )
     app.state.identity_dependencies_factory = (
         lambda: administration_composition.identity_dependencies(resources)
+    )
+    app.state.version_dependencies_factory = (
+        lambda: administration_composition.version_dependencies(resources)
     )
     app.state.access_token_dependencies_factory = (
         lambda: administration_composition.access_token_dependencies(resources)
@@ -453,6 +457,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(job_artifacts_routes.router)
     app.include_router(diagnostics_routes.router)
     app.include_router(identity_routes.router)
+    app.include_router(version_routes.router)
     app.include_router(access_token_routes.router)
     app.include_router(ssh_access_routes.router)
     app.include_router(usage_reporting_routes.router)

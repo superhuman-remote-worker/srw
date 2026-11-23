@@ -197,6 +197,9 @@ def filter_tools_by_backend(tool_names: List[str], backend: Any) -> List[str]:
         drop_categories.add("workspace")
         drop_categories.add("skills")
         drop_categories.add("canvas")
+        # generate_image saves its images into the workspace; on the
+        # throwaway ``none`` tier nobody could ever see them.
+        drop_categories.add("image_generation")
     # Canvas is a positive, externally materializable capability. Unknown and
     # custom backends must opt in explicitly; file-tool support alone says
     # nothing about whether the orchestrator can read the same bytes.
@@ -244,6 +247,7 @@ _OFFICER_DENIED_CATEGORIES = frozenset(
         "canvas",
         "repo",
         "webdav",
+        "image_generation",
     }
 )
 
@@ -542,6 +546,21 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
         except Exception as e:
             logger.warning(f"Could not load research tools: {e}")
 
+    # Image generation: built only when dispatch delivered an ``image``
+    # section (a pinned image_generation catalog row), like the web tools.
+    if "image_generation" in tools_by_category:
+        try:
+            from agent.tools.image_generation import create_image_generation_tools
+
+            image_tools = create_image_generation_tools(context)
+            requested = set(tools_by_category["image_generation"])
+            for tool in image_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded image generation tool: {tool.name}")
+        except Exception as e:
+            logger.warning(f"Could not load image generation tools: {e}")
+
     # Managed product help is persistent-session infrastructure and has no
     # workspace, datasource, or optional-service dependency.
     if "product_help" in tools_by_category:
@@ -669,7 +688,21 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
             try:
                 manager = context.connection_for("mcp")
                 requested = set(tools_by_category["mcp"])
-                for tool in manager.get_langchain_tools():
+                save_file = None
+                if context.has_workspace():
+                    from agent.tools.workspace.files import save_workspace_file
+
+                    def save_file(path: str, data: bytes, overwrite: bool) -> str:
+                        return save_workspace_file(
+                            context, path, data, overwrite=overwrite
+                        )
+
+                # Bound to this context's model: an image a server returns
+                # reaches only a model that takes images. A resource is saved
+                # into this context's workspace.
+                for tool in manager.get_langchain_tools(
+                    sees_images=context.get_phase_multimodal, save_file=save_file
+                ):
                     if tool.name in requested:
                         all_tools.append(tool)
                         logger.debug(f"Loaded MCP tool: {tool.name}")
@@ -740,10 +773,17 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     # Knowledge tools
     if "knowledge" in tools_by_category:
         if not context.has_knowledge():
-            logger.warning(
-                "Knowledge tools require knowledge_store in ToolContext "
-                "(knowledge_graph/Neo4j is optional — graph tools degrade)"
-            )
+            if getattr(context, "knowledge_bindings", None):
+                logger.warning(
+                    "Knowledge tools require knowledge_store in ToolContext "
+                    "(knowledge_graph/Neo4j is optional — graph tools degrade)"
+                )
+            else:
+                # Not a fault: this job or session runs without a knowledge
+                # base (its connector list leaves it out).
+                logger.info(
+                    "No knowledge base is attached; knowledge tools are not loaded"
+                )
         else:
             try:
                 knowledge_tools = create_knowledge_tools(context)

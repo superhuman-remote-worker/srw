@@ -12,6 +12,7 @@ from orchestrator.services.project_loop_spawn import (
     ProjectLoopDependencies,
     spawn_loop_job,
 )
+from tests._kb_context import KbMockContext
 
 
 # =============================================================================
@@ -32,7 +33,7 @@ def _kb_context(job_id=None):
     below) is the proven path, already exercised with a bare ``MagicMock`` in
     tests/test_tool_vocabularies.py::test_kb_tool_params_are_constrained.
     """
-    ctx = MagicMock()
+    ctx = KbMockContext()  # the project's knowledge base is attached
     ctx.project_id = str(uuid.uuid4())
     ctx.project_ids = [ctx.project_id]
     ctx.job_id = job_id or "aaaaaaaa-0000-0000-0000-000000000001"
@@ -425,7 +426,7 @@ class TestKbListPriorityDisplay:
         lines = [line for line in result.splitlines() if "add-dark-mode" in line]
         assert len(lines) == 1
         assert lines[0] == (
-            "● **add-dark-mode** — Add dark mode (feature [priority: high])"
+            "● [project] **project:add-dark-mode** — Add dark mode (feature [priority: high])"
         )
 
     def test_non_ticket_row_is_byte_identical_to_pre_task3_format(self):
@@ -445,7 +446,10 @@ class TestKbListPriorityDisplay:
         result = tools["kb_list"].invoke({})
         lines = [line for line in result.splitlines() if "chose-jwt" in line]
         assert len(lines) == 1
-        assert lines[0] == "● **chose-jwt** — Chose JWT (decision [high])"
+        assert (
+            lines[0]
+            == "● [project] **project:chose-jwt** — Chose JWT (decision [high])"
+        )
         assert "priority" not in lines[0]
 
 

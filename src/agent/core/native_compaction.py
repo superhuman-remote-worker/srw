@@ -50,13 +50,18 @@ STRATEGY_AUXILIARY = "auxiliary"
 # Recipes with an instruction file under config/prompts/compaction/<name>/
 # (sources in that directory's README). Only these names are ever turned into
 # a path.
-KNOWN_RECIPES = ("codex", "claude")
+KNOWN_RECIPES = ("codex", "claude", "deepseek")
 
 # Recipes whose instruction asks for the summary inside <summary></summary>:
 # the summary is the last such block (as Claude Code reads it); a reply
 # without one is not a summary.
 _TAGGED_RECIPES = ("claude",)
 _SUMMARY_BLOCK = re.compile(r"<summary>\s*(.*?)\s*</summary>", re.S | re.I)
+
+# Recipes whose instruction prescribes Markdown sections: a reply without a
+# single heading answered something else (a refusal, a reply to the last
+# message), as on the auxiliary fold.
+_SECTIONED_RECIPES = ("deepseek",)
 
 # Output room assumed when the client's own output cap cannot be read
 # (Codex keeps the same 16k buffer for its own fallback).
@@ -252,7 +257,9 @@ def summary_from_reply(
     ):
         return None, "refusal"
     try:
-        text = validate_summary_message(reply, expect_sections=False)
+        text = validate_summary_message(
+            reply, expect_sections=recipe in _SECTIONED_RECIPES
+        )
     except SummaryRejected as e:
         return None, e.reason
     if recipe in _TAGGED_RECIPES:

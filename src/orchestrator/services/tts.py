@@ -31,15 +31,38 @@ from typing import Any, Optional
 
 import httpx
 import yaml
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
 from orchestrator.services.capability_credentials import (
     resolve_capability_credentials as _resolve_capability_credentials,
 )
 from orchestrator.services.family_matcher import detect_family
 from orchestrator.services.usage_ledger import UsageEvent, UsageLedger
+from shared.tls_pinning import TlsPin, pin_failure_in, pinned_sdk_http_client
 
 logger = logging.getLogger(__name__)
+
+
+def _openai_client(
+    *,
+    base_url: Optional[str],
+    api_key: Optional[str],
+    tls_pin: Optional[TlsPin],
+    timeout: float,
+) -> AsyncOpenAI:
+    """The one OpenAI-compatible client every TTS stage builds.
+
+    ``max_retries=0``: a down/erroring endpoint must fail in seconds, not retry
+    with backoff for minutes. An endpoint's pinned certificate, when it has one,
+    is the only trust anchor (the handshake fails before the key is sent).
+    """
+    return AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
+        max_retries=0,
+        http_client=pinned_sdk_http_client(DefaultAsyncHttpxClient, tls_pin, base_url),
+    )
 
 
 class TtsSynthesisError(RuntimeError):
@@ -610,6 +633,7 @@ async def _formulate_for_speech(
     model: str,
     base_url: Optional[str],
     api_key: Optional[str],
+    tls_pin: Optional[TlsPin],
     timeout: float = 30.0,
     ledger: Optional[UsageLedger] = None,
     user_id: Optional[str] = None,
@@ -643,8 +667,11 @@ async def _formulate_for_speech(
     # max_retries=0: a down/erroring endpoint must fail in seconds, not retry
     # with backoff for minutes — the "Read aloud" button would otherwise appear
     # to hang. (A 503 here previously stretched a single click to ~213s.)
-    client = AsyncOpenAI(
-        api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
+    client = _openai_client(
+        api_key=api_key,
+        base_url=base_url,
+        tls_pin=tls_pin,
+        timeout=timeout,
     )
     try:
         response = await client.chat.completions.create(
@@ -1092,6 +1119,7 @@ async def _synthesize_speech(
     voice: str,
     base_url: Optional[str],
     api_key: Optional[str],
+    tls_pin: Optional[TlsPin],
     timeout: float = 120.0,
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
@@ -1129,8 +1157,11 @@ async def _synthesize_speech(
     # max_retries=0: a down/erroring endpoint must fail in seconds, not retry
     # with backoff for minutes — the "Read aloud" button would otherwise appear
     # to hang. (A 503 here previously stretched a single click to ~213s.)
-    client = AsyncOpenAI(
-        api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
+    client = _openai_client(
+        api_key=api_key,
+        base_url=base_url,
+        tls_pin=tls_pin,
+        timeout=timeout,
     )
     extra = {"instructions": instructions} if instructions else {}
     try:
@@ -1150,6 +1181,11 @@ async def _synthesize_speech(
             voice,
             len(text),
         )
+        # A pinned certificate that no longer matches: say so (the SDK wraps it
+        # as a connection error), so the admin knows to trust it again.
+        pin_failure = pin_failure_in(exc)
+        if pin_failure is not None:
+            raise TtsSynthesisError(str(pin_failure)) from exc
         # Classify actionable upstream errors (bad key, quota/rate limit) so the
         # UI can say what's wrong; the OpenAI SDK exposes the HTTP status.
         code = _tts_error_code(getattr(exc, "status_code", None))
@@ -1230,6 +1266,7 @@ async def generate_message_tts(
                 model=aux_creds.wire_model,
                 base_url=aux_creds.base_url,
                 api_key=aux_creds.api_key,
+                tls_pin=aux_creds.tls_pin,
                 ledger=ledger,
                 user_id=user_id,
                 ref_id=ref_id,
@@ -1255,6 +1292,7 @@ async def generate_message_tts(
         voice=voice,
         base_url=tts_creds.base_url,
         api_key=tts_creds.api_key,
+        tls_pin=tts_creds.tls_pin,
         instructions=instructions,
         provider=tts_params.get("provider"),
     )
@@ -1371,6 +1409,7 @@ async def synthesize_voice_preview(
         voice=resolved_voice,
         base_url=tts_creds.base_url,
         api_key=tts_creds.api_key,
+        tls_pin=tts_creds.tls_pin,
         instructions=instructions,
         provider=tts_params.get("provider"),
     )
@@ -1630,12 +1669,16 @@ async def _resplit_oversized(
     model: str,
     base_url: Optional[str],
     api_key: Optional[str],
+    tls_pin: Optional[TlsPin],
     timeout: float = 60.0,
 ) -> list[str]:
     """Re-prompt the LLM to split any chunk that exceeds the limit at a natural
     break (one pass, in order). Anything still over is left for the code gate."""
-    client = AsyncOpenAI(
-        api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
+    client = _openai_client(
+        api_key=api_key,
+        base_url=base_url,
+        tls_pin=tls_pin,
+        timeout=timeout,
     )
     result: list[str] = []
     prompt = (
@@ -1674,6 +1717,7 @@ async def _llm_clean_and_chunk(
     model: str,
     base_url: Optional[str],
     api_key: Optional[str],
+    tls_pin: Optional[TlsPin],
     timeout: float = 30.0,
     ledger: Optional[UsageLedger] = None,
     user_id: Optional[str] = None,
@@ -1692,8 +1736,11 @@ async def _llm_clean_and_chunk(
     """
     if not api_key:
         return None
-    client = AsyncOpenAI(
-        api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
+    client = _openai_client(
+        api_key=api_key,
+        base_url=base_url,
+        tls_pin=tls_pin,
+        timeout=timeout,
     )
     try:
         response = await client.chat.completions.create(
@@ -1750,7 +1797,11 @@ async def _llm_clean_and_chunk(
         return None
     if any(len(chunk) > TTS_CHUNK_LIMIT for chunk in chunks):
         chunks = await _resplit_oversized(
-            chunks, model=model, base_url=base_url, api_key=api_key
+            chunks,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            tls_pin=tls_pin,
         )
     return chunks
 
@@ -1833,6 +1884,7 @@ async def plan_tts_chunks(
                 model=aux_creds.wire_model,
                 base_url=aux_creds.base_url,
                 api_key=aux_creds.api_key,
+                tls_pin=aux_creds.tls_pin,
                 ledger=ledger,
                 user_id=user_id,
                 ref_id=ref_id,
@@ -1958,11 +2010,11 @@ async def stream_tts_chunks(
 
     aux_model = aux_creds.wire_model
     aux_base_url = aux_creds.base_url
-    client = AsyncOpenAI(
+    client = _openai_client(
         api_key=aux_creds.api_key,
         base_url=aux_base_url,
+        tls_pin=aux_creds.tls_pin,
         timeout=_STREAM_MAX_TOTAL,
-        max_retries=0,
     )
     buffer = ""
     produced_any = False

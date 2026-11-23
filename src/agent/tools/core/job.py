@@ -27,6 +27,7 @@ from typing import Annotated, Any, Dict, List, Optional
 from langchain_core.tools import InjectedToolCallId, tool
 
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from agent.core.bound_tools import binds_todo_tool
 from agent.managers.todo import todo_headline
 from agent.tools.context import ToolContext
 from agent.tools.core.todo import close_last_pending_todo
@@ -44,6 +45,37 @@ logger = logging.getLogger(__name__)
 # before the tool returns); this dict only saves the common no-restart case a
 # DB round-trip. Re-seeded on resume by agent-side hydration.
 _final_phase_data: Dict[str, Dict[str, Any]] = {}
+
+# Jobs that already received their one corrective refusal for a listed
+# deliverable that does not exist. Only jobs without ``todo_complete`` get
+# that refusal; their next call is accepted with the problem recorded.
+_missing_deliverable_refused: set = set()
+
+# The bound description of ``job_complete`` for a job whose tools do not
+# include ``todo_complete``: its one task is closed by this call, so the text
+# speaks of ending the job, not of phases or remaining to-dos. Set at bind
+# time (``apply_job_complete_description``); the docstring below stays the
+# description for every other job.
+JOB_COMPLETE_DESCRIPTION_WITHOUT_TODO_TOOL = """End the job and hand in its result.
+
+Call this when the task in the brief is done, or when it cannot be done (then
+say so in the summary). This call ends the job.
+
+Args:
+    summary: What was done, and anything that could not be done (2-5 sentences)
+    deliverables: The files you created or changed, as workspace paths. List
+        only files that exist; an empty list is valid.
+    confidence: Your confidence that the task is done (0.0-1.0, default 1.0)
+    notes: Optional notes about limitations, edge cases, or recommendations
+    evidence: Optional declared evidence entries for supervision review.
+        Each entry: {"kind": "test_report"|"screenshot"|"change_summary",
+        "label": "<short label>", "media_type": "<MIME type>",
+        "source": "<workspace-relative committed file path>"}. The
+        orchestrator resolves each path at the completion commit and
+        publishes it in the job's bounded evidence manifest.
+
+Returns:
+    Confirmation that the job ends, or why the call was refused"""
 
 
 # Tool metadata for registry
@@ -164,6 +196,14 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             Confirmation that phase is marked as final, or error if in tactical phase
         """
         try:
+            # A job without todo_complete closes its one task with this call:
+            # its results never mention phases or todo_complete, and its
+            # deliverable check is relaxed (see below). Read from the loaded
+            # tool list, which is set before the model can call any tool.
+            todo_tool_bound = binds_todo_tool(
+                getattr(context, "_resolved_tool_names", None)
+            )
+
             # Check if we're in a strategic phase
             is_strategic = True
             if context.has_todo():
@@ -212,6 +252,31 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                 logger.info(
                     f"job_complete called again for job {context.job_id} - already marked as final"
                 )
+                # The decision is recorded, but the one todo that asked for it
+                # can still be pending: a restart between the decision's
+                # journal write and the next checkpoint restores exactly that
+                # state. Close it here as the first call would have, or a job
+                # without todo_complete could never end.
+                closed = None
+                pending_count = 0
+                if context.has_todo():
+                    closed = close_last_pending_todo(
+                        context, "Marked the job final with job_complete."
+                    )
+                    pending_count = len(context.todo_manager.list_pending())
+                if not todo_tool_bound:
+                    if pending_count == 0:
+                        return "The job is already marked as complete. It ends now."
+                    return (
+                        f"The job is already marked as complete. It ends when "
+                        f"its {pending_count} open tasks are closed."
+                    )
+                if closed is not None and pending_count == 0:
+                    return (
+                        f"Phase is already marked as final. Completed the last "
+                        f"todo ({todo_headline(closed.content)}) - job will "
+                        f"complete now."
+                    )
                 return (
                     "Phase is already marked as final. Complete your remaining todos\n"
                     "to finish the job."
@@ -238,6 +303,7 @@ def create_job_tools(context: ToolContext) -> List[Any]:
 
             validation_warnings = []
             found_paths: List[str] = []
+            missing_paths: List[str] = []
 
             # Check that listed deliverables exist and are non-empty
             for deliverable in deliverables:
@@ -247,6 +313,7 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                     # orchestrator's gate, not against the workspace.
                     continue
                 if not found:
+                    missing_paths.append(deliverable)
                     validation_warnings.append(
                         f"Deliverable '{deliverable}' does not exist"
                     )
@@ -288,14 +355,29 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                                 f"Deliverable '{deliverable}' appears empty or trivial ({size} bytes)"
                             )
 
-            # Reject high confidence with validation warnings
-            if validation_warnings and confidence > 0.5:
-                warning_list = "\n".join(f"  - {w}" for w in validation_warnings)
+            if todo_tool_bound:
+                # Reject high confidence with validation warnings
+                if validation_warnings and confidence > 0.5:
+                    warning_list = "\n".join(f"  - {w}" for w in validation_warnings)
+                    return (
+                        f"ERROR: Cannot accept confidence {confidence:.0%} with deliverable issues:\n"
+                        f"{warning_list}\n\n"
+                        "Either fix the deliverables, or lower confidence below 0.5 to acknowledge "
+                        "the issues. Re-call job_complete after addressing these problems."
+                    )
+            elif missing_paths and context.job_id not in _missing_deliverable_refused:
+                # A job without todo_complete is not refused over a short
+                # file; its result may live elsewhere than in a file. A path
+                # that does not exist is refused once per job, so the model
+                # can correct the list; the next call is accepted and the
+                # problem recorded with the decision.
+                _missing_deliverable_refused.add(context.job_id)
+                missing_list = "\n".join(f"  - {p}" for p in missing_paths)
                 return (
-                    f"ERROR: Cannot accept confidence {confidence:.0%} with deliverable issues:\n"
-                    f"{warning_list}\n\n"
-                    "Either fix the deliverables, or lower confidence below 0.5 to acknowledge "
-                    "the issues. Re-call job_complete after addressing these problems."
+                    "ERROR: These listed deliverables do not exist in the "
+                    f"workspace:\n{missing_list}\n\n"
+                    "List only files that exist; an empty list is valid. "
+                    "Re-call job_complete with the corrected list."
                 )
 
             # Delivery: Markdown deliverables get footnote definitions for the
@@ -327,6 +409,10 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                 final_data["evidence"] = [
                     dict(entry) for entry in evidence if isinstance(entry, dict)
                 ][:20]
+            # A job without todo_complete was not refused over these: they
+            # travel with the decision into the completion report instead.
+            if validation_warnings and not todo_tool_bound:
+                final_data["deliverable_warnings"] = list(validation_warnings)
 
             # Journal-before-observe: the decision must be durable BEFORE the
             # model sees success. Nothing is cached locally until the
@@ -389,6 +475,25 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                 pending_count = len(context.todo_manager.list_pending())
 
             citation_line = _citation_delivery_line(citation_delivery)
+            if not todo_tool_bound:
+                warning_line = ""
+                if validation_warnings:
+                    warning_line = (
+                        "\nDeliverable warnings (recorded in the completion "
+                        "report):\n"
+                        + "\n".join(f"  - {w}" for w in validation_warnings)
+                    )
+                details = (
+                    f"Summary: {summary}\n"
+                    f"Deliverables: {len(deliverables)} files\n"
+                    f"Confidence: {confidence:.0%}" + citation_line + warning_line
+                )
+                if pending_count == 0:
+                    return f"Job marked as complete. It ends now.\n\n{details}"
+                return (
+                    f"Job marked as complete. It ends when its {pending_count} "
+                    f"open tasks are closed.\n\n{details}"
+                )
             if pending_count == 0 and closed is not None:
                 return (
                     f"Phase marked as final. Completed the last todo "
@@ -474,6 +579,18 @@ def _citation_delivery_line(delivery: Optional[Dict[str, Any]]) -> str:
             "edit_citation or withdraw them with withdraw_citation if you can."
         )
     return line
+
+
+def job_complete_description(loaded_tool_names: Any) -> Optional[str]:
+    """The bound description ``job_complete`` needs, or None to keep its own.
+
+    A job whose loaded tools do not include ``todo_complete`` gets
+    :data:`JOB_COMPLETE_DESCRIPTION_WITHOUT_TODO_TOOL`; every other job keeps
+    the docstring (None).
+    """
+    if binds_todo_tool(loaded_tool_names):
+        return None
+    return JOB_COMPLETE_DESCRIPTION_WITHOUT_TODO_TOOL
 
 
 def get_final_phase_data(job_id: str) -> Optional[Dict[str, Any]]:
