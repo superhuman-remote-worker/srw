@@ -243,7 +243,7 @@ def _main_cloud_client(health_check):
         store=SimpleNamespace(
             get_active_main_cloud_backend_instance=AsyncMock(return_value=None)
         ),
-        cloud_router=SimpleNamespace(active=active),
+        cloud_router=SimpleNamespace(active=active, active_instance_id=None),
     )
     dependencies = route_module.MainCloudSettingsRouteDependencies(
         operations=operations,

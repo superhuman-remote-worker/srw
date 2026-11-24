@@ -157,6 +157,10 @@ class ApplicationResources:
     #: Set at startup when the main cloud's installation authority could not
     #: be established; ``main_cloud_authority_retry`` calls it until it can.
     main_cloud_authority_retry: Callable[[], Awaitable[None]] | None = None
+    #: Why that authority is not established, while it is not (a reason of
+    #: ``instance_registry.AuthorityUnavailableReason``); the admin Main
+    #: cloud page shows it. ``None`` once established.
+    main_cloud_authority_unavailable: str | None = None
     persistent_thread_recycler: PersistentThreadRecycler | None = None
     usage_ledger: UsageLedger | None = None
     usage_rollup: UsageRollup | None = None

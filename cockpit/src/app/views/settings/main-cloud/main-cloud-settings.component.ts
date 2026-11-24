@@ -118,6 +118,12 @@ const RELATIVE_UNITS: [Intl.RelativeTimeFormatUnit, number][] = [
         </dd>
       </dl>
 
+      @if (p.authority && !p.authority.established) {
+        <p class="helm-note" role="alert" [attr.data-authority]="p.authority.reason ?? 'other'">
+          {{ 'settings.cloud.authority.' + (p.authority.reason ?? 'other') | transloco }}
+        </p>
+      }
+
       @if (p.configuration.helm.state !== 'matches') {
         <p class="helm-note" [attr.data-helm]="p.configuration.helm.state">
           {{ 'settings.cloud.helmNote.' + p.configuration.helm.state | transloco: {instance: p.provider.backend_instance_id} }}

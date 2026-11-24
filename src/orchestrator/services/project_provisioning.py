@@ -257,6 +257,13 @@ async def remove_project_member_from_backend_group(
     return True
 
 
+#: The project's cloud folder error when the main cloud is configured but
+#: its installation authority is not established, so no cloud effect may run
+#: (external_nextcloud_gives_srw_no_installation_proof). The heal that runs
+#: when the project is opened creates the folder, and clears this, once it is.
+MAIN_CLOUD_UNAVAILABLE = "main_cloud_unavailable"
+
+
 async def record_project_folder_error(
     project: dict[str, Any],
     error: str | None,
@@ -265,10 +272,11 @@ async def record_project_folder_error(
 ) -> None:
     """Store why the project has no main-cloud folder, or clear it (``None``).
 
-    ``error`` is a ``CloudBackendErrorKind`` value, a closed set the project
-    page turns into its own text, never the cloud's words. Unchanged values
-    are not written. Never raises: the record is where a failure surfaces,
-    not a reason to fail provisioning.
+    ``error`` is a ``CloudBackendErrorKind`` value or
+    :data:`MAIN_CLOUD_UNAVAILABLE`, a closed set the project page turns into
+    its own text, never the cloud's words. Unchanged values are not written.
+    Never raises: the record is where a failure surfaces, not a reason to
+    fail provisioning.
     """
     if project.get("main_cloud_folder_error") == error:
         return
@@ -371,11 +379,26 @@ async def ensure_project_cloud_resources(
             # branch above does, and as every remote effect below already
             # does. A cloudless installation gets a project without cloud
             # resources, which is the whole point of the optional tier.
-            logger.info(
-                "Project %s: skipping cloud resource provisioning — no active "
-                "main-cloud backend instance (%s).",
+            if not dependencies.main_cloud_router.active.is_configured:
+                logger.info(
+                    "Project %s: skipping cloud resource provisioning — no "
+                    "main cloud is configured (%s).",
+                    project_id_str,
+                    e,
+                )
+                return project
+            # A configured cloud whose installation is not proven: the
+            # project page says so (the admin's Main cloud page says why),
+            # and the heal on the next open creates the folder once it is.
+            logger.warning(
+                "Project %s: no cloud folder — the main cloud's installation "
+                "authority is not established (%s); retried when the project "
+                "is opened.",
                 project_id_str,
                 e,
+            )
+            await record_project_folder_error(
+                project, MAIN_CLOUD_UNAVAILABLE, dependencies=dependencies
             )
             return project
 

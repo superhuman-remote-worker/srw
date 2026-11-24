@@ -60,6 +60,31 @@ from orchestrator.services.cloud.config import (
 logger = logging.getLogger(__name__)
 
 
+#: Why the main cloud's installation authority is not established, as the
+#: admin Main cloud page reports it (a closed set the cockpit words; never the
+#: cloud's own text): the cloud is not configured, it did not answer (or its
+#: Group Folders app is missing), it answered but named no installation
+#: identity, or something else the orchestrator log names.
+AuthorityUnavailableReason = Literal[
+    "not_configured", "unreachable", "no_installation_identity", "other"
+]
+
+
+class MainCloudAuthorityUnavailable(RuntimeError):
+    """The configured main cloud could not be attested; ``reason`` says why."""
+
+    def __init__(self, reason: AuthorityUnavailableReason, message: str) -> None:
+        super().__init__(message)
+        self.reason: AuthorityUnavailableReason = reason
+
+
+def authority_unavailable_reason(exc: BaseException) -> AuthorityUnavailableReason:
+    """The page's reason for a failed authority attempt."""
+    if isinstance(exc, MainCloudAuthorityUnavailable):
+        return exc.reason
+    return "other"
+
+
 def _active_coordinates(value: Any) -> tuple[str, int, str] | None:
     if not isinstance(value, dict):
         return None
@@ -149,9 +174,16 @@ async def build_attested_main_cloud_candidate(
         backend.prepare_backend_instance_attestation(proposed_instance_id)
         initialized = await backend.ensure_initialized()
         proof = backend.installation_proof_sha256
-        if not initialized or proof is None:
-            raise RuntimeError(
-                "main-cloud backend did not attest a stable installation identity"
+        if not initialized:
+            raise MainCloudAuthorityUnavailable(
+                "unreachable" if backend.is_configured else "not_configured",
+                "main-cloud backend did not attest a stable installation identity "
+                "(it did not initialize)",
+            )
+        if proof is None:
+            raise MainCloudAuthorityUnavailable(
+                "no_installation_identity",
+                "main-cloud backend did not attest a stable installation identity",
             )
         authority = MainCloudBackendInstanceAuthority.capture(
             backend_instance_id=proposed_instance_id,
@@ -731,7 +763,10 @@ async def _reconcile_with_helm(
 
 __all__ = [
     "HELM_ACTOR",
+    "AuthorityUnavailableReason",
     "HelmConfigurationStatus",
+    "MainCloudAuthorityUnavailable",
+    "authority_unavailable_reason",
     "changed_fields",
     "confirms_replacement",
     "unattested_changes",

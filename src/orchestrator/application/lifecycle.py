@@ -507,9 +507,20 @@ async def bind_services(resources: ApplicationResources) -> None:
             "background): %s",
             _e,
         )
+        # The admin Main cloud page reports why until a retry succeeds.
+        resources.main_cloud_authority_unavailable = (
+            instance_registry.authority_unavailable_reason(_e)
+        )
 
         async def _retry_authority(overlay: Any = _legacy_overlay) -> None:
-            await establish_main_cloud_authority(resources, overlay)
+            try:
+                await establish_main_cloud_authority(resources, overlay)
+            except Exception as exc:
+                resources.main_cloud_authority_unavailable = (
+                    instance_registry.authority_unavailable_reason(exc)
+                )
+                raise
+            resources.main_cloud_authority_unavailable = None
 
         resources.main_cloud_authority_retry = _retry_authority
 

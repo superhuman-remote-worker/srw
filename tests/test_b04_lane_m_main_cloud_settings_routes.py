@@ -341,6 +341,43 @@ def test_the_page_reports_provider_installation_health_and_matrix(monkeypatch):
     assert not _contains_secret(body)
 
 
+def test_the_page_reports_an_established_authority(monkeypatch):
+    _helm(monkeypatch)
+    wired = _wire(store=_page_store(), cloud_router=_router(active=_page_backend()))
+
+    body = wired.client.get(PAGE).json()
+
+    assert body["authority"] == {"established": True, "reason": None}
+
+
+@pytest.mark.parametrize(
+    ("recorded", "reported"),
+    [
+        ("no_installation_identity", "no_installation_identity"),
+        ("unreachable", "unreachable"),
+        ("not_configured", "not_configured"),
+        # Nothing recorded yet (the first attempt is still running), or a
+        # value the page does not know: the log says why.
+        (None, "other"),
+        ("something new", "other"),
+    ],
+)
+def test_the_page_says_why_the_authority_is_missing(monkeypatch, recorded, reported):
+    """Every cloud effect fails closed without it; before 0.3.1 only a log
+    line said so (external_nextcloud_gives_srw_no_installation_proof)."""
+    _helm(monkeypatch, state="differs", detail="no_active")
+    store = _store(get_active_main_cloud_backend_instance=AsyncMock(return_value=None))
+    wired = _wire(
+        store=store,
+        cloud_router=_router(active=_page_backend(), active_instance_id=None),
+        authority_unavailable_reason=recorded,
+    )
+
+    body = wired.client.get(PAGE).json()
+
+    assert body["authority"] == {"established": False, "reason": reported}
+
+
 def test_the_page_reports_helm_drift_and_a_pending_replacement(monkeypatch):
     _helm(monkeypatch, state="differs", detail="provider")
     wired = _wire(
@@ -569,12 +606,14 @@ def test_the_composition_passes_the_charts_nextcloud_values():
         postgres_db=_store(),
         main_cloud_router=_router(),
         settings=SimpleNamespace(main_cloud_replace_installation="", **CHART),
+        main_cloud_authority_unavailable="no_installation_identity",
     )
 
     operations = workspace_composition.main_cloud_settings_dependencies(
         resources
     ).operations
 
+    assert operations.authority_unavailable_reason == "no_installation_identity"
     assert operations.nextcloud_cron_enabled is True
     assert operations.nextcloud_trashbin_retention == "disabled"
     assert operations.nextcloud_versions_retention == "disabled"

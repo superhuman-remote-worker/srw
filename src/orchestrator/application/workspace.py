@@ -515,6 +515,7 @@ def main_cloud_settings_dependencies(
             store=resources.postgres_db,
             cloud_router=resources.main_cloud_router,
             replace_installation=resources.settings.main_cloud_replace_installation,
+            authority_unavailable_reason=resources.main_cloud_authority_unavailable,
             nextcloud_cron_enabled=resources.settings.nextcloud_cron_enabled,
             nextcloud_trashbin_retention=(
                 resources.settings.nextcloud_trashbin_retention

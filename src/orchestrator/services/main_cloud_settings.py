@@ -58,6 +58,9 @@ class MainCloudSettingsDependencies:
     store: Any
     cloud_router: Any
     replace_installation: str = ""
+    #: Why this replica has no installation authority, while it has none
+    #: (``ApplicationResources.main_cloud_authority_unavailable``).
+    authority_unavailable_reason: str | None = None
     nextcloud_cron_enabled: bool | None = None
     nextcloud_trashbin_retention: str = ""
     nextcloud_versions_retention: str = ""
@@ -81,6 +84,29 @@ async def _health(backend: Any) -> dict[str, Any]:
         "ok": bool(status.ok),
         "latency_ms": round(float(status.latency_ms), 1),
         "detail": detail if _HEALTH_DETAIL.fullmatch(detail) else "unreachable",
+    }
+
+
+#: The reasons the page words; anything else reads as ``other``.
+_AUTHORITY_REASONS = frozenset(
+    {"not_configured", "unreachable", "no_installation_identity", "other"}
+)
+
+
+def _authority(dependencies: MainCloudSettingsDependencies) -> dict[str, Any]:
+    """Whether this replica holds the main cloud's installation authority.
+
+    Without it every cloud effect fails closed (no project folders, shares,
+    deliverable export or session mounts), so the page says so and why,
+    instead of only the orchestrator log
+    (external_nextcloud_gives_srw_no_installation_proof).
+    """
+    if dependencies.cloud_router.active_instance_id is not None:
+        return {"established": True, "reason": None}
+    reason = dependencies.authority_unavailable_reason
+    return {
+        "established": False,
+        "reason": reason if reason in _AUTHORITY_REASONS else "other",
     }
 
 
@@ -170,6 +196,7 @@ async def get_main_cloud_page(
             "initialized": bool(active.is_initialized),
         },
         "health": health,
+        "authority": _authority(dependencies),
         "background_jobs": background_jobs,
         "retention": retention,
         "configuration": {

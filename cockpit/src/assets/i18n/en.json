@@ -1909,6 +1909,12 @@
         "differs": "differ from the active installation",
         "invalid": "incomplete"
       },
+      "authority": {
+        "no_installation_identity": "SRW cannot tell which installation this cloud is, so every cloud feature is off: no project folders, shares, deliverable export or session mounts. For Nextcloud, SRW reads the installation's instance id from status.php or from the session cookie of its login page, and got neither. SRW tries again every minute.",
+        "unreachable": "SRW cannot reach this cloud, or its Group Folders app is missing, so every cloud feature is off: no project folders, shares, deliverable export or session mounts. SRW tries again every minute.",
+        "not_configured": "No main cloud is configured, so cloud features are off.",
+        "other": "SRW has not established which installation this cloud is, so every cloud feature is off. The orchestrator log names the reason. SRW tries again every minute."
+      },
       "helmNote": {
         "differs": "Helm's cloud values describe something other than the active installation. At its next start the orchestrator adopts only what attesting the installation proves (its internal URL or admin account); for anything else, or a different installation, set cloud.replaceInstallation to {{instance}} to confirm.",
         "invalid": "Helm's cloud values are incomplete (a required secret is unset), so the active installation keeps serving."
@@ -2152,6 +2158,7 @@
         "nameTaken": "This project has no cloud folder: the cloud already has folders with its name and its fallback name. Rename the project; SRW retries when it is opened, at most once an hour.",
         "refused": "This project has no cloud folder: the cloud refused SRW's administrator account. SRW retries when the project is opened, at most once an hour.",
         "unreachable": "This project has no cloud folder: the cloud could not be reached. SRW retries when the project is opened, at most once an hour.",
+        "notConnected": "This project has no cloud folder: SRW is not connected to the cloud yet (an administrator sees why under Settings → Main cloud). SRW creates the folder when the project is opened after that, at most once an hour.",
         "other": "This project has no cloud folder: creating it failed. SRW retries when the project is opened, at most once an hour."
       },
       "workspaceNetwork": "Workspace Network",

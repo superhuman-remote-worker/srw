@@ -1909,6 +1909,12 @@
         "differs": "weichen von der aktiven Installation ab",
         "invalid": "unvollständig"
       },
+      "authority": {
+        "no_installation_identity": "SRW kann nicht feststellen, welche Installation diese Cloud ist, daher sind alle Cloud-Funktionen aus: keine Projektordner, Freigaben, Ergebnis-Exporte oder Sitzungs-Mounts. Bei Nextcloud liest SRW die Instanz-ID der Installation aus status.php oder aus dem Sitzungs-Cookie ihrer Anmeldeseite und hat keine von beiden erhalten. SRW versucht es jede Minute erneut.",
+        "unreachable": "SRW erreicht diese Cloud nicht, oder ihr fehlt die App Group Folders, daher sind alle Cloud-Funktionen aus: keine Projektordner, Freigaben, Ergebnis-Exporte oder Sitzungs-Mounts. SRW versucht es jede Minute erneut.",
+        "not_configured": "Es ist keine Haupt-Cloud konfiguriert, daher sind die Cloud-Funktionen aus.",
+        "other": "SRW hat noch nicht festgestellt, welche Installation diese Cloud ist, daher sind alle Cloud-Funktionen aus. Den Grund nennt das Orchestrator-Log. SRW versucht es jede Minute erneut."
+      },
       "helmNote": {
         "differs": "Die cloud-Werte in Helm beschreiben etwas anderes als die aktive Installation. Beim nächsten Start übernimmt der Orchestrator nur, was die Attestierung der Installation belegt (interne URL oder Admin-Account); für alles andere oder eine andere Installation bestätigen Sie mit cloud.replaceInstallation = {{instance}}.",
         "invalid": "Die cloud-Werte in Helm sind unvollständig (ein erforderliches Secret fehlt), daher bleibt die aktive Installation in Betrieb."
@@ -2152,6 +2158,7 @@
         "nameTaken": "Dieses Projekt hat keinen Cloud-Ordner: In der Cloud gibt es schon Ordner mit seinem Namen und seinem Ausweichnamen. Benennen Sie das Projekt um; SRW versucht es erneut, wenn es geöffnet wird, höchstens einmal pro Stunde.",
         "refused": "Dieses Projekt hat keinen Cloud-Ordner: Die Cloud hat SRWs Administratorkonto abgewiesen. SRW versucht es erneut, wenn das Projekt geöffnet wird, höchstens einmal pro Stunde.",
         "unreachable": "Dieses Projekt hat keinen Cloud-Ordner: Die Cloud war nicht erreichbar. SRW versucht es erneut, wenn das Projekt geöffnet wird, höchstens einmal pro Stunde.",
+        "notConnected": "Dieses Projekt hat keinen Cloud-Ordner: SRW ist noch nicht mit der Cloud verbunden (warum, sieht ein Administrator unter Einstellungen → Main Cloud). SRW legt den Ordner danach an, wenn das Projekt geöffnet wird, höchstens einmal pro Stunde.",
         "other": "Dieses Projekt hat keinen Cloud-Ordner: Das Anlegen ist fehlgeschlagen. SRW versucht es erneut, wenn das Projekt geöffnet wird, höchstens einmal pro Stunde."
       },
       "workspaceNetwork": "Workspace-Netzwerk",

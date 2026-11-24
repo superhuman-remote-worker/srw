@@ -3089,6 +3089,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       unavailable: 'unreachable',
       timeout: 'unreachable',
       throttled: 'unreachable',
+      main_cloud_unavailable: 'notConnected',
     };
     return `projectDetail.settings.cloudFolderFailed.${known[kind] ?? 'other'}`;
   }

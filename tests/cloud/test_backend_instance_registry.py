@@ -131,6 +131,57 @@ async def test_candidate_prepares_provisional_instance_before_remote_attestation
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "initialized", "proof", "reason"),
+    [
+        (True, True, None, "no_installation_identity"),
+        (True, False, None, "unreachable"),
+        (False, False, None, "not_configured"),
+    ],
+)
+async def test_a_candidate_that_does_not_attest_says_why(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: bool,
+    initialized: bool,
+    proof: str | None,
+    reason: str,
+) -> None:
+    """The admin Main cloud page words the reason
+    (external_nextcloud_gives_srw_no_installation_proof)."""
+    import orchestrator.services.cloud.instance_registry as registry
+
+    class _Backend(FakeMainCloudBackend):
+        backend_id = "nextcloud"
+
+        @property
+        def is_configured(self) -> bool:
+            return configured
+
+        async def ensure_initialized(self) -> bool:
+            self._installation_proof_sha256 = proof
+            return initialized
+
+    backend = _Backend(start_initialized=False)
+    authority = _authority()
+    settings = type("Settings", (), {"backend_id": "nextcloud"})()
+    monkeypatch.setattr(registry, "load_main_cloud_config", lambda **_kwargs: settings)
+    monkeypatch.setattr(
+        registry, "main_cloud_secret_references", lambda *_a: authority.secret_refs
+    )
+    monkeypatch.setattr(
+        registry, "main_cloud_routing_snapshot", lambda _s: authority.routing
+    )
+    monkeypatch.setattr(registry, "build_backend_from_config", lambda _s: backend)
+
+    with pytest.raises(registry.MainCloudAuthorityUnavailable) as raised:
+        await build_attested_main_cloud_candidate(backend_instance_id=_A)
+
+    assert raised.value.reason == reason
+    assert registry.authority_unavailable_reason(raised.value) == reason
+    assert registry.authority_unavailable_reason(RuntimeError("x")) == "other"
+
+
+@pytest.mark.asyncio
 async def test_reload_rereads_pointer_before_process_local_swap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1022,6 +1073,10 @@ def test_startup_hands_a_failed_authority_to_the_retry_task():
     source = inspect.getsource(lifecycle.bind_services)
     assert "await establish_main_cloud_authority(resources, _legacy_overlay)" in source
     assert "resources.main_cloud_authority_retry = _retry_authority" in source
+    # The admin page's reason is recorded at the failure and kept current by
+    # every retry, and cleared by the one that succeeds.
+    assert source.count("resources.main_cloud_authority_unavailable = (") == 2
+    assert "resources.main_cloud_authority_unavailable = None" in source
     started = inspect.getsource(background_tasks.start_background_tasks)
     assert '"main_cloud_authority_retry"' in started
     assert "resources.main_cloud_authority_retry" in started

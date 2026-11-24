@@ -60,6 +60,24 @@ export type MainCloudRetention =
   | {source: 'chart'; trashbin: string | null; versions: string | null}
   | {source: 'external'};
 
+/** Why the main cloud's installation authority is not established. */
+export type MainCloudAuthorityReason =
+  | 'not_configured'
+  | 'unreachable'
+  | 'no_installation_identity'
+  | 'other';
+
+/**
+ * Whether this orchestrator holds the cloud's installation authority. Without
+ * it every cloud effect is off: no project folders, shares, deliverable export
+ * or session mounts.
+ */
+export interface MainCloudAuthority {
+  established: boolean;
+  /** null when established. */
+  reason: MainCloudAuthorityReason | null;
+}
+
 export interface MainCloudPage {
   provider: {
     backend_id: string;
@@ -71,6 +89,8 @@ export interface MainCloudPage {
     initialized: boolean;
   };
   health: {ok: boolean; latency_ms: number | null; detail: string};
+  /** Absent from an orchestrator older than 0.3.1: the page then shows nothing. */
+  authority?: MainCloudAuthority;
   /**
    * null for a provider without background jobs (OpenCloud); absent from an
    * orchestrator older than D13. Either way the page shows nothing.

@@ -1029,6 +1029,8 @@ describe('ProjectDetailPageComponent cloud storage settings', () => {
     expect(text('already_exists')).toContain('Rename the project');
     expect(text('permission_denied')).toContain('refused');
     expect(text('unavailable')).toContain('could not be reached');
+    // The main cloud is configured but its installation is not proven.
+    expect(text('main_cloud_unavailable')).toContain('not connected to the cloud');
     // Any kind the page has no text of its own for gets the general one.
     expect(component.cloudFolderFailureKey('invalid_request')).toBe(
       'projectDetail.settings.cloudFolderFailed.other',

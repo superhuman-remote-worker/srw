@@ -15,6 +15,7 @@ import type {
 import fixture from '../../../core/models/fixtures/main-cloud.json';
 // The real catalogue, so these specs also prove the keys exist.
 import en from '../../../../assets/i18n/en.json';
+import de from '../../../../assets/i18n/de-DE.json';
 
 const PAGE = fixture as unknown as MainCloudPage;
 
@@ -146,6 +147,35 @@ describe('MainCloudSettingsComponent', () => {
     const active = host.querySelector('thead th.active')!;
     expect(active.getAttribute('data-provider')).toBe('nextcloud');
     expect(text(active)).toContain(en.settings.cloud.activeBadge);
+  });
+
+  it('says nothing about the installation authority once it is established', () => {
+    const {host} = mount();
+    expect(host.querySelector('[data-authority]')).toBeNull();
+  });
+
+  it('says why cloud features are off without an installation authority', () => {
+    const page = structuredClone(PAGE);
+    page.provider.backend_instance_id = null;
+    page.authority = {established: false, reason: 'no_installation_identity'};
+    const {host} = mount(of(page));
+    const note = host.querySelector('[data-authority="no_installation_identity"]')!;
+    expect(note.getAttribute('role')).toBe('alert');
+    expect(text(note)).toBe(en.settings.cloud.authority.no_installation_identity);
+    expect(text(note)).toContain('session cookie');
+  });
+
+  it('words a missing reason as the general one', () => {
+    const page = structuredClone(PAGE);
+    page.authority = {established: false, reason: null};
+    const {host} = mount(of(page));
+    expect(text(host.querySelector('[data-authority]'))).toBe(en.settings.cloud.authority.other);
+  });
+
+  it('has a German text for every authority reason', () => {
+    expect(Object.keys(de.settings.cloud.authority).sort()).toEqual(
+      Object.keys(en.settings.cloud.authority).sort(),
+    );
   });
 
   it('explains Helm drift and the replacement confirmation', () => {

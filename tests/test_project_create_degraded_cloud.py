@@ -91,10 +91,23 @@ def _uninitialised_cloud_router() -> MagicMock:
     what this file is about.
     """
     router = MagicMock()
+    router.active.is_configured = False
     router.for_owner.side_effect = FeatureNotAvailable(
         "durable active backend-instance authority", backend="nextcloud"
     )
     router.for_project_optional.return_value = None
+    return router
+
+
+def _unproven_cloud_router() -> MagicMock:
+    """A configured cloud whose installation authority is not established.
+
+    The production shape of an external Nextcloud before 0.3.1
+    (external_nextcloud_gives_srw_no_installation_proof): the adapter has its
+    admin account, but no installation proof, so ``for_owner`` refuses.
+    """
+    router = _uninitialised_cloud_router()
+    router.active.is_configured = True
     return router
 
 
@@ -171,6 +184,43 @@ async def test_create_project_succeeds_without_cloud_and_leaves_no_orphan_rows()
     # The fix is in how the caller handles it, not in weakening the router.
     cloud.for_owner.assert_called_once()
     # Nothing was written to the project row on the way out.
+    db.update_project.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_cloudless_installation_records_no_cloud_error() -> None:
+    db = _store()
+    db.set_project_main_cloud_folder_error = AsyncMock()
+
+    await projects.create_project(
+        _body(),
+        user=_owner(),
+        dependencies=_dependencies(db, _uninitialised_cloud_router()),
+    )
+
+    db.set_project_main_cloud_folder_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_configured_cloud_without_authority_is_recorded_on_the_project() -> (
+    None
+):
+    """Not an INFO line: the project page says the cloud is unavailable."""
+    db = _store()
+    db.set_project_main_cloud_folder_error = AsyncMock()
+
+    project = await projects.create_project(
+        _body(),
+        user=_owner(),
+        dependencies=_dependencies(db, _unproven_cloud_router()),
+    )
+
+    db.set_project_main_cloud_folder_error.assert_awaited_once_with(
+        PROJECT_ID, project_provisioning.MAIN_CLOUD_UNAVAILABLE
+    )
+    assert project["main_cloud_folder_error"] == "main_cloud_unavailable"
+    # Still created, still no cloud state claimed on the row.
+    assert project["main_cloud_backend"] is None
     db.update_project.assert_not_awaited()
 
 
