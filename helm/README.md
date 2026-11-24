@@ -128,7 +128,11 @@ The superuser creates the extensions the migrations need, before they run:
 is not a trusted extension, so `srw` could not create it itself. A future
 migration that needs another untrusted extension must add it to
 `srw.postgresRolesDatabases` in `templates/databases/_postgres-roles.tpl`
-(a chart test fails until it does).
+(a chart test fails until it does). On the `cnpg` engine a new Cluster creates
+the same extensions from the same list, as the superuser right after initdb
+(`bootstrap.initdb.postInitApplicationSQL`); a `migrating` Cluster gets them
+with the imported data. Before 0.3.1 a fresh `cnpg` vector database had no
+`vector` extension and the orchestrator crash-looped on its first migration.
 
 **How the passwords are set.** The chart generates each superuser password
 once and keeps it, like its other generated credentials. A value in
@@ -485,6 +489,9 @@ Edit at minimum:
 - `keycloak.externalIssuerUrl` → your IdP issuer URL
 - `gitea.internal: false` + `*.externalUrl` → your git server URLs
 - `cloud.externalBackend` + `cloud.externalUrl` → your cloud storage endpoint
+  (an external Nextcloud needs no SRW app; see
+  [Cloud folders](../docs/cloud-folders.md#for-operators) for what SRW reads
+  from it)
 - `ingress.className` and `ingress.tls.issuerName` → your cluster's ingress + cert-manager issuer
 
 A published chart version pins every component image to its release commit's

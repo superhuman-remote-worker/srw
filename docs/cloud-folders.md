@@ -292,4 +292,17 @@ folder is left out as `mount_unsupported`. Keep the defaults
   (`Legacy cloud WebDAV connectors retired: …`).
 - Protected Sessions need `agent.protectedCloudModeEnabled` and, on bundled
   Nextcloud, `nextcloud.protectedEffect.enabled`; see the
-  [Helm guide](../helm/README.md#protected-nextcloud-effect-lane).
+  [Helm guide](../helm/README.md#protected-nextcloud-effect-lane). An
+  external Nextcloud has no protected mode.
+- **An external Nextcloud** (`cloud.externalBackend: nextcloud`) needs the
+  Group Folders app and no SRW app. Before any cloud effect, SRW proves which installation it talks to by
+  the server's instance id (`occ config:system:get instanceid`). It reads the
+  id from `status.php` when the server lists it there, and otherwise from the
+  name of the session cookie that an unauthenticated `GET /index.php/login`
+  sets. A reverse proxy in front of Nextcloud must pass that response's
+  `Set-Cookie` headers through. Without the id every cloud feature stays off:
+  no project folders, shares, deliverable export or session mounts.
+  **Settings → Main cloud** then says why, a project created meanwhile says it
+  has no cloud folder yet, and SRW retries every minute. Before 0.3.1 SRW read
+  only `status.php`, which a stock Nextcloud never fills, so an external
+  Nextcloud had no cloud features at all.
