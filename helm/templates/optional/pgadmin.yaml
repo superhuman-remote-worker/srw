@@ -12,6 +12,13 @@ to that storage dir, so an absolute path outside it would be dropped ("no passwo
 supplied"). pgAdmin has no PVC, so the import re-runs on every restart (operator
 edits to the tree are not persisted — the server list is chart-owned).
 
+Hosts and ports come from the same helpers every other consumer uses, so they
+follow the engine (`<fullname>-postgres` on a StatefulSet, `-rw` on
+CloudNativePG) and an external database. There is no wait for the databases:
+pgAdmin starts fine with a server that is down, and a wait on a name that does
+not resolve held the pod in Init and failed every `helm --wait`
+(pgadmin_waits_forever_for_statefulset_hosts_on_cnpg).
+
 Login credentials come from the Secret (keys PGADMIN_EMAIL / PGADMIN_PASSWORD by
 default — override via pgadmin.auth.*). Add them to your Vault bundle (prod: the
 main ExternalSecret uses `dataFrom: extract`, so new properties are picked up
@@ -25,6 +32,12 @@ automatically) or to secrets.values (chart-managed dev secret).
 {{- $pwKey := $auth.passwordSecretKey | default "PGADMIN_PASSWORD" -}}
 {{- $dbUser := $auth.dbUsername | default "srw" -}}
 {{- $prereg := .Values.pgadmin.preregisterDatabases -}}
+{{- $appHost := include "srw.postgresHost" . -}}
+{{- $appPort := include "srw.postgresPort" . -}}
+{{- $vectorHost := include "srw.vectorPostgresHost" . -}}
+{{- $vectorPort := include "srw.vectorPostgresPort" . -}}
+{{- $auditHost := include "srw.auditPostgresHost" . -}}
+{{- $auditPort := include "srw.auditPostgresPort" . -}}
 {{- if $prereg }}
 apiVersion: v1
 kind: ConfigMap
@@ -39,8 +52,8 @@ data:
         "1": {
           "Name": "SRW App DB",
           "Group": "SRW",
-          "Host": "{{ $fullname }}-postgres",
-          "Port": 5432,
+          "Host": {{ $appHost | quote }},
+          "Port": {{ $appPort }},
           "MaintenanceDB": {{ include "srw.postgresDb" . | quote }},
           "Username": {{ $dbUser | quote }},
           "SSLMode": "prefer",
@@ -49,8 +62,8 @@ data:
         "2": {
           "Name": "SRW Vector DB (pgvector)",
           "Group": "SRW",
-          "Host": "{{ $fullname }}-pgvector",
-          "Port": 5432,
+          "Host": {{ $vectorHost | quote }},
+          "Port": {{ $vectorPort }},
           "MaintenanceDB": {{ include "srw.vectorPostgresDb" . | quote }},
           "Username": {{ $dbUser | quote }},
           "SSLMode": "prefer",
@@ -59,8 +72,8 @@ data:
         "3": {
           "Name": "SRW Audit DB",
           "Group": "SRW",
-          "Host": "{{ $fullname }}-auditdb",
-          "Port": 5432,
+          "Host": {{ $auditHost | quote }},
+          "Port": {{ $auditPort }},
           "MaintenanceDB": {{ include "srw.auditPostgresDb" . | quote }},
           "Username": {{ $dbUser | quote }},
           "SSLMode": "prefer",
@@ -90,14 +103,8 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if $prereg }}
       initContainers:
-        - name: wait-for-postgres
-          image: busybox:1.36
-          command:
-            - sh
-            - -c
-            - "until nc -z -w 2 {{ $fullname }}-postgres 5432; do sleep 2; done"
-        {{- if $prereg }}
         # Build a libpq passfile (chmod 600, owned by the pgadmin uid 5050) from
         # the Secret so servers.json's PassFile entries resolve without prompting.
         # Passwords come from env (secretKeyRef) — never templated into a manifest.
@@ -129,9 +136,9 @@ spec:
               # Escape '\' and ':' per the .pgpass format (db field is '*' so any DB matches).
               esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/:/\\:/g'; }
               {
-                printf '%s:5432:*:%s:%s\n' "{{ $fullname }}-postgres" "{{ $dbUser }}" "$(esc "$APP_PW")"
-                printf '%s:5432:*:%s:%s\n' "{{ $fullname }}-pgvector" "{{ $dbUser }}" "$(esc "$VECTOR_PW")"
-                printf '%s:5432:*:%s:%s\n' "{{ $fullname }}-auditdb" "{{ $dbUser }}" "$(esc "$AUDIT_PW")"
+                printf '%s:%s:*:%s:%s\n' {{ $appHost | quote }} {{ $appPort | quote }} {{ $dbUser | quote }} "$(esc "$APP_PW")"
+                printf '%s:%s:*:%s:%s\n' {{ $vectorHost | quote }} {{ $vectorPort | quote }} {{ $dbUser | quote }} "$(esc "$VECTOR_PW")"
+                printf '%s:%s:*:%s:%s\n' {{ $auditHost | quote }} {{ $auditPort | quote }} {{ $dbUser | quote }} "$(esc "$AUDIT_PW")"
               } > "$f"
               chmod 600 "$f"
               chown 5050:5050 "$f"
