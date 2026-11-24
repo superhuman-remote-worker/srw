@@ -988,3 +988,70 @@ class TestMemoryRequestParity:
         )[0]
         resources = cluster["spec"]["resources"]
         assert resources["requests"]["memory"] == resources["limits"]["memory"] == "4Gi"
+
+
+class TestExtensionsAtInitdb:
+    """A fresh CNPG Cluster creates the extensions SRW's migrations need.
+
+    The owner ``srw`` is no superuser on CloudNativePG and ``vector`` is not a
+    trusted extension, so vector migration 0001 failed with "permission denied
+    to create extension" and the orchestrator crash-looped on prod-private's
+    fresh install (fresh_cnpg_install_cannot_create_the_vector_extension).
+    The StatefulSet's postgres-roles.sh creates them as the superuser; the
+    Cluster now does the same, from the same list.
+    """
+
+    EXPECTED = {
+        "postgres": ["uuid-ossp", "btree_gist"],
+        "pgvector": ["uuid-ossp", "vector", "pg_trgm"],
+    }
+
+    @staticmethod
+    def _sql(cluster: dict) -> list[str]:
+        return cluster["spec"]["bootstrap"]["initdb"].get("postInitApplicationSQL", [])
+
+    def test_fresh_clusters_create_their_extensions_as_the_superuser(self):
+        clusters = {
+            c["metadata"]["name"].removeprefix(f"{FULLNAME}-"): c
+            for c in _cluster(*_all_cnpg())
+        }
+        for component, extensions in self.EXPECTED.items():
+            assert self._sql(clusters[component]) == [
+                f'CREATE EXTENSION IF NOT EXISTS "{name}" WITH SCHEMA public'
+                for name in extensions
+            ], component
+        # Audit, Gitea, Keycloak and Nextcloud need none.
+        for component in ("auditdb", "giteadb", "keycloakdb", "nextclouddb"):
+            assert (
+                "postInitApplicationSQL"
+                not in clusters[component]["spec"]["bootstrap"]["initdb"]
+            ), component
+
+    @pytest.mark.parametrize(
+        ("key", "template"),
+        [("postgres", "postgres.yaml"), ("vector", "postgres-vector.yaml")],
+    )
+    def test_the_list_is_the_statefulsets_own(self, key, template):
+        """One list for both engines (srw.postgresRolesDatabases), so they
+        cannot drift."""
+        documents = _render(show_only=f"templates/databases/{template}")
+        (statefulset,) = _kinds(documents, "StatefulSet")
+        env = {
+            item["name"]: item.get("value")
+            for container in statefulset["spec"]["template"]["spec"]["containers"]
+            for item in container.get("env", [])
+        }
+        statefulset_list = env["SRW_DB_EXTENSIONS"].split()
+        (cluster,) = _cluster(f"databases.{key}.engine=cnpg")
+        assert self._sql(cluster) == [
+            f'CREATE EXTENSION IF NOT EXISTS "{name}" WITH SCHEMA public'
+            for name in statefulset_list
+        ]
+
+    def test_an_import_brings_its_own_extensions(self):
+        """While ``migrating`` the logical import restores the extensions with
+        the data (dev's import, 2026-08-23); nothing runs beside it."""
+        (cluster,) = _cluster("databases.vector.engine=migrating")
+        initdb = cluster["spec"]["bootstrap"]["initdb"]
+        assert "import" in initdb
+        assert "postInitApplicationSQL" not in initdb

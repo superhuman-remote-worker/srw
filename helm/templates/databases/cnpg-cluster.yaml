@@ -133,6 +133,21 @@ spec:
       localeCType: {{ . | quote }}
       {{- end }}
       {{- end }}
+      {{- if eq (include "srw.dbEngine" (dict "context" $ctx "db" $db)) "cnpg" }}
+      {{- $extensions := dig .key "extensions" "" (include "srw.postgresRolesDatabases" $ctx | fromYaml) | splitList " " | compact }}
+      {{- with $extensions }}
+      # The extensions SRW's migrations create, made by the superuser right
+      # after initdb, from the list the StatefulSet's postgres-roles.sh uses:
+      # the owner `srw` is no superuser here, and `vector` is not a trusted
+      # extension, so migration 0001 cannot create it itself. Only at `cnpg`:
+      # a `migrating` import restores the extensions with the data, and once
+      # the Cluster exists this stanza is inert like the rest of bootstrap.
+      postInitApplicationSQL:
+        {{- range . }}
+        - {{ printf "CREATE EXTENSION IF NOT EXISTS \"%s\" WITH SCHEMA public" . | quote }}
+        {{- end }}
+      {{- end }}
+      {{- end }}
       {{- if eq (include "srw.dbEngine" (dict "context" $ctx "db" $db)) "migrating" }}
       # Logical dump/restore straight from the legacy Service. Chosen over
       # pg_basebackup because the fleet spans PG15 and PG16, the legacy pods
