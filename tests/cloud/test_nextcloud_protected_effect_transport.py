@@ -115,6 +115,7 @@ async def test_initialization_builds_a_distinct_json_effect_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clients: list[object] = []
+    paths: list[str] = []
 
     class _Client:
         def __init__(self, **kwargs) -> None:
@@ -123,6 +124,7 @@ async def test_initialization_builds_a_distinct_json_effect_client(
             clients.append(self)
 
         async def get(self, path: str, **_kwargs) -> httpx.Response:
+            paths.append(path)
             if path == "/status.php":
                 # Nextcloud 31 deliberately no longer publishes instanceid.
                 payload = {"installed": True, "version": "31.0.0"}
@@ -172,6 +174,9 @@ async def test_initialization_builds_a_distinct_json_effect_client(
     assert await backend.ensure_initialized() is True
     assert backend.backend_instance_id is None
     assert backend.installation_proof_sha256 == INSTALLATION_PROOF_SHA
+    # The lane attests the bundled server; the login page's session cookie,
+    # an external Nextcloud's proof, is never consulted beside it.
+    assert "/index.php/login" not in paths
     backend.bind_backend_instance(INSTANCE)
     assert backend.backend_instance_id == INSTANCE
     # The admin's, agent-service's and the effect lane's: three clients,

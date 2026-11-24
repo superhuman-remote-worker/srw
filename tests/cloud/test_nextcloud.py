@@ -732,6 +732,180 @@ class TestSharedClientSendsNoCookies:
         assert seen == [None, None]
 
 
+#: What a stock Nextcloud 33's status.php answers (homelab, 2026-11-17): no
+#: ``instanceid`` among the keys.
+_STOCK_STATUS = {
+    "installed": True,
+    "maintenance": False,
+    "needsDbUpgrade": False,
+    "version": "33.0.0.16",
+    "versionstring": "33.0.0",
+    "edition": "",
+    "productname": "Nextcloud",
+    "extendedSupport": False,
+}
+#: The cookies an unauthenticated GET /index.php/login sets.
+_LOGIN_COOKIES = [
+    "oc1a2b3c4d5e=8f9a0b1c2d3e4f; path=/; secure; HttpOnly; SameSite=Lax",
+    "oc_sessionPassphrase=Zm9v; path=/; secure; HttpOnly; SameSite=Lax",
+    "nc_sameSiteCookielax=true; path=/; httponly; secure; samesite=lax",
+    "nc_sameSiteCookiestrict=true; path=/; httponly; secure; samesite=strict",
+    "__Host-nc_sameSiteCookielax=true; path=/; httponly; secure; samesite=lax",
+]
+
+
+class TestInstallationProofFromSessionCookie:
+    """An external Nextcloud proves its installation with the instance id its
+    session cookie is named after (external_nextcloud_gives_srw_no_installation_proof)."""
+
+    @staticmethod
+    async def _initialize(
+        monkeypatch,
+        *,
+        status: dict,
+        login_cookies: list[str],
+        login_status: int = 200,
+    ) -> tuple[NextcloudBackend, list[httpx.Request]]:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            path = request.url.path
+            if path == "/status.php":
+                return httpx.Response(200, json=status)
+            if path == "/index.php/apps/groupfolders/folders":
+                return httpx.Response(
+                    200, json={"ocs": {"meta": {"statuscode": 100}, "data": []}}
+                )
+            if path == "/index.php/login":
+                return httpx.Response(
+                    login_status,
+                    headers=[("set-cookie", c) for c in login_cookies],
+                    text="<html>login</html>",
+                )
+            # WebDAV-root discovery: unprefixed paths.
+            return httpx.Response(404)
+
+        real_client = httpx.AsyncClient
+
+        def client_with_mock(**kwargs):
+            return real_client(**{**kwargs, "transport": httpx.MockTransport(handler)})
+
+        monkeypatch.setattr(httpx, "AsyncClient", client_with_mock)
+        backend = NextcloudBackend(_nc_test_settings())
+        assert await backend.ensure_initialized() is True
+        return backend, seen
+
+    @pytest.mark.asyncio
+    async def test_the_session_cookie_name_sets_the_proof(self, monkeypatch):
+        from orchestrator.services.cloud.backend_instance_authority import (
+            main_cloud_installation_proof_sha256,
+        )
+
+        backend, _ = await self._initialize(
+            monkeypatch, status=_STOCK_STATUS, login_cookies=_LOGIN_COOKIES
+        )
+
+        assert backend.installation_proof_sha256 == (
+            main_cloud_installation_proof_sha256(
+                backend_id="nextcloud", remote_identity="oc1a2b3c4d5e"
+            )
+        )
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_without_such_a_cookie_the_proof_stays_none(self, monkeypatch):
+        cookies = [c for c in _LOGIN_COOKIES if not c.startswith("oc1a2b")]
+        backend, _ = await self._initialize(
+            monkeypatch, status=_STOCK_STATUS, login_cookies=cookies
+        )
+
+        assert backend.installation_proof_sha256 is None
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_two_instance_shaped_cookies_prove_nothing(self, monkeypatch):
+        backend, _ = await self._initialize(
+            monkeypatch,
+            status=_STOCK_STATUS,
+            login_cookies=[*_LOGIN_COOKIES, "ocffffffffff00=x; path=/"],
+        )
+
+        assert backend.installation_proof_sha256 is None
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_a_redirecting_login_page_still_names_the_cookie(self, monkeypatch):
+        # user_oidc's auto-redirect answers the login page with a redirect to
+        # the identity provider; the session cookie comes with it and the
+        # redirect is not followed.
+        backend, seen = await self._initialize(
+            monkeypatch,
+            status=_STOCK_STATUS,
+            login_cookies=_LOGIN_COOKIES,
+            login_status=303,
+        )
+
+        assert backend.installation_proof_sha256 is not None
+        assert [r.url.path for r in seen].count("/index.php/login") == 1
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_the_login_page_is_read_without_credentials(self, monkeypatch):
+        backend, seen = await self._initialize(
+            monkeypatch, status=_STOCK_STATUS, login_cookies=_LOGIN_COOKIES
+        )
+
+        (login,) = [r for r in seen if r.url.path == "/index.php/login"]
+        assert login.method == "GET"
+        assert "authorization" not in login.headers
+        assert "cookie" not in login.headers
+        # The admin's other requests still authenticate.
+        status = next(r for r in seen if r.url.path == "/status.php")
+        assert status.headers["authorization"].startswith("Basic ")
+        await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_status_php_instanceid_comes_first(self, monkeypatch):
+        from orchestrator.services.cloud.backend_instance_authority import (
+            main_cloud_installation_proof_sha256,
+        )
+
+        backend, seen = await self._initialize(
+            monkeypatch,
+            status={**_STOCK_STATUS, "instanceid": "ocstatusphp01"},
+            login_cookies=_LOGIN_COOKIES,
+        )
+
+        assert backend.installation_proof_sha256 == (
+            main_cloud_installation_proof_sha256(
+                backend_id="nextcloud", remote_identity="ocstatusphp01"
+            )
+        )
+        assert "/index.php/login" not in [r.url.path for r in seen]
+        await backend.close()
+
+    @pytest.mark.parametrize(
+        ("headers", "expected"),
+        [
+            (["oc1a2b3c4d5e=v; path=/"], "oc1a2b3c4d5e"),
+            # Two Set-Cookie lines for one session (a regenerated id).
+            (["oc1a2b3c4d5e=a; path=/", "oc1a2b3c4d5e=b; path=/"], "oc1a2b3c4d5e"),
+            (["oc_sessionPassphrase=v", "nc_sameSiteCookielax=true"], None),
+            (["oc1a2b=v; path=/"], None),  # too short for an instance id
+            (["ocabc_defghijk=v; path=/"], None),
+            (["xoc1a2b3c4d5e=v; path=/"], None),
+            ([], None),
+        ],
+    )
+    def test_cookie_name_shape(self, headers, expected):
+        from orchestrator.services.cloud.nextcloud import (
+            instance_id_from_session_cookies,
+        )
+
+        assert instance_id_from_session_cookies(headers) == expected
+
+
 class TestShareRateBucket:
     def test_unset_env_keeps_fifteen_per_ten_minutes(self):
         assert share_rate_bucket({}) == (15, 600.0)

@@ -127,6 +127,31 @@ _USER_OIDC_CONFIG_PATH = (
 _USER_OIDC_CREATE_USER_PATH = "/ocs/v2.php/apps/user_oidc/api/v1/user"
 _USER_OIDC_MAPPING_UID_RE = re.compile(r"provider-(\d+)-mappingUid\Z")
 
+#: Nextcloud names its PHP session cookie after the installation's instance id
+#: (``OC::initSession`` uses ``OC_Util::getInstanceId()``), which is ``oc`` and
+#: ten lower-case letters and digits on a current install (older ownCloud
+#: upgrades kept longer ones). Its other cookies (``oc_sessionPassphrase``,
+#: ``nc_sameSiteCookie*``, ``__Host-nc_*``, a proxy's own) never have this
+#: shape: they carry an underscore or another prefix.
+_INSTANCE_ID_COOKIE_RE = re.compile(r"oc[A-Za-z0-9]{10,32}")
+#: The page that starts a session without a login, so its response names the
+#: session cookie. ``status.php`` starts none.
+_INSTANCE_ID_COOKIE_PATH = "/index.php/login"
+
+
+def instance_id_from_session_cookies(set_cookie_headers: list[str]) -> Optional[str]:
+    """The instance id Nextcloud's session cookie is named after, from a
+    response's ``Set-Cookie`` headers; ``None`` unless exactly one cookie name
+    has the instance-id shape (none, or two different ones, prove nothing)."""
+    names = {
+        header.split("=", 1)[0].strip()
+        for header in set_cookie_headers
+        if "=" in header
+    }
+    matches = {name for name in names if _INSTANCE_ID_COOKIE_RE.fullmatch(name)}
+    return matches.pop() if len(matches) == 1 else None
+
+
 #: The shared clients' (the admin's and agent-service's) timeouts and pool.
 _CLIENT_TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=10.0)
 _CLIENT_LIMITS = httpx.Limits(max_connections=20, max_keepalive_connections=10)
@@ -982,6 +1007,16 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
             await self._discover_dav_roots()
 
             installation_proof = legacy_installation_proof
+            if installation_proof is None and self._protected_effect_url is None:
+                # Stock Nextcloud's status.php never had ``instanceid``, and
+                # only the bundled server has the lane below; without a second
+                # source an external Nextcloud never gets a proof.
+                cookie_instance_id = await self._instance_id_from_login_page()
+                if cookie_instance_id is not None:
+                    installation_proof = main_cloud_installation_proof_sha256(
+                        backend_id=self.backend_id,
+                        remote_identity=cookie_instance_id,
+                    )
             if self._protected_effect_url is not None:
                 attestation_instance_id = (
                     self._backend_instance_id or self._attestation_backend_instance_id
@@ -1028,8 +1063,11 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
             self._installation_proof_sha256 = installation_proof
             if installation_proof is None:
                 logger.warning(
-                    "Nextcloud exposes no stable installation identity; "
-                    "main-cloud authority remains unavailable"
+                    "Nextcloud exposes no stable installation identity "
+                    "(status.php names no instanceid and %s set no session "
+                    "cookie named after one); main-cloud authority remains "
+                    "unavailable",
+                    _INSTANCE_ID_COOKIE_PATH,
                 )
 
             self._initialized = True
@@ -1039,6 +1077,33 @@ class NextcloudBackend(NextcloudUserRootGrant, NextcloudAgentServiceCredential):
             logger.warning(f"Nextcloud backend init failed: {e}")
             await self._close_clients()
             return False
+
+    async def _instance_id_from_login_page(self) -> Optional[str]:
+        """The instance id from the session cookie of one unauthenticated
+        ``GET /index.php/login``, or ``None``.
+
+        Nextcloud starts a session for every request but ``status.php`` and
+        names the cookie after its instance id, the same value ``occ
+        config:system:get instanceid`` prints, so it is as stable an
+        installation identity as the ``status.php`` field this proof was
+        built for. No credentials are sent (a basic-auth request would log
+        in and mint a session token), no redirect is followed (an OIDC
+        auto-redirect would leave Nextcloud), and the client stores no
+        cookie: only this response's ``Set-Cookie`` headers are read.
+        """
+        assert self._client is not None
+        try:
+            resp = await self._client.get(
+                _INSTANCE_ID_COOKIE_PATH, auth=None, follow_redirects=False
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Nextcloud %s could not be read for the installation identity (%s)",
+                _INSTANCE_ID_COOKIE_PATH,
+                type(exc).__name__,
+            )
+            return None
+        return instance_id_from_session_cookies(resp.headers.get_list("set-cookie"))
 
     def _build_agent_client(
         self, transport: Optional[httpx.AsyncBaseTransport] = None
