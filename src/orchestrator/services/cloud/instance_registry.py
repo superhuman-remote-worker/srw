@@ -45,6 +45,7 @@ from uuid import uuid4
 from orchestrator.services.cloud import (
     MainCloudBackend,
     MainCloudRouter,
+    RetainedInstallationNotAttested,
     build_backend_from_config,
     provider_adapter,
 )
@@ -55,6 +56,7 @@ from orchestrator.services.cloud.config import (
     load_main_cloud_config,
     main_cloud_routing_snapshot,
     main_cloud_secret_references,
+    main_cloud_selected,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,8 +81,17 @@ class MainCloudAuthorityUnavailable(RuntimeError):
 
 
 def authority_unavailable_reason(exc: BaseException) -> AuthorityUnavailableReason:
-    """The page's reason for a failed authority attempt."""
-    if isinstance(exc, MainCloudAuthorityUnavailable):
+    """The page's reason for a failed authority attempt.
+
+    A deployment that names no main cloud is ``not_configured`` whatever the
+    attempt raised: its configuration falls back to a development OpenCloud
+    at localhost, which looks configured and only ever fails to answer.
+    """
+    if not main_cloud_selected():
+        return "not_configured"
+    if isinstance(
+        exc, (MainCloudAuthorityUnavailable, RetainedInstallationNotAttested)
+    ):
         return exc.reason
     return "other"
 

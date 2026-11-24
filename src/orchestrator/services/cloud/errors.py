@@ -66,3 +66,18 @@ class FeatureNotAvailable(CloudBackendError):
             f"backend {backend!r} does not support {feature!r}",
             backend=backend,
         )
+
+
+class RetainedInstallationNotAttested(FeatureNotAvailable):
+    """A retained main-cloud installation did not prove itself again.
+
+    ``reason`` is the admin Main cloud page's word for why:
+    ``unreachable`` (it did not initialize: no answer, or no Group Folders),
+    ``no_installation_identity`` (it answered but named no installation) or
+    ``other`` (it named a different installation). A ``FeatureNotAvailable``,
+    so every caller that refuses the effect on one still does.
+    """
+
+    def __init__(self, reason: str, *, backend: str) -> None:
+        super().__init__("retained main-cloud installation proof", backend=backend)
+        self.reason = reason

@@ -10,6 +10,7 @@ from orchestrator.services.cloud.backend_instance_authority import (
     main_cloud_installation_proof_sha256,
 )
 from orchestrator.services.cloud.instance_registry import (
+    MainCloudAuthorityUnavailable,
     activate_main_cloud_config,
     build_attested_main_cloud_candidate,
     initialize_main_cloud_instance_authority,
@@ -165,6 +166,7 @@ async def test_a_candidate_that_does_not_attest_says_why(
     authority = _authority()
     settings = type("Settings", (), {"backend_id": "nextcloud"})()
     monkeypatch.setattr(registry, "load_main_cloud_config", lambda **_kwargs: settings)
+    monkeypatch.setattr(registry, "main_cloud_selected", lambda: True)
     monkeypatch.setattr(
         registry, "main_cloud_secret_references", lambda *_a: authority.secret_refs
     )
@@ -179,6 +181,41 @@ async def test_a_candidate_that_does_not_attest_says_why(
     assert raised.value.reason == reason
     assert registry.authority_unavailable_reason(raised.value) == reason
     assert registry.authority_unavailable_reason(RuntimeError("x")) == "other"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(RuntimeError("connection refused"), id="any-error"),
+        pytest.param(
+            MainCloudAuthorityUnavailable("unreachable", "did not initialize"),
+            id="unreachable",
+        ),
+    ],
+)
+def test_a_deployment_without_a_main_cloud_is_not_configured(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    """Its fallback (a development OpenCloud at localhost) looks configured
+    and only ever fails to answer; the page must not call that unreachable."""
+    import orchestrator.services.cloud.instance_registry as registry
+
+    monkeypatch.setattr(registry, "main_cloud_selected", lambda: False)
+    assert registry.authority_unavailable_reason(exc) == "not_configured"
+
+
+@pytest.mark.parametrize("reason", ["unreachable", "no_installation_identity", "other"])
+def test_a_retained_installation_keeps_its_reason(
+    monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    """After a restart the active installation is re-attested by the router,
+    which raises its own refusal; the page still says why."""
+    import orchestrator.services.cloud.instance_registry as registry
+    from orchestrator.services.cloud import RetainedInstallationNotAttested
+
+    monkeypatch.setattr(registry, "main_cloud_selected", lambda: True)
+    exc = RetainedInstallationNotAttested(reason, backend="nextcloud")
+    assert registry.authority_unavailable_reason(exc) == reason
 
 
 @pytest.mark.asyncio

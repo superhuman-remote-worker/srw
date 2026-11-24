@@ -161,6 +161,30 @@ def _pick(*names: str, default: Optional[str] = None) -> Optional[str]:
     return default
 
 
+def main_cloud_selected() -> bool:
+    """Whether this deployment names a main cloud at all.
+
+    Without one, :func:`load_main_cloud_config` still builds OpenCloud at
+    ``localhost:9200`` on built-in development credentials (the Compose
+    default), and that backend reports itself configured. So "configured"
+    cannot tell a release with no cloud from one whose cloud is down. The
+    environment can: a Helm release renders ``MAIN_CLOUD_BACKEND`` exactly when
+    it configures a main cloud (bundled OpenCloud or Nextcloud, or
+    ``cloud.externalBackend``), an older Nextcloud deployment keeps its
+    ``NEXTCLOUD_*`` variables, and ``MAIN_CLOUD_URL`` / ``OPENCLOUD_URL`` name
+    one explicitly. A ``MAIN_CLOUD_BACKEND`` with no registered adapter (the
+    chart's ``cloud.externalBackend: webdav``, a plain datasource) names none.
+    """
+    backend_id = os.getenv("MAIN_CLOUD_BACKEND")
+    if backend_id:
+        from orchestrator.services.cloud import provider_adapter
+
+        return provider_adapter(backend_id) is not None
+    return _detect_legacy_nextcloud_mode() or bool(
+        _pick("MAIN_CLOUD_URL", "OPENCLOUD_URL")
+    )
+
+
 def load_main_cloud_config(
     *,
     backend_override: Optional[str] = None,

@@ -34,6 +34,7 @@ from orchestrator.services.cloud import (
     CloudBackendErrorKind,
     FeatureNotAvailable,
 )
+from orchestrator.services.cloud.config import main_cloud_selected
 from orchestrator.services.cloud.identity import (
     resolve_user_identity_cached,
     with_cached_identity,
@@ -378,8 +379,14 @@ async def ensure_project_cloud_resources(
             # its blanket 500. Degrade exactly as the `for_project_optional`
             # branch above does, and as every remote effect below already
             # does. A cloudless installation gets a project without cloud
-            # resources, which is the whole point of the optional tier.
-            if not dependencies.main_cloud_router.active.is_configured:
+            # resources, which is the whole point of the optional tier. Its
+            # fallback backend (a development OpenCloud at localhost) still
+            # reports itself configured, so the deployment's own choice
+            # decides (``main_cloud_selected``).
+            if (
+                not main_cloud_selected()
+                or not dependencies.main_cloud_router.active.is_configured
+            ):
                 logger.info(
                     "Project %s: skipping cloud resource provisioning — no "
                     "main cloud is configured (%s).",

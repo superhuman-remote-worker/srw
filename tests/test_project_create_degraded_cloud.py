@@ -202,10 +202,32 @@ async def test_a_cloudless_installation_records_no_cloud_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_configured_cloud_without_authority_is_recorded_on_the_project() -> (
-    None
-):
+async def test_a_release_without_a_cloud_records_no_cloud_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production shape of a release with no main cloud: its fallback (a
+    development OpenCloud at localhost) reports itself configured, so only
+    the deployment's own choice tells it apart (found on k3d, 2026-11-24)."""
+    monkeypatch.setattr(project_provisioning, "main_cloud_selected", lambda: False)
+    db = _store()
+    db.set_project_main_cloud_folder_error = AsyncMock()
+
+    project = await projects.create_project(
+        _body(),
+        user=_owner(),
+        dependencies=_dependencies(db, _unproven_cloud_router()),
+    )
+
+    db.set_project_main_cloud_folder_error.assert_not_awaited()
+    assert project.get("main_cloud_folder_error") is None
+
+
+@pytest.mark.asyncio
+async def test_a_configured_cloud_without_authority_is_recorded_on_the_project(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Not an INFO line: the project page says the cloud is unavailable."""
+    monkeypatch.setattr(project_provisioning, "main_cloud_selected", lambda: True)
     db = _store()
     db.set_project_main_cloud_folder_error = AsyncMock()
 

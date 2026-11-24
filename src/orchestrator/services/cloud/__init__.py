@@ -49,6 +49,7 @@ from orchestrator.services.cloud.errors import (
     CloudBackendError,
     CloudBackendErrorKind,
     FeatureNotAvailable,
+    RetainedInstallationNotAttested,
 )
 from orchestrator.services.cloud.handles import (
     GroupId,
@@ -295,14 +296,18 @@ class MainCloudRouter:
                     authority.backend_instance_id
                 )
                 initialized = await backend.ensure_initialized()
-                if (
-                    not initialized
-                    or backend.installation_proof_sha256
-                    != authority.installation_proof_sha256
-                ):
-                    raise FeatureNotAvailable(
-                        "retained main-cloud installation proof",
-                        backend=authority.backend_id,
+                proof = backend.installation_proof_sha256
+                if not initialized:
+                    raise RetainedInstallationNotAttested(
+                        "unreachable", backend=authority.backend_id
+                    )
+                if proof is None:
+                    raise RetainedInstallationNotAttested(
+                        "no_installation_identity", backend=authority.backend_id
+                    )
+                if proof != authority.installation_proof_sha256:
+                    raise RetainedInstallationNotAttested(
+                        "other", backend=authority.backend_id
                     )
                 backend.bind_backend_instance(authority.backend_instance_id)
             except BaseException:
@@ -576,6 +581,7 @@ __all__ = [
     "CloudMountSubject",
     "DataPlaneToken",
     "FeatureNotAvailable",
+    "RetainedInstallationNotAttested",
     "FolderGrantKind",
     "GroupId",
     "HealthStatus",

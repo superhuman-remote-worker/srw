@@ -23,6 +23,7 @@ from orchestrator.services.cloud.config import (
     OpenCloudSettings,
     _detect_legacy_nextcloud_mode,
     load_main_cloud_config,
+    main_cloud_selected,
 )
 
 
@@ -215,3 +216,50 @@ class TestBuildBackendDefaultRouting:
         _opencloud_env(monkeypatch)
         backend = build_backend("opencloud")
         assert isinstance(backend, OpenCloudBackend)
+
+
+class TestMainCloudSelected:
+    """Whether the deployment names a main cloud at all.
+
+    A Helm release without a cloud renders no cloud env, and the resolver
+    then builds the development OpenCloud at localhost, which reports itself
+    configured; ``main_cloud_selected`` tells that release apart from one
+    whose cloud is down (external_nextcloud_gives_srw_no_installation_proof).
+    """
+
+    @pytest.mark.parametrize(
+        ("env", "selected"),
+        [
+            pytest.param({}, False, id="no-cloud-env"),
+            pytest.param({"NEXTCLOUD_PORT": "8800"}, False, id="port-only"),
+            pytest.param({"MAIN_CLOUD_BACKEND": "nextcloud"}, True, id="nextcloud"),
+            pytest.param({"MAIN_CLOUD_BACKEND": "opencloud"}, True, id="opencloud"),
+            pytest.param({"MAIN_CLOUD_BACKEND": "webdav"}, False, id="webdav"),
+            pytest.param(
+                {"NEXTCLOUD_URL": "http://nc.example"}, True, id="legacy-nextcloud"
+            ),
+            pytest.param(
+                {"OPENCLOUD_URL": "http://opencloud:9200"}, True, id="opencloud-url"
+            ),
+            pytest.param(
+                {"MAIN_CLOUD_URL": "http://cloud.example"}, True, id="main-cloud-url"
+            ),
+        ],
+    )
+    def test_the_environment_decides(
+        self, monkeypatch: pytest.MonkeyPatch, env: dict[str, str], selected: bool
+    ):
+        _clear_cloud_env(monkeypatch)
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        assert main_cloud_selected() is selected
+
+    def test_a_cloudless_release_still_resolves_to_a_configured_opencloud(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Why the predicate exists: the fallback looks configured."""
+        from orchestrator.services.cloud import build_backend
+
+        _clear_cloud_env(monkeypatch)
+        assert build_backend().is_configured is True
+        assert main_cloud_selected() is False

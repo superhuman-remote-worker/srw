@@ -15,6 +15,7 @@ import pytest
 from orchestrator.services.cloud import (
     FeatureNotAvailable,
     MainCloudRouter,
+    RetainedInstallationNotAttested,
 )
 from orchestrator.services.cloud.backend_instance_authority import (
     MainCloudBackendInstanceAuthority,
@@ -187,6 +188,49 @@ class TestBackendInstanceRouting:
         with pytest.raises(FeatureNotAvailable):
             await router.resolve_backend_instance(_authority())
         assert candidate.is_initialized is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("initializes", "proof", "reason"),
+        [
+            pytest.param(False, _PROOF, "unreachable", id="did-not-initialize"),
+            pytest.param(True, None, "no_installation_identity", id="no-identity"),
+            pytest.param(True, "0" * 64, "other", id="another-installation"),
+        ],
+    )
+    async def test_a_retained_installation_that_does_not_prove_itself_says_why(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        initializes: bool,
+        proof: str | None,
+        reason: str,
+    ):
+        """The admin Main cloud page words the reason after a restart too
+        (external_nextcloud_gives_srw_no_installation_proof, k3d 2026-11-24)."""
+
+        class _Candidate(FakeMainCloudBackend):
+            backend_id = "nextcloud"
+
+            async def ensure_initialized(self) -> bool:
+                self._installation_proof_sha256 = proof
+                return initializes
+
+        router = MainCloudRouter(_attested_fake())
+        candidate = _Candidate(start_initialized=False)
+        import orchestrator.services.cloud as cloud_pkg
+
+        monkeypatch.setattr(
+            cloud_pkg,
+            "build_backend_from_instance",
+            lambda authority: candidate,
+        )
+
+        with pytest.raises(RetainedInstallationNotAttested) as raised:
+            await router.resolve_backend_instance(_authority())
+        assert raised.value.reason == reason
+        # Still the refusal every caller already handles.
+        assert isinstance(raised.value, FeatureNotAvailable)
+        assert "retained main-cloud installation proof" in str(raised.value)
 
     @pytest.mark.asyncio
     async def test_same_provider_new_instance_retains_old_adapter(self):
